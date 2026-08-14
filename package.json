@@ -1,0 +1,19 @@
+{
+  "name": "livesub",
+  "version": "1.0.0",
+  "description": "",
+  "main": "background.js",
+  "scripts": {
+    "build:assets": "node scripts/copy-assets.js",
+    "postinstall": "npm run build:assets",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@ricky0123/vad-web": "^0.0.30",
+    "onnxruntime-web": "1.22.0"
+  }
+}

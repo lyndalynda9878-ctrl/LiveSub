@@ -1,0 +1,5 @@
+node_modules/
+
+# Regenere par `npm install` (script postinstall -> scripts/copy-assets.js).
+# Contient notamment un .wasm de ~13 Mo, inutile de le versionner.
+vendor/
