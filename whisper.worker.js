@@ -372,9 +372,11 @@ self.onmessage = (event) => {
         // Chrono demarre APRES le chargement : on veut mesurer l'inference
         // seule, pour comparer honnetement WebGPU et WASM.
         const debut = performance.now();
-        // On force la langue : sur un extrait court, la detection automatique
-        // de whisper-tiny se trompe facilement.
-        const resultat = await transcrire(audio, { language: langue });
+        // Sans `langue`, on laisse Whisper detecter tout seul. On n'ecrit pas
+        // `language: undefined` : la librairie ne traite pas ca comme "absent".
+        // Avec une langue imposee c'est plus sur sur un extrait court, ou la
+        // detection automatique de whisper-tiny se trompe facilement.
+        const resultat = await transcrire(audio, langue ? { language: langue } : {});
         self.postMessage({
           type: "result",
           id,

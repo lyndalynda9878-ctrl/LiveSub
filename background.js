@@ -39,6 +39,34 @@ async function getCaptureState() {
 }
 
 // ---------------------------------------------------------------------------
+// Memoire du backend Whisper (GPU ou CPU)
+// ---------------------------------------------------------------------------
+// Le worker Whisper chronometre le GPU et le CPU au tout premier lancement,
+// puis garde le plus rapide. On range le verdict ici pour ne pas refaire la
+// mesure (~1 a 2 min) a chaque demarrage de capture.
+//
+// ⚠️ Pourquoi ici, dans le service worker, et pas dans l'offscreen qui s'en
+// sert ? Parce que dans un document offscreen chrome.storage s'est revele non
+// fiable : `get()` renvoie parfois un resultat vide alors que la cle existe, et
+// parfois ne repond jamais -- ce qui gelait le demarrage de Whisper. Le service
+// worker, lui, n'a pas ce probleme. L'offscreen recoit donc le verdict dans le
+// message START_CAPTURE et nous renvoie le sien par WHISPER_BACKEND.
+//
+// storage.local (et pas .session) : c'est une propriete de la machine, elle
+// doit survivre a la fermeture du navigateur.
+const BACKEND_KEY = "whisperBackend";
+
+async function readWhisperBackend() {
+  try {
+    return (await chrome.storage.local.get(BACKEND_KEY))[BACKEND_KEY] || null;
+  } catch (err) {
+    // Sans memoire on remesurera : c'est lent, mais rien n'est casse.
+    console.warn("⚠️ Lecture du backend Whisper impossible :", err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Offscreen document
 // ---------------------------------------------------------------------------
 // Deux appels simultanes a createDocument() levent une erreur : on memorise la
@@ -153,7 +181,10 @@ async function doStartAudioCapture() {
     const response = await chrome.runtime.sendMessage({
       type: "START_CAPTURE",
       streamId: streamId,
-      tabId: tab.id
+      tabId: tab.id,
+      // L'offscreen ne peut pas lire chrome.storage de facon fiable : on lui
+      // passe le backend deja mesure (null au premier lancement).
+      memoBackend: await readWhisperBackend()
     });
 
     if (!response || !response.success) {
@@ -258,6 +289,16 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log("📩 Message recu dans background :", request);
+
+  // L'offscreen a fini de choisir son backend : on le retient pour la prochaine
+  // fois, ce qui evite de refaire la mesure GPU/CPU a chaque capture.
+  if (request.type === "WHISPER_BACKEND") {
+    chrome.storage.local
+      .set({ [BACKEND_KEY]: { backend: request.backend, signature: request.signature } })
+      .then(() => console.log("💾 Backend Whisper memorise :", request.backend))
+      .catch((err) => console.warn("⚠️ Memorisation du backend impossible :", err));
+    return; // pas de reponse attendue
+  }
 
   // La popup demande l'etat courant a son ouverture.
   if (request.type === "GET_STATE") {

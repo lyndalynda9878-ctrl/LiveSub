@@ -7,7 +7,19 @@ let audioElement = null;
 let vad = null;
 let analyser = null;
 
-// Écouter les messages du service worker
+// ---------------------------------------------------------------------------
+// Messages du service worker
+// ---------------------------------------------------------------------------
+//
+// ⚠️ Ce listener s'enregistre AVANT tout le reste, et notamment avant la
+// creation du worker Whisper. background.js n'attend que 500 ms entre la
+// creation de ce document et son premier message : tout ce qui retarde
+// l'enregistrement du listener fait echouer le demarrage de la capture avec
+// « Le module audio n'a pas repondu ». (Vu pour de vrai : le worker Whisper
+// place avant suffisait a passer a cote de la fenetre.)
+//
+// C'est aussi la bonne separation : un Whisper lent ou casse ne doit jamais
+// empecher la capture audio de demarrer.
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log("📩 Offscreen a recu un message :", request);
 
@@ -16,7 +28,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // suite sans attendre : si getUserMedia echouait ensuite, l'erreur restait
     // dans cette console et le background enregistrait quand meme "actif" --
     // la popup affichait "✅ Actif" alors que rien ne capturait.
-    startCapture(request.streamId).then(sendResponse);
+    startCapture(request.streamId, request.memoBackend).then(sendResponse);
     return true; // reponse asynchrone
   }
 
@@ -27,10 +39,187 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Whisper : le worker de transcription
+// ---------------------------------------------------------------------------
+//
+// Le VAD (plus bas) decoupe la parole en segments ; on les envoie ici. Whisper
+// tourne dans un Web Worker et PAS dans ce document : l'inference bloque le fil
+// sur lequel elle tourne, et ce fil-ci fait tourner l'AudioContext, le worklet
+// du VAD et la redirection du son vers les haut-parleurs. Une inference ici
+// hacherait le son de l'onglet.
+//
+// Pour l'instant le texte part seulement dans cette console. L'overlay
+// (content.js) viendra apres.
+
+// Le worker n'est PAS cree au chargement du script, mais au demarrage de la
+// capture (voir demarrerWhisper). Le creer ici rendait le document offscreen
+// injoignable : background.js n'attend que 500 ms entre la creation du document
+// et son premier message, et la capture echouait sur « Le module audio n'a pas
+// repondu ». Whisper n'a de toute facon rien a faire tant qu'on ne capture pas.
+let whisperWorker = null;
+
+// Chaque segment envoye recoit un numero ; le worker le renvoie avec le texte,
+// ce qui permet de retrouver a quel segment la reponse correspond.
+let prochainSegmentId = 1;
+const segmentsEnCours = new Map();
+
+// Renseigne quand le worker a fini de charger le modele. Tant que c'est faux,
+// les segments partent quand meme : le worker les met dans sa propre file et
+// les traitera des qu'il sera pret.
+let whisperPret = false;
+
+// ⚠️ Le backend mesure (GPU ou CPU) est memorise dans chrome.storage, mais PAS
+// depuis ici : dans un document offscreen, chrome.storage s'est revele non
+// fiable. Selon les fois, `chrome.storage.local.get()` renvoie un resultat vide
+// alors que la cle existe, ou ne repond jamais du tout -- et dans ce dernier
+// cas le `await` gelait le demarrage de Whisper pour de bon.
+//
+// C'est donc le service worker qui lit et ecrit la mesure :
+//   - il nous passe le verdict connu dans le message START_CAPTURE ;
+//   - on lui renvoie le verdict mesure par WHISPER_BACKEND.
+// Les messages, eux, marchent parfaitement depuis un offscreen.
+
+function surMessageWhisper(event) {
+  const message = event.data;
+
+  switch (message.type) {
+    case "ready": {
+      whisperPret = true;
+      const ou = message.backend === "webgpu" ? "GPU (WebGPU)" : "CPU (WASM)";
+      console.log(`✅ Whisper pret en ${Math.round(message.ms / 1000)} s, sur ${ou}`);
+      if (message.mesures) {
+        const chiffre = (ms) => (ms == null ? "indisponible" : `${(ms / 1000).toFixed(2)} s`);
+        console.log(
+          `   (premiere mesure : GPU ${chiffre(message.mesures.webgpu)} / ` +
+            `CPU ${chiffre(message.mesures.wasm)} -- verdict memorise)`
+        );
+      }
+      // Au service worker de le ranger : voir le commentaire plus haut.
+      chrome.runtime.sendMessage({
+        type: "WHISPER_BACKEND",
+        backend: message.backend,
+        signature: message.signature,
+      });
+      break;
+    }
+
+    case "progress":
+      // Telechargement du modele, au premier lancement.
+      console.log(`⬇️  Whisper : ${message.fichier} ${message.pourcent} %`);
+      break;
+
+    case "info":
+      // Repli d'un backend sur l'autre, mesure en cours... Non bloquant.
+      console.log(`ℹ️  Whisper : ${message.message}`);
+      break;
+
+    case "result": {
+      const segment = segmentsEnCours.get(message.id);
+      segmentsEnCours.delete(message.id);
+
+      const texte = message.texte;
+      // Sur un segment sans parole nette, Whisper renvoie souvent une chaine
+      // vide ou juste de la ponctuation : inutile de polluer la console.
+      if (!texte || !/[\p{L}\p{N}]/u.test(texte)) {
+        console.log("   (segment sans texte exploitable)");
+        break;
+      }
+
+      const duree = segment ? `${segment.secondes} s de parole` : "segment";
+      console.log(
+        `📝 « ${texte} »\n   (${duree}, transcrit en ${(message.ms / 1000).toFixed(1)} s ` +
+          `sur ${message.backend})`
+      );
+      break;
+    }
+
+    case "error": {
+      segmentsEnCours.delete(message.id);
+      console.error("❌ Whisper :", message.message);
+      break;
+    }
+  }
+}
+
+// Erreur non rattrapee dans le worker (ex : l'import de Transformers.js echoue
+// au demarrage). Sans ce handler, le worker mourrait en silence et les segments
+// partiraient dans le vide.
+function surErreurWhisper(event) {
+  console.error("❌ Le worker Whisper a plante :", event.message || event);
+  console.error(
+    "💡 A verifier : le dossier vendor/ existe-t-il (npm install) ? " +
+      "L'extension a-t-elle ete rechargee depuis chrome://extensions ?"
+  );
+}
+
+// Cree le worker et lance le chargement du modele. Appele au demarrage de la
+// capture, PAS au chargement du script (voir le commentaire sur whisperWorker).
+//
+// On le fait des le debut de la capture et pas a la premiere parole : le
+// chargement prend plusieurs secondes (et bien plus au tout premier lancement,
+// avec le telechargement du modele et la mesure des backends). Autant que ce
+// soit en route pendant que l'utilisateur lance sa video.
+//
+// `memo` = le verdict deja mesure, fourni par le service worker dans le message
+// START_CAPTURE (null la premiere fois). Rien de bloquant ici : pas un seul
+// appel a chrome.storage, justement.
+function demarrerWhisper(memo) {
+  if (whisperWorker) return; // deja demarre, on ne recharge pas le modele
+
+  console.log("⏳ Whisper : chargement du modele dans le worker...");
+
+  // type: "module" -> le worker peut faire `import` de Transformers.js.
+  whisperWorker = new Worker(chrome.runtime.getURL("whisper.worker.js"), {
+    type: "module",
+  });
+  whisperWorker.onmessage = surMessageWhisper;
+  whisperWorker.onerror = surErreurWhisper;
+
+  whisperWorker.postMessage({ type: "init", memo: memo ?? null });
+}
+
+// Envoie un segment de parole au worker. Rien a decoder : le VAD produit deja
+// du Float32Array mono a 16 kHz, exactement ce que Whisper attend.
+function transcrireSegment(audio) {
+  // Le VAD ne peut pas tourner sans capture, et la capture demarre Whisper :
+  // en pratique on ne passe jamais ici sans worker. Garde-fou quand meme.
+  if (!whisperWorker) {
+    console.warn("⚠️  Segment ignore : le worker Whisper n'est pas demarre");
+    return;
+  }
+
+  const id = prochainSegmentId++;
+  const secondes = (audio.length / 16000).toFixed(1);
+  segmentsEnCours.set(id, { secondes });
+
+  // On envoie une COPIE, et c'est elle qu'on transfere. Transferer directement
+  // le tableau du VAD viderait un buffer dont la librairie est proprietaire.
+  // La copie coute quelques centaines de Ko, le risque n'en vaut pas la peine.
+  const copie = new Float32Array(audio);
+
+  // 2e argument : liste des buffers TRANSFERES. Le tableau change de
+  // proprietaire au lieu d'etre copie une seconde fois pour passer au worker.
+  whisperWorker.postMessage(
+    { type: "transcribe", id, audio: copie, langue: null },
+    [copie.buffer]
+  );
+
+  const attente = whisperPret ? "" : " (le modele charge encore, ca patientera)";
+  console.log(`➡️  Segment #${id} envoye a Whisper : ${secondes} s${attente}`);
+
+  // Un retard qui s'installe se voit ici : la transcription ne suit plus la
+  // parole. Utile a savoir avant de brancher l'overlay.
+  if (segmentsEnCours.size > 3) {
+    console.warn(`⚠️  ${segmentsEnCours.size} segments en attente de transcription`);
+  }
+}
+
+
 // Démarrer la capture.
 // Ne rejette JAMAIS : renvoie toujours { success, error?, warning? }, parce que
 // c'est cette reponse qui decide si le background a le droit d'ecrire "actif".
-async function startCapture(streamId) {
+async function startCapture(streamId, memoBackend) {
   try {
     console.log("🎤 Offscreen : demarrage capture avec streamId :", streamId);
 
@@ -39,6 +228,12 @@ async function startCapture(streamId) {
       console.log("🔄 Flux deja existant, on le ferme d'abord");
       await stopCapture();
     }
+
+    // Whisper se met en route en parallele : le chargement du modele prend
+    // plusieurs secondes et la capture audio n'a pas a l'attendre. Les premiers
+    // segments arriveront peut-etre avant qu'il soit pret -- le worker les garde
+    // dans sa file et les traitera dans l'ordre.
+    demarrerWhisper(memoBackend);
 
     // Créer le contexte audio
     audioContext = new AudioContext();
@@ -157,9 +352,9 @@ async function startVAD(stream) {
       },
       onSpeechEnd: (audio) => {
         console.log("🔇 PAROLE TERMINEE ! (fin)");
-        console.log("📦 Segment audio capturé, taille :", audio.length, "échantillons");
-
-        // Ici on pourra envoyer le segment à Whisper plus tard !
+        // Le segment part a Whisper : Float32Array mono 16 kHz, deja au bon
+        // format. Le texte arrivera dans la console via whisperWorker.onmessage.
+        transcrireSegment(audio);
       },
       onVADMisfire: () => {
         console.log("❌ Fausse alerte du VAD (bruit)");
