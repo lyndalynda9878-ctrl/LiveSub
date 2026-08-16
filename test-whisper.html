@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>LiveSub - test Whisper</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 0 20px;
+      color: #1f2937;
+    }
+    h1 { color: #4f46e5; font-size: 20px; }
+    p.hint { color: #6b7280; font-size: 14px; }
+    #log {
+      margin-top: 20px;
+      padding: 14px;
+      background: #f8f9fa;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+    .ok { color: #0f9d63; }
+    .err { color: #dc2626; }
+
+    /* Indicateur d'activite : il doit BOUGER pendant l'inference. */
+    #indicateur {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 16px;
+      padding: 12px 14px;
+      background: #eef2ff;
+      border: 1px solid #c7d2fe;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    #indicateur[hidden] { display: none; }
+
+    /* Le spinner est une animation CSS : jolie, mais elle tourne sur le
+       compositeur et continuerait meme page figee. La vraie preuve, c'est
+       #compteur, mis a jour par un setInterval du fil principal. */
+    .spinner {
+      width: 16px;
+      height: 16px;
+      border: 3px solid #c7d2fe;
+      border-top-color: #4f46e5;
+      border-radius: 50%;
+      animation: tourne 0.8s linear infinite;
+      flex: none;
+    }
+    @keyframes tourne { to { transform: rotate(360deg); } }
+
+    #compteur {
+      margin-left: auto;
+      font-family: Consolas, monospace;
+      color: #4f46e5;
+      font-variant-numeric: tabular-nums;
+    }
+    #progres {
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      color: #6b7280;
+    }
+
+    /* De quoi avoir une barre de defilement, pour tester le scroll pendant
+       l'inference. */
+    .remplissage {
+      margin-top: 24px;
+      color: #9ca3af;
+      font-size: 13px;
+      line-height: 2.4;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎬 LiveSub — test de transcription Whisper (Web Worker)</h1>
+  <p class="hint">
+    Page de test isolee : elle ne touche ni a la capture audio ni au VAD.
+    Elle sert uniquement a verifier que Xenova/whisper-tiny transcrit un extrait,
+    <strong>depuis un Web Worker</strong>, sans figer l'interface.
+    Le texte transcrit est ecrit ici ET dans la console (F12).
+  </p>
+  <p class="hint">
+    Pendant la transcription : le compteur a droite doit continuer de defiler et
+    la page doit rester scrollable. C'est le critere de reussite.
+  </p>
+
+  <div id="indicateur" hidden>
+    <div class="spinner"></div>
+    <span class="libelle">Transcription</span>
+    <span id="progres"></span>
+    <span id="compteur">0.0 s</span>
+  </div>
+
+  <div id="log">Chargement...</div>
+
+  <div class="remplissage">
+    ↓ Zone de remplissage : elle sert juste a rendre la page scrollable pendant
+    l'inference.<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁<br>
+    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+  </div>
+
+  <!-- type="module" : ce script cree le worker, il ne transcrit plus lui-meme.
+       Whisper et Transformers.js vivent desormais dans whisper.worker.js. -->
+  <script type="module" src="test-whisper.js"></script>
+</body>
+</html>

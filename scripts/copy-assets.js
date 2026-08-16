@@ -13,6 +13,10 @@ const path = require("path");
 
 const ROOT = path.join(__dirname, "..");
 const VENDOR = path.join(ROOT, "vendor");
+// Transformers.js a son propre ONNX Runtime, d'une version differente de celle
+// du VAD, avec des fichiers qui portent LE MEME NOM. D'ou un sous-dossier
+// dedie : melanger les deux jeux de .wasm casserait l'un ou l'autre.
+const VENDOR_TRANSFORMERS = path.join(VENDOR, "transformers");
 
 // Version d'ONNX Runtime Web inlinee dans @ricky0123/vad-web/dist/bundle.min.js.
 // Le fichier .wasm et sa glue .mjs sont apparies a cette version precise :
@@ -59,12 +63,47 @@ function checkOrtVersion() {
   }
 }
 
-function copyAssets() {
-  fs.mkdirSync(VENDOR, { recursive: true });
+// Transformers.js : le bundle web (ESM) + le runtime WebAssembly qu'il charge
+// dynamiquement. Sans ces .wasm en local, la librairie irait les chercher sur
+// le CDN jsdelivr -- ce qu'on ne veut pas (objectif hors-ligne).
+//
+// Le .wasm doit venir de l'onnxruntime-web imbrique SOUS @huggingface/transformers,
+// pas de celui du VAD : ce sont deux versions differentes, et un .wasm depareille
+// echoue au chargement.
+const TRANSFORMERS_DIST = "@huggingface/transformers/dist";
+const TRANSFORMERS_ORT_DIST =
+  "@huggingface/transformers/node_modules/onnxruntime-web/dist";
 
-  for (const [from, to] of FILES) {
+const TRANSFORMERS_FILES = [
+  // La librairie elle-meme (module ES autonome).
+  // Bien prendre transformers.min.js et PAS transformers.web.js : cette
+  // derniere version laisse des imports non resolus ("onnxruntime-web/webgpu")
+  // destines a un bundler, que le navigateur refuse. transformers.min.js
+  // embarque ONNX Runtime et se charge directement.
+  [`${TRANSFORMERS_DIST}/transformers.min.js`, "transformers.min.js"],
+  // Le runtime WASM, dans ses 4 variantes.
+  // ONNX Runtime choisit laquelle charger au demarrage, par detection des
+  // capacites du navigateur (jspi si disponible, sinon asyncify ; jsep pour
+  // WebGPU). Comme le choix se fait a l'execution, on les fournit toutes :
+  // s'il en manque une, le chargement echoue avec "no available backend found".
+  ...["", ".jsep", ".asyncify", ".jspi"].flatMap((variante) => [
+    [
+      `${TRANSFORMERS_ORT_DIST}/ort-wasm-simd-threaded${variante}.mjs`,
+      `ort-wasm-simd-threaded${variante}.mjs`,
+    ],
+    [
+      `${TRANSFORMERS_ORT_DIST}/ort-wasm-simd-threaded${variante}.wasm`,
+      `ort-wasm-simd-threaded${variante}.wasm`,
+    ],
+  ]),
+];
+
+function copyInto(destDir, files, label) {
+  fs.mkdirSync(destDir, { recursive: true });
+
+  for (const [from, to] of files) {
     const src = path.join(ROOT, "node_modules", from);
-    const dest = path.join(VENDOR, to);
+    const dest = path.join(destDir, to);
 
     if (!fs.existsSync(src)) {
       throw new Error(`Fichier source introuvable : ${src}`);
@@ -73,11 +112,15 @@ function copyAssets() {
     fs.copyFileSync(src, dest);
 
     const sizeKo = Math.round(fs.statSync(dest).size / 1024);
-    console.log(`  ✅ vendor/${to} (${sizeKo} Ko)`);
+    console.log(`  ✅ ${label}${to} (${sizeKo} Ko)`);
   }
 }
 
 console.log("📦 Copie des assets du VAD vers vendor/ ...");
 checkOrtVersion();
-copyAssets();
+copyInto(VENDOR, FILES, "vendor/");
 console.log("✅ Assets du VAD prets.");
+
+console.log("📦 Copie de Transformers.js vers vendor/transformers/ ...");
+copyInto(VENDOR_TRANSFORMERS, TRANSFORMERS_FILES, "vendor/transformers/");
+console.log("✅ Assets de Transformers.js prets.");

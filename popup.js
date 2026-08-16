@@ -3,9 +3,23 @@
 // repartirait a zero -- c'etait la cause de la desynchronisation du bouton.
 let isActive = false;
 
+// Dernier message renvoye par le background.
+// On le garde ici parce que l'echec declenche aussi un evenement
+// storage.onChanged : sans ca, le repaint provoque par cet evenement effacerait
+// l'erreur avant meme qu'elle soit lue.
+let errorMessage = null;
+let warningMessage = null;
+
 // Recuperer le bouton et la zone de statut
 const toggleBtn = document.getElementById("toggleBtn");
 const statusDiv = document.getElementById("status");
+
+function setStatus(text, color) {
+  statusDiv.textContent = text;
+  statusDiv.style.color = color;
+  // La popup est etroite : l'infobulle permet de lire un message tronque.
+  statusDiv.title = text;
+}
 
 // Fonction pour mettre a jour l'affichage du bouton
 function updateUI() {
@@ -14,34 +28,43 @@ function updateUI() {
   if (isActive) {
     toggleBtn.textContent = "⏹️ Arreter";
     toggleBtn.className = "stop";
-    statusDiv.textContent = "✅ Actif";
-    statusDiv.style.color = "#0f9d63";
   } else {
     toggleBtn.textContent = "▶️ Demarrer";
     toggleBtn.className = "";
-    statusDiv.textContent = "⏸️ Arrete";
-    statusDiv.style.color = "#666";
+  }
+
+  // Une erreur prime sur l'etat : elle reste affichee tant que l'utilisateur
+  // n'a pas relance une action. Et comme isActive vaut false en cas d'echec,
+  // le bouton est deja revenu sur "Demarrer".
+  if (errorMessage) {
+    setStatus("❌ " + errorMessage, "#dc2626");
+  } else if (isActive && warningMessage) {
+    setStatus("⚠️ " + warningMessage, "#b45309");
+  } else if (isActive) {
+    setStatus("✅ Actif", "#0f9d63");
+  } else {
+    setStatus("⏸️ Arrete", "#666");
   }
 }
 
-function showError(message) {
-  statusDiv.textContent = "❌ " + message;
-  statusDiv.style.color = "#dc2626";
+// Applique la reponse du background : c'est LUI qui dit si la capture tourne
+// vraiment. On n'affiche jamais "Actif" sur une supposition de la popup.
+function applyState(state) {
+  isActive = Boolean(state && state.active);
+  errorMessage = (state && state.error) || null;
+  warningMessage = (state && state.warning) || null;
+  updateUI();
 }
 
 // Demander l'etat courant au background (source de verite).
 async function loadState() {
   toggleBtn.disabled = true;
-  statusDiv.textContent = "⏳ ...";
+  setStatus("⏳ ...", "#666");
 
   try {
-    const state = await chrome.runtime.sendMessage({ type: "GET_STATE" });
-    isActive = Boolean(state && state.active);
-    updateUI();
+    applyState(await chrome.runtime.sendMessage({ type: "GET_STATE" }));
   } catch (err) {
-    isActive = false;
-    updateUI();
-    showError("Background injoignable");
+    applyState({ active: false, error: "Background injoignable" });
   }
 }
 
@@ -51,25 +74,28 @@ toggleBtn.addEventListener("click", async () => {
   // background qui nous dit ce qui s'est reellement passe.
   const wanted = !isActive;
 
+  // Nouvelle tentative : on repart d'une ardoise propre.
+  errorMessage = null;
+  warningMessage = null;
+
   toggleBtn.disabled = true;
-  statusDiv.textContent = wanted ? "⏳ Demarrage..." : "⏳ Arret...";
-  statusDiv.style.color = "#666";
+  setStatus(wanted ? "⏳ Demarrage..." : "⏳ Arret...", "#666");
 
   try {
-    const state = await chrome.runtime.sendMessage({
+    applyState(await chrome.runtime.sendMessage({
       type: "TOGGLE_SUBTITLES",
       active: wanted
-    });
-
-    isActive = Boolean(state && state.active);
-    updateUI();
-
-    if (state && state.error) {
-      showError(state.error);
-    }
+    }));
   } catch (err) {
-    await loadState();
-    showError("Echec : " + (err.message || err));
+    // Le background n'a pas repondu : on redemande l'etat reel, mais on garde
+    // l'erreur affichee par-dessus.
+    const message = "Echec : " + (err.message || err);
+    try {
+      const state = await chrome.runtime.sendMessage({ type: "GET_STATE" });
+      applyState({ ...(state || {}), error: message });
+    } catch (err2) {
+      applyState({ active: false, error: message });
+    }
   }
 });
 
@@ -80,6 +106,13 @@ chrome.storage.session.onChanged.addListener((changes) => {
   if (!change) return;
 
   isActive = Boolean(change.newValue && change.newValue.active);
+
+  // Le storage ne transporte que l'etat, pas les messages : on ne jette
+  // l'erreur affichee que si une capture vient de demarrer pour de bon.
+  if (isActive) {
+    errorMessage = null;
+  }
+
   updateUI();
 });
 

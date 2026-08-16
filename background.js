@@ -75,6 +75,28 @@ async function createOffscreen() {
 }
 
 // ---------------------------------------------------------------------------
+// Serialisation des demarrages / arrets
+// ---------------------------------------------------------------------------
+// Le garde-fou "est-ce que c'est deja actif ?" lit l'etat au debut mais ne
+// l'ecrit qu'a la toute fin (apres createOffscreen + getMediaStreamId). Entre
+// les deux, un second demarrage lance en parallele lit encore "inactif" et
+// passe le garde : on se retrouve avec DEUX captures, celle qui reste volant le
+// flux de l'autre. On fait donc passer start et stop dans une file d'attente :
+// une operation a la fois, le garde voit toujours l'etat definitif.
+//
+// C'est bien une variable en memoire, mais ce n'est PAS de l'etat : elle ne
+// sert qu'a ordonner des appels concurrents, qui sont forcement dans la meme
+// vie du service worker. La verite reste dans chrome.storage.session.
+let captureQueue = Promise.resolve();
+
+function serializeCapture(operation) {
+  const result = captureQueue.then(operation, operation);
+  // La file ne doit jamais rester bloquee sur un echec.
+  captureQueue = result.catch(() => {});
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Demarrage / arret de la capture
 // ---------------------------------------------------------------------------
 
@@ -93,7 +115,11 @@ async function toggleOverlay(tabId, active) {
 }
 
 // Renvoie toujours l'etat resultant -> c'est lui que la popup affiche.
-async function startAudioCapture() {
+function startAudioCapture() {
+  return serializeCapture(doStartAudioCapture);
+}
+
+async function doStartAudioCapture() {
   // Garde anti double-capture : si une capture tourne deja, on ne demarre pas
   // une deuxieme (elle volerait le flux de la premiere).
   const current = await getCaptureState();
@@ -119,33 +145,84 @@ async function startAudioCapture() {
     });
     console.log("✅ StreamId obtenu :", streamId);
 
-    // 4. Envoyer le streamId à l'offscreen document
+    // 4. Envoyer le streamId à l'offscreen document et ATTENDRE son verdict.
+    // L'offscreen ne repond qu'une fois getUserMedia et l'AudioContext
+    // reellement demarres : c'est cette reponse qui fait foi, pas le simple
+    // fait que le message soit parti.
     console.log("📤 Envoi du message a l'offscreen...");
-    await chrome.runtime.sendMessage({
+    const response = await chrome.runtime.sendMessage({
       type: "START_CAPTURE",
       streamId: streamId,
       tabId: tab.id
     });
-    console.log("✅ Message envoye a l'offscreen");
 
-    // 5. Etat officiel : on capture.
+    if (!response || !response.success) {
+      throw new Error(
+        (response && response.error) ||
+        "L'offscreen document n'a pas confirme le demarrage de la capture"
+      );
+    }
+    console.log("✅ Offscreen a confirme le demarrage");
+
+    // 5. Etat officiel : on capture. On n'arrive ici que si TOUT a reussi.
     const state = await writeState({ active: true, tabId: tab.id });
 
     // 6. Dire à content.js d'afficher l'overlay
     await toggleOverlay(tab.id, true);
 
-    return state;
+    // Le VAD peut avoir echoue sans empecher la capture : on fait remonter
+    // l'avertissement a la popup au lieu de le laisser en console.
+    return response.warning ? { ...state, warning: response.warning } : state;
 
   } catch (error) {
     console.error("❌ Erreur startAudioCapture :", error);
+
+    // L'echec peut survenir apres que l'offscreen a ouvert un flux : on le
+    // referme, sinon un onglet resterait marque "en cours de capture" par
+    // Chrome alors que l'extension se croit a l'arret.
+    try {
+      await chrome.runtime.sendMessage({ type: "STOP_CAPTURE" });
+    } catch (err) {
+      // Normal s'il n'y a pas (ou plus) d'offscreen document.
+    }
+
     // On remet l'etat a zero : sans ca la popup afficherait "Actif" alors que
     // rien ne tourne, et le bouton refuserait de redemarrer.
     await writeState(EMPTY_STATE);
-    return { ...EMPTY_STATE, error: error.message || String(error) };
+    return { ...EMPTY_STATE, error: describeError(error) };
   }
 }
 
-async function stopAudioCapture() {
+// Traduit les messages bruts de Chrome en quelque chose d'actionnable.
+// Le message d'origine reste dans la console pour le debug.
+function describeError(error) {
+  const raw = (error && error.message) || String(error);
+
+  // Le cas le plus frequent : apres un rechargement de l'extension, la
+  // permission activeTab n'est accordee qu'une fois l'icone cliquee.
+  // Attention a l'ordre : ce message de Chrome contient AUSSI la phrase sur
+  // les pages chrome://, alors que ce n'est pas la vraie cause.
+  if (raw.includes("has not been invoked")) {
+    return "Clique sur l'icone LiveSub puis reessaie";
+  }
+  if (raw.includes("Chrome pages cannot be captured") || raw.includes("cannot be captured")) {
+    return "Cette page ne peut pas etre capturee (page chrome:// ou Web Store)";
+  }
+  if (raw.includes("Aucun onglet actif")) {
+    return "Aucun onglet actif a capturer";
+  }
+  if (raw.includes("Could not establish connection")) {
+    return "Le module audio n'a pas repondu, reessaie";
+  }
+
+  return raw;
+}
+
+function stopAudioCapture() {
+  return serializeCapture(doStopAudioCapture);
+}
+
+async function doStopAudioCapture() {
   console.log("⏸️ Arret de la capture audio...");
 
   // On lit l'onglet AVANT de remettre l'etat a zero : c'est l'onglet capture,

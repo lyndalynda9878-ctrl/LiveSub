@@ -12,18 +12,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log("📩 Offscreen a recu un message :", request);
 
   if (request.type === "START_CAPTURE") {
-    // On ne peut pas attendre ici : le listener doit repondre tout de suite.
-    startCapture(request.streamId);
-    sendResponse({ success: true });
+    // On repond APRES le demarrage reel. Avant, on repondait "success" tout de
+    // suite sans attendre : si getUserMedia echouait ensuite, l'erreur restait
+    // dans cette console et le background enregistrait quand meme "actif" --
+    // la popup affichait "✅ Actif" alors que rien ne capturait.
+    startCapture(request.streamId).then(sendResponse);
+    return true; // reponse asynchrone
   }
 
   if (request.type === "STOP_CAPTURE") {
-    stopCapture();
-    sendResponse({ success: true });
+    // Meme raison : on ne confirme l'arret qu'une fois tout relache.
+    stopCapture().then(() => sendResponse({ success: true }));
+    return true; // reponse asynchrone
   }
 });
 
-// Démarrer la capture
+// Démarrer la capture.
+// Ne rejette JAMAIS : renvoie toujours { success, error?, warning? }, parce que
+// c'est cette reponse qui decide si le background a le droit d'ecrire "actif".
 async function startCapture(streamId) {
   try {
     console.log("🎤 Offscreen : demarrage capture avec streamId :", streamId);
@@ -76,15 +82,31 @@ async function startCapture(streamId) {
     // Démarrer l'analyse du volume
     analyseVolume(analyser);
 
-    // Démarrer le VAD (détection de parole)
-    await startVAD(stream);
+    // Démarrer le VAD (détection de parole).
+    // Un VAD en panne n'empeche pas d'entendre le son : ce n'est pas un echec
+    // de la capture, mais ca ne doit plus passer inapercu non plus -> on le
+    // remonte en avertissement jusqu'a la popup.
+    const vadStatus = await startVAD(stream);
+
+    return {
+      success: true,
+      warning: vadStatus.ok ? null : "Sous-titres indisponibles : " + vadStatus.error
+    };
 
   } catch (error) {
     console.error("❌ Offscreen : erreur startCapture :", error);
+
+    // On ne laisse pas une capture a moitie ouverte derriere nous : sans ce
+    // nettoyage, isCapturing/mediaStream resteraient incoherents et le
+    // prochain demarrage repartirait d'un etat batard.
+    await stopCapture();
+
+    return { success: false, error: error.message || String(error) };
   }
 }
 
-// Démarrer le VAD
+// Démarrer le VAD. Renvoie { ok: true } ou { ok: false, error } -- l'appelant
+// decide quoi en faire, au lieu que l'echec finisse seulement en console.
 async function startVAD(stream) {
   try {
     console.log("🎤 Demarrage du VAD (détection de parole)...");
@@ -147,6 +169,7 @@ async function startVAD(stream) {
     // Pas besoin d'appeler vad.start() : MicVAD.new() demarre deja tout seul
     // (option startOnLoad, activee par defaut).
     console.log("✅ VAD demarre !");
+    return { ok: true };
 
   } catch (error) {
     // On n'avale surtout pas l'erreur : sans ce message, le VAD echoue en
@@ -157,6 +180,7 @@ async function startVAD(stream) {
       "L'extension a-t-elle ete rechargee depuis chrome://extensions ?"
     );
     vad = null;
+    return { ok: false, error: error.message || String(error) };
   }
 }
 
