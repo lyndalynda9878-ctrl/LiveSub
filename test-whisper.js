@@ -104,8 +104,13 @@ worker.onmessage = (event) => {
 
   switch (message.type) {
     case "ready":
-      enAttente.get("init")?.resolve(message.ms);
+      enAttente.get("init")?.resolve(message);
       enAttente.delete("init");
+      break;
+
+    case "info":
+      // Ex : WebGPU a echoue, le worker est reparti sur le CPU. Pas bloquant.
+      log(`ℹ️  ${message.message}`);
       break;
 
     case "progress":
@@ -143,10 +148,45 @@ function attendre(cle) {
   return new Promise((resolve, reject) => enAttente.set(cle, { resolve, reject }));
 }
 
-function initialiserWorker() {
+// ---------------------------------------------------------------------------
+// Memoire du backend le plus rapide
+// ---------------------------------------------------------------------------
+//
+// Le worker chronometre le GPU et le CPU au tout premier lancement, puis garde
+// le plus rapide. On range le verdict ici pour ne PAS refaire la mesure a
+// chaque demarrage. C'est la page qui s'en charge et pas le worker : `chrome`
+// est indefini dans un worker dedie.
+//
+// storage.local (et pas .session) : la mesure doit survivre a la fermeture du
+// navigateur, c'est une propriete de la machine, pas de la session.
+const CLE_BACKEND = "whisperBackend";
+
+async function lireMemoBackend() {
+  try {
+    return (await chrome.storage.local.get(CLE_BACKEND))[CLE_BACKEND] ?? null;
+  } catch {
+    // Pas de storage : on remesurera, c'est tout.
+    return null;
+  }
+}
+
+async function ecrireMemoBackend(backend, signature) {
+  try {
+    await chrome.storage.local.set({ [CLE_BACKEND]: { backend, signature } });
+  } catch {
+    // Idem : sans memoire on remesure au prochain lancement, rien de casse.
+  }
+}
+
+async function initialiserWorker() {
   const promesse = attendre("init");
-  worker.postMessage({ type: "init" });
-  return promesse;
+  worker.postMessage({ type: "init", memo: await lireMemoBackend() });
+
+  const pret = await promesse;
+  // Toujours reecrire : si le backend memorise s'est revele inutilisable, le
+  // worker a bascule et c'est le nouveau choix qu'il faut retenir.
+  await ecrireMemoBackend(pret.backend, pret.signature);
+  return pret;
 }
 
 function transcrire(audio, langue) {
@@ -168,6 +208,12 @@ const EXTRAITS = [
   { fichier: "test/speech-fr.mp3", langue: "french", intitule: "Extrait francais" },
 ];
 
+// Le worker renvoie "webgpu" ou "wasm" ; ici on l'ecrit en clair.
+const LIBELLE_BACKEND = {
+  webgpu: "WebGPU (carte graphique) 🚀",
+  wasm: "WASM (processeur)",
+};
+
 async function main() {
   logDiv.textContent = "";
 
@@ -175,9 +221,19 @@ async function main() {
     log("⏳ Chargement du modele dans le worker (premier lancement : telechargement)...");
     demarrerIndicateur("Chargement du modele");
 
-    const msModele = await initialiserWorker();
+    const pret = await initialiserWorker();
     arreterIndicateur();
-    log(`✅ Modele charge en ${Math.round(msModele / 1000)} s`, "ok");
+    log(`✅ Modele charge en ${Math.round(pret.ms / 1000)} s`, "ok");
+    log(`⚙️  Backend : ${LIBELLE_BACKEND[pret.backend] ?? pret.backend}`, "ok");
+
+    if (pret.mesures) {
+      // Uniquement au premier lancement : le detail du match GPU / CPU.
+      const chiffre = (ms) => (ms == null ? "indisponible" : `${(ms / 1000).toFixed(2)} s`);
+      log(`   mesure : GPU ${chiffre(pret.mesures.webgpu)} / CPU ${chiffre(pret.mesures.wasm)}`);
+      log("   (verdict memorise : les prochains lancements ne remesurent plus)");
+    } else {
+      log("   (backend deja mesure sur cette machine, repris de la memoire)");
+    }
 
     for (const extrait of EXTRAITS) {
       log("");
@@ -191,7 +247,11 @@ async function main() {
       const resultat = await transcrire(audio, extrait.langue);
       arreterIndicateur();
 
-      log(`📝 TEXTE TRANSCRIT (${extrait.langue}, ${(resultat.ms / 1000).toFixed(1)} s) :`, "ok");
+      log(
+        `📝 TEXTE TRANSCRIT (${extrait.langue}, ${(resultat.ms / 1000).toFixed(1)} s ` +
+          `sur ${resultat.backend}) :`,
+        "ok"
+      );
       log(`   "${resultat.texte}"`, "ok");
     }
 

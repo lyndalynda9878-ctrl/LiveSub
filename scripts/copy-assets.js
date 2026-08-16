@@ -83,9 +83,15 @@ const TRANSFORMERS_FILES = [
   [`${TRANSFORMERS_DIST}/transformers.min.js`, "transformers.min.js"],
   // Le runtime WASM, dans ses 4 variantes.
   // ONNX Runtime choisit laquelle charger au demarrage, par detection des
-  // capacites du navigateur (jspi si disponible, sinon asyncify ; jsep pour
-  // WebGPU). Comme le choix se fait a l'execution, on les fournit toutes :
-  // s'il en manque une, le chargement echoue avec "no available backend found".
+  // capacites du navigateur. Comme le choix se fait a l'execution, on les
+  // fournit toutes : s'il en manque une, le chargement echoue avec
+  // "no available backend found".
+  //
+  // Pour WebGPU : sur cette version d'ONNX Runtime (1.26), l'execution GPU
+  // passe par la variante `asyncify` (ou `jspi` si le navigateur la supporte),
+  // et PAS par `jsep` comme dans les versions 1.19-1.21. On garde quand meme
+  // `jsep` : elle ne coute qu'un fichier, et evite une regression si la
+  // librairie change d'avis.
   ...["", ".jsep", ".asyncify", ".jspi"].flatMap((variante) => [
     [
       `${TRANSFORMERS_ORT_DIST}/ort-wasm-simd-threaded${variante}.mjs`,
