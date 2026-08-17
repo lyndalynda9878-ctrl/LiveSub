@@ -41,18 +41,87 @@ env.allowRemoteModels = true;
 
 // whisper-tiny MULTILINGUE (surtout pas la variante .en, qui ne fait que
 // l'anglais : LiveSub doit sous-titrer du francais).
-const MODEL = "Xenova/whisper-tiny";
+const MODELE_DEFAUT = "Xenova/whisper-tiny";
 
-// Poids non quantifies, sur les deux backends. Par defaut la librairie prend
-// une variante quantifiee du depot Xenova, que cette version d'ONNX Runtime
-// refuse ("Missing required scale ... MatMulNBits"). fp32 est plus lourd a
-// telecharger mais se charge sans probleme -- et sur GPU le gain vient du
-// parallelisme, pas de la quantification.
-const DTYPE = "fp32";
+// Poids NON quantifies. C'est un choix mesure, pas un choix par defaut.
+//
+// La quantification 8 bits (onnx-community/whisper-tiny en `q8`, avec
+// `opt=basic` -- voir plus bas) a ete essayee serieusement et compare a fp32
+// sur la meme machine (page test-bench.html) :
+//   - 42 Mo au lieu de 147, et ~18 % plus rapide par segment ;
+//   - texte IDENTIQUE sur un extrait propre et complet (0 % de WER, FR et EN) ;
+//   - mais TEXTE DEGRADE sur le regime reel de LiveSub. En bout-en-bout, q8
+//     ecrivait systematiquement « What you are country can do for you » la ou
+//     fp32 ecrivait « What your country can do for you », et « as what » au
+//     lieu de « ask what ». Sur 21 fragments compares, fp32 gagnait 8 fois,
+//     q8 une seule.
+//
+// Comme la latence est stable a ~2 s avec fp32 (voir le decoupage dans
+// offscreen.js), les 18 % de vitesse n'achetent rien : on paierait une perte de
+// precision pour un gain invisible. On garde donc fp32.
+//
+// Le seul vrai avantage restant de q8 est le poids (105 Mo de moins), qui
+// comptera le jour ou on embarquera le modele dans l'extension. La piste a
+// creuser ce jour-la n'est pas tiny en q8, mais whisper-BASE en q8 : 77 Mo,
+// soit toujours moins que tiny fp32, et un modele nettement moins sujet aux
+// hallucinations.
+//
+// A ne pas confondre avec q4 / q4f16, essayes et abandonnes : q4 ne charge pas
+// du tout, et en WebGPU fp16 et q4f16 produisent du texte casse (boucles de
+// repetition). fp16 sur CPU est mesure 1,3 a 1,4x plus LENT que fp32 (le
+// processeur n'a pas d'unite fp16 native).
+const DTYPE_DEFAUT = "fp32";
 
-// Change des que le modele ou la precision change. Une mesure memorisee qui ne
-// porte pas la meme signature est jetee : elle ne dit plus rien d'utile.
-const SIGNATURE = `${MODEL}|${DTYPE}`;
+// Le modele et la precision peuvent etre imposes par la query string du worker
+// (`whisper.worker.js?modele=...&dtype=...`). Ca ne sert QU'A la page de
+// comparaison test-bench.html, qui doit faire tourner plusieurs variantes cote
+// a cote sans qu'on reecrive ce fichier entre chaque mesure. En production
+// personne ne passe de parametre : ce sont les valeurs par defaut ci-dessus qui
+// s'appliquent.
+//
+// Bonus : `mesurerDansUnEnfant` cree les workers enfants a partir de
+// self.location.href, donc ils heritent automatiquement de ces parametres.
+const PARAMETRES = new URL(self.location.href).searchParams;
+const MODEL = PARAMETRES.get("modele") || MODELE_DEFAUT;
+
+// Le dtype accepte soit un nom ("q8"), soit un objet JSON par sous-modele
+// ({"encoder_model":"q8","decoder_model_merged":"fp32"}) : Transformers.js
+// permet de quantifier l'encodeur sans toucher au decodeur.
+const DTYPE = (() => {
+  const brut = PARAMETRES.get("dtype") || DTYPE_DEFAUT;
+  return brut.startsWith("{") ? JSON.parse(brut) : brut;
+})();
+
+// Niveau d'optimisation du graphe ONNX ("disabled", "basic", "extended",
+// "all"). "all" = le comportement par defaut d'ONNX Runtime, et ce qui va bien
+// a fp32.
+//
+// Ce reglage existe parce qu'il est la CLE des variantes quantifiees : en
+// "all", ni q8 ni fp16 ne chargent, et l'erreur donne le change en accusant les
+// poids alors que le coupable est l'optimiseur --
+//   q8   : qdq_actions.cc TransposeDQWeightsForMatMulNBits
+//          « Missing required scale: model.decoder.embed_tokens... »
+//   fp16 : SimplifiedLayerNormFusion
+// Ce sont deux passes de fusion de niveau "extended". En "basic", les deux
+// chargent et transcrivent. (C'est ce qui explique l'echec note plus tot dans
+// le projet sur les exports quantifies : le probleme n'a jamais ete la
+// quantification elle-meme.)
+//
+// A garder en tete si on retente la quantification un jour -- par exemple avec
+// whisper-base en q8. Mesure au passage : "basic" est plus rapide que
+// "disabled" (1345 ms contre 1505 ms par segment), on ne coupe donc que ce
+// qu'il faut.
+const OPTIMISATION_DEFAUT = "all";
+
+const OPTIMISATION = PARAMETRES.get("opt") || OPTIMISATION_DEFAUT;
+
+// Options passees telles quelles a ONNX Runtime a la creation de la session.
+const SESSION_OPTIONS = { graphOptimizationLevel: OPTIMISATION };
+
+// Change des que le modele, la precision ou le niveau d'optimisation change.
+// Une mesure memorisee qui ne porte pas la meme signature est jetee : elle ne
+// dit plus rien d'utile.
+const SIGNATURE = `${MODEL}|${JSON.stringify(DTYPE)}|${OPTIMISATION}`;
 
 // ---------------------------------------------------------------------------
 // Choix du backend : on MESURE, on ne suppose pas
@@ -90,6 +159,7 @@ function construirePipeline(device) {
   return pipeline("automatic-speech-recognition", MODEL, {
     device,
     dtype: DTYPE,
+    session_options: SESSION_OPTIONS,
     // Suit le telechargement des fichiers du modele et le remonte a la page.
     progress_callback: (etat) => {
       if (etat.status === "progress" && etat.progress != null) {
@@ -97,6 +167,9 @@ function construirePipeline(device) {
           type: "progress",
           fichier: etat.file,
           pourcent: Math.round(etat.progress),
+          // Taille totale du fichier, en octets. Sert a la page de comparaison
+          // pour chiffrer le poids reel de chaque variante du modele.
+          octets: etat.total ?? null,
         });
       }
     },

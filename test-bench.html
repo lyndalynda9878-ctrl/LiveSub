@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>LiveSub - comparaison des variantes de Whisper</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 1000px;
+      margin: 40px auto;
+      padding: 0 20px;
+      color: #1f2937;
+    }
+    h1 { color: #4f46e5; font-size: 20px; }
+    p.hint { color: #6b7280; font-size: 14px; }
+    #etat {
+      margin-top: 16px;
+      padding: 10px 12px;
+      background: #eef2ff;
+      border: 1px solid #c7d2fe;
+      border-radius: 8px;
+      font-size: 14px;
+      font-family: Consolas, monospace;
+    }
+    #log {
+      margin-top: 16px;
+      padding: 14px;
+      background: #f8f9fa;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      max-height: 480px;
+      overflow-y: auto;
+    }
+    .ok { color: #0f9d63; }
+    .err { color: #dc2626; }
+    .titre { color: #4f46e5; font-weight: bold; }
+    table {
+      margin-top: 20px;
+      border-collapse: collapse;
+      font-size: 13px;
+      width: 100%;
+    }
+    th, td {
+      border: 1px solid #e5e7eb;
+      padding: 6px 10px;
+      text-align: left;
+    }
+    th { background: #f3f4f6; }
+    td:first-child { font-family: Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <h1>⚖️ LiveSub — comparaison des variantes de Whisper</h1>
+  <p class="hint">
+    Chaque variante transcrit <strong>exactement le meme audio</strong> : des
+    segments de 2,5 s (la taille que le VAD envoie en production) puis l'extrait
+    complet, en anglais et en francais. On mesure le temps par segment et on
+    compare les textes a ceux de la variante actuelle.
+  </p>
+
+  <div id="etat">Demarrage...</div>
+  <div id="tableau"></div>
+  <div id="fragments"></div>
+  <div id="log">Chargement...</div>
+
+  <script type="module" src="test-bench.js"></script>
+</body>
+</html>

@@ -37,12 +37,36 @@ function toggleOverlay(show) {
   }
 }
 
+// Afficher un texte transcrit. Chaque segment REMPLACE le precedent : un
+// sous-titre, c'est ce qui vient d'etre dit, pas l'historique de la video.
+function afficherSousTitre(texte, finParole) {
+  if (!texte) return;
+
+  subtitleBox.innerText = texte;
+
+  // Le texte peut arriver juste avant le TOGGLE_SUBTITLES (les deux voyagent
+  // par des chemins differents). On ne force pas l'affichage pour autant :
+  // c'est TOGGLE_SUBTITLES qui decide si l'overlay est visible, et le texte
+  // sera deja en place quand il s'affichera.
+
+  // Latence bout en bout : de la fermeture du segment (cote offscreen) a cet
+  // affichage. C'est le chiffre qui compte pour l'utilisateur -- il englobe la
+  // transcription, l'attente en file et les deux sauts de messages.
+  const latence = finParole ? ((Date.now() - finParole) / 1000).toFixed(1) : "?";
+  console.log(`📝 Sous-titre affiche (${latence} s apres la fin de parole) :`, texte);
+}
+
 // Écouter les messages du service worker
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log("📩 Message recu dans content.js :", request);
-  
+
   if (request.type === "TOGGLE_SUBTITLES") {
     toggleOverlay(request.active);
+    sendResponse({ success: true });
+  }
+
+  if (request.type === "SUBTITLE") {
+    afficherSousTitre(request.texte, request.finParole);
     sendResponse({ success: true });
   }
 });

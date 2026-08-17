@@ -142,6 +142,28 @@ async function toggleOverlay(tabId, active) {
   }
 }
 
+// Relaie un texte transcrit vers l'overlay de l'onglet capture.
+//
+// L'offscreen produit le texte mais ne peut pas l'envoyer lui-meme : il n'a pas
+// acces a chrome.tabs. C'est donc nous qui faisons le pont, et nous seuls
+// savons quel onglet est capture (chrome.storage.session).
+//
+// Meme precaution que toggleOverlay : une page sans content script (chrome://,
+// page ouverte avant l'installation) ne doit pas faire de bruit a chaque
+// segment -- on log une fois en warn et on continue.
+async function sendSubtitle(texte, finParole) {
+  const { active, tabId } = await readState();
+  if (!active || !tabId) return; // capture arretee entre-temps
+
+  try {
+    // finParole voyage jusqu'a content.js, qui mesure la latence bout en bout
+    // au moment ou il affiche vraiment le texte.
+    await chrome.tabs.sendMessage(tabId, { type: "SUBTITLE", texte, finParole });
+  } catch (err) {
+    console.warn("⚠️ Sous-titre non affiche (content.js injoignable) :", err.message);
+  }
+}
+
 // Renvoie toujours l'etat resultant -> c'est lui que la popup affiche.
 function startAudioCapture() {
   return serializeCapture(doStartAudioCapture);
@@ -289,6 +311,12 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log("📩 Message recu dans background :", request);
+
+  // Texte transcrit par l'offscreen -> overlay de l'onglet capture.
+  if (request.type === "TRANSCRIPT") {
+    sendSubtitle(request.texte, request.finParole);
+    return; // pas de reponse attendue
+  }
 
   // L'offscreen a fini de choisir son backend : on le retient pour la prochaine
   // fois, ce qui evite de refaire la mesure GPU/CPU a chaque capture.

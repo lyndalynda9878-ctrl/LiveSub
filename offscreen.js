@@ -117,6 +117,7 @@ function surMessageWhisper(event) {
     case "result": {
       const segment = segmentsEnCours.get(message.id);
       segmentsEnCours.delete(message.id);
+      surveillerFile(); // la file se vide aussi ici, pas seulement a l'envoi
 
       const texte = message.texte;
       // Sur un segment sans parole nette, Whisper renvoie souvent une chaine
@@ -127,10 +128,30 @@ function surMessageWhisper(event) {
       }
 
       const duree = segment ? `${segment.secondes} s de parole` : "segment";
+      // Latence reelle : temps entre la fermeture du segment et maintenant.
+      // Elle inclut l'attente en file quand Whisper a du retard, pas seulement
+      // l'inference -- c'est bien ce qu'on veut mesurer.
+      const latence = segment ? (Date.now() - segment.finParole) / 1000 : null;
       console.log(
         `📝 « ${texte} »\n   (${duree}, transcrit en ${(message.ms / 1000).toFixed(1)} s ` +
-          `sur ${message.backend})`
+          `sur ${message.backend}` +
+          (latence === null ? "" : `, latence ${latence.toFixed(1)} s`) +
+          `)`
       );
+
+      // Vers l'overlay de la page. On passe par le service worker : un document
+      // offscreen ne peut pas parler directement a un content script (il n'a pas
+      // acces a chrome.tabs), et c'est le service worker qui sait quel onglet
+      // est capture.
+      //
+      // On joint finParole pour que content.js mesure la latence jusqu'a
+      // l'affichage REEL, bout en bout (meme machine, donc Date.now()
+      // comparable d'un contexte a l'autre).
+      chrome.runtime.sendMessage({
+        type: "TRANSCRIPT",
+        texte,
+        finParole: segment ? segment.finParole : null,
+      });
       break;
     }
 
@@ -179,9 +200,250 @@ function demarrerWhisper(memo) {
   whisperWorker.postMessage({ type: "init", memo: memo ?? null });
 }
 
+// ---------------------------------------------------------------------------
+// Decoupage des segments : on n'attend plus forcement le silence
+// ---------------------------------------------------------------------------
+//
+// Le VAD ne ferme un segment que sur une pause. Sur quelqu'un qui parle sans
+// s'arreter, ca donnait des segments de 20 a 40 s : le sous-titre arrivait
+// bien apres la phrase. On assemble donc les segments NOUS-MEMES, a partir des
+// trames que le VAD nous passe une par une (onFrameProcessed), et on coupe des
+// qu'on atteint DUREE_MAX -- meme si ca parle encore.
+//
+// C'est pour ca qu'on ignore l'audio fourni par onSpeechEnd : il contient tout
+// le passage depuis le debut de la parole, donc ce qu'on a deja envoye. On ne
+// garde de onSpeechEnd que le SIGNAL de fin.
+
+const TAUX = 16000; // le VAD travaille en 16 kHz mono
+
+// 7 s, et pas 2,5 s comme avant. C'est contre-intuitif -- attendre plus pour
+// etre moins en retard -- mais c'est ce que disent les mesures.
+//
+// Whisper complete TOUT extrait a 30 s avant de le traiter. Un segment de 2,5 s
+// lui coute donc presque aussi cher qu'un de 7 s : ~1,4 s de calcul dans les
+// deux cas. Couper fin ne fait rien gagner, ca multiplie juste le nombre
+// d'appels. A 2,5 s, on demandait une inference toutes les ~2,5 s pour ~1,4 s
+// de calcul plus les segments fermes en avance par les silences : le debit
+// demande depassait le debit possible, la file grossissait sans jamais se
+// vider, et le retard grandissait de +0,3 s par seconde d'audio -- mesure : 5 s
+// de retard au bout de 10 s, 32 s au bout de 90 s.
+//
+// A 7 s, on divise le nombre d'inferences par ~3 pour le meme cout unitaire.
+// Et ca corrige aussi le TEXTE : whisper-tiny est tres instable en dessous de
+// ~5 s, il n'a pas assez de contexte et se rabat sur les phrases les plus
+// frequentes de son entrainement (d'ou les « Thank you for watching » et
+// « don't forget to subscribe » observes dans les tests).
+//
+// Le prix a payer : le premier sous-titre d'une phrase arrive apres 7 s de
+// parole au lieu de 2,5 s. Mais avant il arrivait avec 30 s de retard, donc
+// c'est un gain net.
+const DUREE_MAX = 7;
+
+// Quand on coupe a DUREE_MAX, la coupure tombe n'importe ou -- souvent en plein
+// milieu d'un mot. Whisper recevait alors un demi-mot en fin de segment et un
+// demi-mot au debut du suivant, et il inventait la suite dans les deux cas.
+//
+// On garde donc la fin du segment comme debut du suivant : le mot coupe est
+// entier d'un cote au moins. Le mot en question peut apparaitre deux fois de
+// suite a l'ecran, mais chaque sous-titre remplace le precedent -- une legere
+// repetition est bien moins genante qu'un mot invente.
+//
+// Uniquement sur les coupures a DUREE_MAX : quand c'est le VAD qui ferme sur un
+// silence, la phrase est finie, il n'y a rien a rattraper.
+const RECOUVREMENT = 0.5;
+
+// Ce qu'on garde en reserve avant le declenchement du VAD, pour ne pas manger
+// le debut du premier mot. (La librairie a son propre preSpeechPadMs, mais il
+// ne s'applique qu'a SON tampon, pas au notre.)
+const PRE_PAROLE = 0.3;
+
+// En dessous, ce n'est pas de la parole : Whisper n'en tirerait que du bruit.
+const DUREE_MIN = 0.4;
+
+// Duree en dessous de laquelle on prefere ATTENDRE la suite plutot qu'envoyer.
+//
+// DUREE_MAX borne le haut, mais le VAD ferme aussi sur les silences : sans
+// plancher, on continue d'envoyer des bouts d'une seconde. Or c'est exactement
+// la que whisper-tiny invente -- faute de contexte, il sort les phrases les
+// plus frequentes de son entrainement (« Thank you for watching », « And
+// not! »). Mesure : avec DUREE_MAX a 7 s mais aucun plancher, la moitie des
+// sous-titres etaient encore des hallucinations.
+//
+// Donc quand le VAD ferme sur un segment trop court, on ne l'envoie pas tout de
+// suite : on laisse une chance a la phrase de reprendre, et on recolle les deux
+// morceaux.
+const DUREE_MIN_ENVOI = 3;
+
+// ... mais pas indefiniment : si le silence dure, la phrase est vraiment finie
+// et il faut afficher ce qu'on a, meme court. C'est le prix de l'attente :
+// jusqu'a 1,5 s de latence en plus sur le dernier bout d'une phrase.
+const SILENCE_MAX = 1.5;
+
+let tampon = [];        // trames accumulees (Float32Array de 16 kHz)
+let tamponSamples = 0;  // leur total en echantillons, pour eviter de recompter
+let enParole = false;
+
+// Ce que le tampon contient de DEJA ENVOYE : le recouvrement repris au segment
+// precedent. Sert a ne pas retranscrire deux fois le meme demi-mot si le VAD
+// ferme juste apres une coupure a DUREE_MAX.
+let reportSamples = 0;
+
+// Le VAD a ferme, mais le segment etait trop court pour etre envoye tel quel :
+// on garde tout et on attend de voir si la phrase reprend (voir
+// DUREE_MIN_ENVOI). `silenceSamples` compte le silence ecoule depuis.
+let enAttente = false;
+let silenceSamples = 0;
+
+function dureeTampon() {
+  return tamponSamples / TAUX;
+}
+
+// Duree de ce qui n'a encore jamais ete envoye a Whisper.
+function dureeNouveaute() {
+  return (tamponSamples - reportSamples) / TAUX;
+}
+
+function viderTampon() {
+  tampon = [];
+  tamponSamples = 0;
+  reportSamples = 0;
+  enAttente = false;
+  silenceSamples = 0;
+}
+
+// Colle les trames en un seul Float32Array continu, pret pour Whisper.
+function assemblerTampon() {
+  const audio = new Float32Array(tamponSamples);
+  let position = 0;
+  for (const trame of tampon) {
+    audio.set(trame, position);
+    position += trame.length;
+  }
+  return audio;
+}
+
+// Ferme le segment courant et l'envoie a Whisper. `raison` sert au log.
+//
+// `recouvrement` (en secondes) = ce qu'on garde de la FIN de ce segment pour
+// demarrer le suivant. Voir le commentaire de RECOUVREMENT.
+function fermerSegment(raison, recouvrement = 0) {
+  // On teste ce qu'il y a de NOUVEAU, pas la taille du tampon : juste apres une
+  // coupure a DUREE_MAX, le tampon contient deja le recouvrement, qui a ete
+  // envoye avec le segment precedent. Le renvoyer seul afficherait un
+  // sous-titre en double.
+  if (dureeNouveaute() < DUREE_MIN) {
+    viderTampon();
+    return;
+  }
+
+  const audio = assemblerTampon();
+
+  if (recouvrement > 0) {
+    // On reprend les dernieres trames en repartant de la fin, jusqu'a couvrir
+    // la duree voulue. On raisonne en trames entieres : elles font ~32 ms, donc
+    // l'arrondi est sans consequence, et ca evite de decouper un Float32Array.
+    const cible = recouvrement * TAUX;
+    const queue = [];
+    let gardes = 0;
+    for (let i = tampon.length - 1; i >= 0 && gardes < cible; i--) {
+      queue.unshift(tampon[i]);
+      gardes += tampon[i].length;
+    }
+    tampon = queue;
+    tamponSamples = gardes;
+    reportSamples = gardes; // tout ce qui reste vient d'etre envoye
+    enAttente = false;
+    silenceSamples = 0;
+  } else {
+    viderTampon();
+  }
+
+  transcrireSegment(audio, raison);
+}
+
+// Appelee pour CHAQUE trame analysee par le VAD (~32 ms), qu'il y ait parole
+// ou non. C'est ici qu'on decide de couper.
+function surTrame(trame) {
+  tampon.push(trame);
+  tamponSamples += trame.length;
+
+  if (!enParole) {
+    // Cas 1 : on retient un segment trop court en esperant la suite. On garde
+    // TOUT (y compris ce silence : Whisper s'en accommode tres bien, et ca
+    // conserve le rythme de la phrase si elle reprend).
+    if (enAttente) {
+      silenceSamples += trame.length;
+      // Le silence s'installe : la phrase etait bel et bien finie, on envoie ce
+      // qu'on a plutot que de faire attendre le sous-titre davantage.
+      if (silenceSamples / TAUX >= SILENCE_MAX) {
+        fermerSegment("silence prolonge");
+      }
+      return;
+    }
+
+    // Cas 2 : au repos. Le tampon ne sert que de reserve : on jette ce qui
+    // depasse PRE_PAROLE, sinon il grossirait indefiniment pendant les silences.
+    while (dureeTampon() > PRE_PAROLE && tampon.length > 1) {
+      tamponSamples -= tampon.shift().length;
+    }
+    // On vient peut-etre de jeter des trames comptees dans le report : sans ce
+    // recalage, dureeNouveaute() sous-estimerait le neuf et on finirait par
+    // jeter des segments valables.
+    reportSamples = Math.min(reportSamples, tamponSamples);
+    return;
+  }
+
+  // Ca parle toujours mais le segment est plein : on coupe sans attendre, en
+  // gardant la fin pour le segment suivant (la coupure tombe en plein mot).
+  if (dureeTampon() >= DUREE_MAX) {
+    fermerSegment("duree max", RECOUVREMENT);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Surveillance de la file
+// ---------------------------------------------------------------------------
+//
+// Whisper traite les segments un par un. Tant qu'il transcrit plus vite que la
+// parole n'arrive, la file reste vide et la latence est celle d'un segment. Des
+// qu'il ralentit (machine chargee, segments plus courts donc plus nombreux), la
+// file s'allonge et la latence derive sans jamais revenir toute seule : c'est le
+// signe que le reglage est trop agressif pour cette machine.
+//
+// On previent au franchissement du seuil, pas a chaque segment : sinon
+// l'avertissement noierait la console au moment ou on en a le plus besoin.
+const FILE_ALERTE = 3;
+let fileSignalee = false;
+
+function surveillerFile() {
+  const enAttente = segmentsEnCours.size;
+
+  if (!fileSignalee && enAttente > FILE_ALERTE) {
+    fileSignalee = true;
+    console.warn(
+      `⚠️  La transcription prend du retard : ${enAttente} segments en attente. ` +
+        `Les sous-titres vont s'afficher de plus en plus tard. ` +
+        `Si ca persiste, rallonger encore DUREE_MAX (actuellement ${DUREE_MAX} s) : ` +
+        `un segment long ne coute pas plus cher qu'un court, Whisper les complete ` +
+        `tous a 30 s.`
+    );
+    return;
+  }
+
+  // Retour a la normale : utile a savoir, ca distingue un a-coup passager
+  // (le chargement du modele, par exemple) d'un vrai sous-dimensionnement.
+  if (fileSignalee && enAttente <= 1) {
+    fileSignalee = false;
+    console.log("✅ La transcription a rattrape son retard (file vide).");
+  }
+}
+
 // Envoie un segment de parole au worker. Rien a decoder : le VAD produit deja
 // du Float32Array mono a 16 kHz, exactement ce que Whisper attend.
-function transcrireSegment(audio) {
+//
+// `audio` nous appartient (on vient de l'assembler), donc on le transfere
+// directement : aucune copie.
+function transcrireSegment(audio, raison) {
   // Le VAD ne peut pas tourner sans capture, et la capture demarre Whisper :
   // en pratique on ne passe jamais ici sans worker. Garde-fou quand meme.
   if (!whisperWorker) {
@@ -190,29 +452,22 @@ function transcrireSegment(audio) {
   }
 
   const id = prochainSegmentId++;
-  const secondes = (audio.length / 16000).toFixed(1);
-  segmentsEnCours.set(id, { secondes });
-
-  // On envoie une COPIE, et c'est elle qu'on transfere. Transferer directement
-  // le tableau du VAD viderait un buffer dont la librairie est proprietaire.
-  // La copie coute quelques centaines de Ko, le risque n'en vaut pas la peine.
-  const copie = new Float32Array(audio);
+  const secondes = (audio.length / TAUX).toFixed(1);
+  // finParole = maintenant : c'est l'instant ou le segment est clos. Il sert a
+  // mesurer la latence jusqu'a l'affichage du sous-titre.
+  segmentsEnCours.set(id, { secondes, finParole: Date.now() });
 
   // 2e argument : liste des buffers TRANSFERES. Le tableau change de
-  // proprietaire au lieu d'etre copie une seconde fois pour passer au worker.
+  // proprietaire au lieu d'etre copie pour passer au worker.
   whisperWorker.postMessage(
-    { type: "transcribe", id, audio: copie, langue: null },
-    [copie.buffer]
+    { type: "transcribe", id, audio, langue: null },
+    [audio.buffer]
   );
 
   const attente = whisperPret ? "" : " (le modele charge encore, ca patientera)";
-  console.log(`➡️  Segment #${id} envoye a Whisper : ${secondes} s${attente}`);
+  console.log(`➡️  Segment #${id} envoye a Whisper : ${secondes} s (${raison})${attente}`);
 
-  // Un retard qui s'installe se voit ici : la transcription ne suit plus la
-  // parole. Utile a savoir avant de brancher l'overlay.
-  if (segmentsEnCours.size > 3) {
-    console.warn(`⚠️  ${segmentsEnCours.size} segments en attente de transcription`);
-  }
+  surveillerFile();
 }
 
 
@@ -334,6 +589,16 @@ async function startVAD(stream) {
       // Silero VAD v5 (le defaut de la librairie est l'ancien modele "legacy").
       model: "v5",
 
+      // Combien de silence avant de declarer la parole finie. Defaut : 1400 ms,
+      // soit presque une seconde et demie ajoutee a CHAQUE sous-titre. A 700 ms
+      // on coupe sur les vraies respirations sans hacher les phrases.
+      redemptionMs: 700,
+
+      // Duree minimale pour qu'un bruit compte comme de la parole. On garde le
+      // defaut (400 ms) : le baisser ferait passer des toux et des bruits de
+      // clavier pour de la parole, et Whisper en ferait du texte inutile.
+      minSpeechMs: 400,
+
       // Ou trouver vad.worklet.bundle.min.js et silero_vad_v5.onnx
       baseAssetPath: chrome.runtime.getURL("vendor/"),
       // Ou trouver ort-wasm-simd-threaded.mjs et .wasm
@@ -347,17 +612,48 @@ async function startVAD(stream) {
         ort.env.wasm.proxy = false;
       },
 
+      // Toutes les trames passent par ici (~32 ms chacune), parole ou pas :
+      // c'est nous qui assemblons et decoupons les segments.
+      onFrameProcessed: (probs, trame) => {
+        surTrame(trame);
+      },
+
       onSpeechStart: () => {
         console.log("🗣️ PAROLE DETECTEE ! (debut)");
+        // Le tampon contient deja PRE_PAROLE secondes de son : le debut du
+        // premier mot est dedans, on repart de la sans rien jeter.
+        //
+        // Et si on etait en attente (segment trop court), le tampon contient en
+        // plus tout le morceau precedent : la phrase se recolle d'elle-meme.
+        enParole = true;
+        enAttente = false;
+        silenceSamples = 0;
       },
-      onSpeechEnd: (audio) => {
+
+      // On ignore l'audio que la librairie nous tend : il repart du debut de la
+      // parole, donc il contient ce qu'on a deja envoye a chaque coupure. Seul
+      // le signal de fin nous interesse.
+      onSpeechEnd: () => {
         console.log("🔇 PAROLE TERMINEE ! (fin)");
-        // Le segment part a Whisper : Float32Array mono 16 kHz, deja au bon
-        // format. Le texte arrivera dans la console via whisperWorker.onmessage.
-        transcrireSegment(audio);
+        enParole = false;
+
+        // Assez de matiere : on envoie tout de suite.
+        if (dureeNouveaute() >= DUREE_MIN_ENVOI) {
+          fermerSegment("fin de parole");
+          return;
+        }
+
+        // Trop court : on retient, en esperant que la phrase reprenne. C'est
+        // surTrame qui tranchera, au bout de SILENCE_MAX.
+        enAttente = true;
+        silenceSamples = 0;
       },
+
       onVADMisfire: () => {
         console.log("❌ Fausse alerte du VAD (bruit)");
+        // Trop court pour etre de la parole : on jette, sans rien envoyer.
+        enParole = false;
+        viderTampon();
       }
     });
 
@@ -421,6 +717,13 @@ async function stopCapture() {
 
   isCapturing = false;
   analyser = null;
+
+  // Le tampon de trames ne doit pas survivre a la capture : sans ca, la
+  // prochaine commencerait avec la fin de l'audio de la precedente.
+  enParole = false;
+  viderTampon();
+  fileSignalee = false;
+
   console.log("✅ Offscreen : tout est bien ferme");
 }
 
