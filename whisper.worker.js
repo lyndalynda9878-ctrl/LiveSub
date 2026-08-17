@@ -43,6 +43,33 @@ env.allowRemoteModels = true;
 // l'anglais : LiveSub doit sous-titrer du francais).
 const MODELE_DEFAUT = "Xenova/whisper-tiny";
 
+// Nombre maximum de jetons (~mots) que Whisper a le droit d'ecrire pour UN
+// segment. Sans reglage, la librairie autorise 448 jetons.
+//
+// Ce n'est pas theorique : mesure sur de la parole propre, un segment a mis
+// 17,1 s a etre transcrit alors que la mediane etait de 4,3 s. Whisper part en
+// boucle de repetition et ecrit jusqu'a epuisement du quota. Pendant ce
+// temps-la le worker est monopolise, les segments s'empilent, et c'est
+// exactement le « blocage » observe.
+//
+// 60 jetons est large : un segment fait au plus 7 s de parole (DUREE_MAX dans
+// offscreen.js), soit ~20 a 25 mots a debit normal. On ne coupe donc jamais une
+// phrase legitime -- on ne coupe que les boucles.
+const MAX_JETONS = 60;
+
+// Langue imposee a Whisper.
+//
+// Avant, on laissait la detection automatique (`language` absent). Elle se
+// trompe reguliserement sur des segments courts : dans les tests, du francais
+// est ressorti en anglais (« J'adore, j'aime » -> « I love you »), et une
+// langue mal detectee donne du texte faux ou vide.
+//
+// TODO : a remplacer par un choix de l'utilisateur (selecteur FR/EN dans la
+// popup). En attendant, on impose le francais, qui est le cas d'usage vise.
+// Le message `transcribe` peut toujours passer une langue explicite, qui
+// l'emporte -- c'est ce que fait la page de comparaison test-bench.html.
+const LANGUE_DEFAUT = "french";
+
 // Poids NON quantifies. C'est un choix mesure, pas un choix par defaut.
 //
 // La quantification 8 bits (onnx-community/whisper-tiny en `q8`, avec
@@ -398,6 +425,8 @@ function enfiler(tache) {
 //   { type: "init", memo }              memo = { backend, signature } ou null,
 //                                       relu depuis chrome.storage par la page
 //   { type: "transcribe", id, audio: Float32Array (16 kHz mono), langue }
+//     `langue` est facultative : absente, on applique LANGUE_DEFAUT. Elle n'est
+//     jamais laissee a la detection automatique.
 // Worker -> worker enfant (mesure, usage interne) :
 //   { type: "init", forcer: "webgpu"|"wasm", mesurer: true }
 //     -> l'enfant repond "ready" avec msMesure, puis on le jette.
@@ -445,11 +474,16 @@ self.onmessage = (event) => {
         // Chrono demarre APRES le chargement : on veut mesurer l'inference
         // seule, pour comparer honnetement WebGPU et WASM.
         const debut = performance.now();
-        // Sans `langue`, on laisse Whisper detecter tout seul. On n'ecrit pas
-        // `language: undefined` : la librairie ne traite pas ca comme "absent".
-        // Avec une langue imposee c'est plus sur sur un extrait court, ou la
-        // detection automatique de whisper-tiny se trompe facilement.
-        const resultat = await transcrire(audio, langue ? { language: langue } : {});
+        // La langue est TOUJOURS imposee : celle du message si elle est
+        // fournie, sinon LANGUE_DEFAUT. On ne laisse plus Whisper deviner --
+        // sur un segment court il se trompe trop souvent (voir LANGUE_DEFAUT).
+        //
+        // max_new_tokens borne le temps de calcul : c'est ce qui empeche une
+        // boucle de repetition de monopoliser le worker (voir MAX_JETONS).
+        const resultat = await transcrire(audio, {
+          language: langue || LANGUE_DEFAUT,
+          max_new_tokens: MAX_JETONS,
+        });
         self.postMessage({
           type: "result",
           id,

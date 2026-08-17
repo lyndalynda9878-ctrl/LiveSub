@@ -294,6 +294,14 @@ let reportSamples = 0;
 let enAttente = false;
 let silenceSamples = 0;
 
+// Etions-nous en attente juste avant que le VAD ne crie « parole » ?
+//
+// Sert uniquement au cas de la fausse alerte : si ce declenchement se revele
+// etre du bruit, il faut pouvoir revenir a l'etat d'avant au lieu de tout
+// jeter. Sans cette memoire, l'information est perdue -- onSpeechStart remet
+// deja enAttente a false.
+let attenteAvantParole = false;
+
 function dureeTampon() {
   return tamponSamples / TAUX;
 }
@@ -309,6 +317,7 @@ function viderTampon() {
   reportSamples = 0;
   enAttente = false;
   silenceSamples = 0;
+  attenteAvantParole = false;
 }
 
 // Colle les trames en un seul Float32Array continu, pret pour Whisper.
@@ -625,6 +634,9 @@ async function startVAD(stream) {
         //
         // Et si on etait en attente (segment trop court), le tampon contient en
         // plus tout le morceau precedent : la phrase se recolle d'elle-meme.
+        // On note l'etat d'avant : si cette « parole » se revele etre du bruit
+        // (onVADMisfire), il faudra y revenir sans jeter ce qu'on retenait.
+        attenteAvantParole = enAttente;
         enParole = true;
         enAttente = false;
         silenceSamples = 0;
@@ -651,9 +663,26 @@ async function startVAD(stream) {
 
       onVADMisfire: () => {
         console.log("❌ Fausse alerte du VAD (bruit)");
-        // Trop court pour etre de la parole : on jette, sans rien envoyer.
         enParole = false;
-        viderTampon();
+
+        // AVANT : viderTampon() -- on jetait TOUT le tampon.
+        //
+        // C'etait faux des qu'on retenait un segment court en attendant la
+        // suite de la phrase : un simple bruit (musique, effet sonore) suffisait
+        // a effacer de la vraie parole, jamais transcrite. Mesure sur une
+        // source avec musique : 4 a 5,5 % du son captee partait comme ca.
+        //
+        // MAINTENANT : on ne jette que le bruit. Si on retenait quelque chose,
+        // on retourne simplement en attente, tampon intact.
+        if (attenteAvantParole) {
+          enAttente = true;
+          attenteAvantParole = false;
+          return;
+        }
+
+        // Rien n'etait retenu : pas besoin de vider non plus. La branche « au
+        // repos » de surTrame ramene le tampon a PRE_PAROLE toute seule, ce qui
+        // preserve l'amorce du mot suivant.
       }
     });
 
