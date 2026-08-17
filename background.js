@@ -67,6 +67,28 @@ async function readWhisperBackend() {
 }
 
 // ---------------------------------------------------------------------------
+// Langue parlee dans la video
+// ---------------------------------------------------------------------------
+// Choisie par l'utilisateur dans la popup, rangee dans storage.local.
+//
+// Meme raison que pour le backend Whisper : c'est nous qui lisons le storage,
+// pas l'offscreen (ou chrome.storage s'est revele non fiable). L'offscreen la
+// recoit dans START_CAPTURE, puis par le message LANGUE si elle change en
+// cours de capture.
+const LANGUE_KEY = "langueSousTitres";
+const LANGUE_DEFAUT = "french";
+
+async function readLangue() {
+  try {
+    return (await chrome.storage.local.get(LANGUE_KEY))[LANGUE_KEY] || LANGUE_DEFAUT;
+  } catch (err) {
+    // Sans memoire, on retombe sur le francais : la capture doit demarrer.
+    console.warn("⚠️ Lecture de la langue impossible :", err);
+    return LANGUE_DEFAUT;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Offscreen document
 // ---------------------------------------------------------------------------
 // Deux appels simultanes a createDocument() levent une erreur : on memorise la
@@ -206,7 +228,9 @@ async function doStartAudioCapture() {
       tabId: tab.id,
       // L'offscreen ne peut pas lire chrome.storage de facon fiable : on lui
       // passe le backend deja mesure (null au premier lancement).
-      memoBackend: await readWhisperBackend()
+      memoBackend: await readWhisperBackend(),
+      // Idem pour la langue choisie dans la popup.
+      langue: await readLangue()
     });
 
     if (!response || !response.success) {
@@ -315,6 +339,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // Texte transcrit par l'offscreen -> overlay de l'onglet capture.
   if (request.type === "TRANSCRIPT") {
     sendSubtitle(request.texte, request.finParole);
+    return; // pas de reponse attendue
+  }
+
+  // La popup a change de langue -> on previent l'offscreen, qui l'appliquera
+  // au prochain segment. Ca evite d'avoir a redemarrer la capture.
+  if (request.type === "SET_LANGUE") {
+    // try/catch : il n'y a pas forcement d'offscreen document (aucune capture
+    // en cours). Ce n'est pas une erreur -- la langue est deja rangee dans
+    // storage.local par la popup, et sera lue au prochain demarrage.
+    chrome.runtime
+      .sendMessage({ type: "LANGUE", langue: request.langue })
+      .then(() => console.log("🗣️ Langue transmise a l'offscreen :", request.langue))
+      .catch(() => console.log("ℹ️ Pas de capture en cours : langue rangee pour plus tard"));
     return; // pas de reponse attendue
   }
 

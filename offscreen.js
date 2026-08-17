@@ -28,8 +28,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // suite sans attendre : si getUserMedia echouait ensuite, l'erreur restait
     // dans cette console et le background enregistrait quand meme "actif" --
     // la popup affichait "✅ Actif" alors que rien ne capturait.
-    startCapture(request.streamId, request.memoBackend).then(sendResponse);
+    startCapture(request.streamId, request.memoBackend, request.langue).then(sendResponse);
     return true; // reponse asynchrone
+  }
+
+  // La langue a change dans la popup pendant qu'on capture. On ne touche a
+  // rien d'autre : le segment en cours de transcription part avec l'ancienne
+  // langue, le suivant prendra la nouvelle.
+  if (request.type === "LANGUE") {
+    langueCourante = request.langue;
+    console.log("🗣️ Langue des sous-titres :", langueCourante);
+    return; // pas de reponse attendue
   }
 
   if (request.type === "STOP_CAPTURE") {
@@ -68,6 +77,16 @@ const segmentsEnCours = new Map();
 // les segments partent quand meme : le worker les met dans sa propre file et
 // les traitera des qu'il sera pret.
 let whisperPret = false;
+
+// Langue parlee dans la video, choisie par l'utilisateur dans la popup.
+//
+// Elle nous arrive du service worker : dans START_CAPTURE au demarrage, puis
+// par le message LANGUE si l'utilisateur en change en cours de route. On ne lit
+// pas chrome.storage d'ici, pour la meme raison que le backend (voir plus bas).
+//
+// La valeur initiale n'est qu'un filet : en pratique START_CAPTURE arrive
+// toujours avant le premier segment.
+let langueCourante = "french";
 
 // ⚠️ Le backend mesure (GPU ou CPU) est memorise dans chrome.storage, mais PAS
 // depuis ici : dans un document offscreen, chrome.storage s'est revele non
@@ -469,7 +488,7 @@ function transcrireSegment(audio, raison) {
   // 2e argument : liste des buffers TRANSFERES. Le tableau change de
   // proprietaire au lieu d'etre copie pour passer au worker.
   whisperWorker.postMessage(
-    { type: "transcribe", id, audio, langue: null },
+    { type: "transcribe", id, audio, langue: langueCourante },
     [audio.buffer]
   );
 
@@ -483,9 +502,13 @@ function transcrireSegment(audio, raison) {
 // Démarrer la capture.
 // Ne rejette JAMAIS : renvoie toujours { success, error?, warning? }, parce que
 // c'est cette reponse qui decide si le background a le droit d'ecrire "actif".
-async function startCapture(streamId, memoBackend) {
+async function startCapture(streamId, memoBackend, langue) {
   try {
     console.log("🎤 Offscreen : demarrage capture avec streamId :", streamId);
+
+    // La langue du choix utilisateur, transmise par le service worker.
+    if (langue) langueCourante = langue;
+    console.log("🗣️ Langue des sous-titres :", langueCourante);
 
     // Si on a déjà une capture, on l'arrête d'abord
     if (mediaStream) {

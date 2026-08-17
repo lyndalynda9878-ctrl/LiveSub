@@ -64,10 +64,14 @@ const MAX_JETONS = 60;
 // est ressorti en anglais (« J'adore, j'aime » -> « I love you »), et une
 // langue mal detectee donne du texte faux ou vide.
 //
-// TODO : a remplacer par un choix de l'utilisateur (selecteur FR/EN dans la
-// popup). En attendant, on impose le francais, qui est le cas d'usage vise.
-// Le message `transcribe` peut toujours passer une langue explicite, qui
-// l'emporte -- c'est ce que fait la page de comparaison test-bench.html.
+// C'est un REPLI, pas le reglage principal : la langue vient normalement du
+// selecteur de la popup, et voyage jusqu'ici dans le message `transcribe`
+// (popup -> background -> offscreen -> worker). Elle l'emporte toujours sur
+// cette constante. La page de comparaison test-bench.html passe elle aussi sa
+// propre langue.
+//
+// LANGUE_DEFAUT ne sert donc que si personne n'en precise : worker appele sans
+// langue, ou storage illisible.
 const LANGUE_DEFAUT = "french";
 
 // Poids NON quantifies. C'est un choix mesure, pas un choix par defaut.

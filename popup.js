@@ -13,6 +13,44 @@ let warningMessage = null;
 // Recuperer le bouton et la zone de statut
 const toggleBtn = document.getElementById("toggleBtn");
 const statusDiv = document.getElementById("status");
+const langueSelect = document.getElementById("langue");
+
+// ---------------------------------------------------------------------------
+// Langue parlee dans la video
+// ---------------------------------------------------------------------------
+//
+// storage.local (et pas .session) : le choix doit survivre a la fermeture du
+// navigateur, c'est une preference de l'utilisateur.
+//
+// La popup est detruite a chaque fermeture : sans cette relecture au
+// chargement, le menu repartirait toujours sur la premiere option.
+const CLE_LANGUE = "langueSousTitres";
+const LANGUE_PAR_DEFAUT = "french";
+
+async function chargerLangue() {
+  try {
+    const stored = await chrome.storage.local.get(CLE_LANGUE);
+    langueSelect.value = stored[CLE_LANGUE] || LANGUE_PAR_DEFAUT;
+  } catch (err) {
+    // Sans storage on affiche le defaut : rien de casse, juste pas memorise.
+    langueSelect.value = LANGUE_PAR_DEFAUT;
+  }
+}
+
+langueSelect.addEventListener("change", async () => {
+  const langue = langueSelect.value;
+
+  try {
+    await chrome.storage.local.set({ [CLE_LANGUE]: langue });
+    // On previent le background, qui relaie a l'offscreen : ca permet de
+    // changer de langue SANS redemarrer la capture. Si rien ne capture, le
+    // relais echoue sans consequence -- la valeur rangee ci-dessus sera lue au
+    // prochain demarrage.
+    await chrome.runtime.sendMessage({ type: "SET_LANGUE", langue });
+  } catch (err) {
+    console.warn("Changement de langue non transmis :", err);
+  }
+});
 
 function setStatus(text, color) {
   statusDiv.textContent = text;
@@ -118,3 +156,4 @@ chrome.storage.session.onChanged.addListener((changes) => {
 
 // Au depart, on demande l'etat au background au lieu de supposer "arrete".
 loadState();
+chargerLangue();
