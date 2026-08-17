@@ -89,6 +89,45 @@ async function readLangue() {
 }
 
 // ---------------------------------------------------------------------------
+// Retard du son
+// ---------------------------------------------------------------------------
+// Sert a recaler ce qu'on entend sur les sous-titres, qui arrivent forcement
+// en retard. Deux formes possibles :
+//   - un NOMBRE de secondes (0 = desactive) : reglage manuel ;
+//   - la chaine "auto" : l'offscreen mesure le bon retard sur les 5 premiers
+//     segments, puis nous le renvoie pour qu'on le retienne.
+//
+// Meme circuit que la langue : lu ici, transmis dans START_CAPTURE, puis par le
+// message RETARD s'il change en cours de capture.
+const RETARD_KEY = "retardAudio";
+const RETARD_DEFAUT = 0;
+
+// Le retard mesure en mode auto, une fois la calibration faite. Absent tant
+// qu'on n'a jamais calibre -- l'offscreen calibrera alors au prochain
+// demarrage.
+const RETARD_CALIBRE_KEY = "retardCalibre";
+
+async function readRetard() {
+  try {
+    return (await chrome.storage.local.get(RETARD_KEY))[RETARD_KEY] ?? RETARD_DEFAUT;
+  } catch (err) {
+    // Sans memoire, pas de retard : c'est le comportement d'origine.
+    console.warn("⚠️ Lecture du retard audio impossible :", err);
+    return RETARD_DEFAUT;
+  }
+}
+
+async function readRetardCalibre() {
+  try {
+    return (await chrome.storage.local.get(RETARD_CALIBRE_KEY))[RETARD_CALIBRE_KEY] ?? null;
+  } catch (err) {
+    // Sans memoire, l'offscreen recalibrera : c'est lent mais correct.
+    console.warn("⚠️ Lecture du retard calibre impossible :", err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Offscreen document
 // ---------------------------------------------------------------------------
 // Deux appels simultanes a createDocument() levent une erreur : on memorise la
@@ -230,7 +269,12 @@ async function doStartAudioCapture() {
       // passe le backend deja mesure (null au premier lancement).
       memoBackend: await readWhisperBackend(),
       // Idem pour la langue choisie dans la popup.
-      langue: await readLangue()
+      langue: await readLangue(),
+      // Et pour le retard applique au son des haut-parleurs.
+      retard: await readRetard(),
+      // En mode "auto", la valeur deja calibree (null si jamais mesuree) :
+      // elle evite de repasser par la calibration a chaque lancement.
+      retardCalibre: await readRetardCalibre()
     });
 
     if (!response || !response.success) {
@@ -352,6 +396,38 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .sendMessage({ type: "LANGUE", langue: request.langue })
       .then(() => console.log("🗣️ Langue transmise a l'offscreen :", request.langue))
       .catch(() => console.log("ℹ️ Pas de capture en cours : langue rangee pour plus tard"));
+    return; // pas de reponse attendue
+  }
+
+  // La popup a change le retard du son -> on previent l'offscreen, qui ajuste
+  // son noeud de retard a chaud. Meme fonctionnement que SET_LANGUE.
+  if (request.type === "SET_RETARD") {
+    // Repasser sur "auto" doit REMESURER : on efface la valeur calibree avant
+    // de relayer, sinon l'offscreen reappliquerait l'ancienne mesure -- qui
+    // peut dater d'une machine plus rapide ou d'un autre reglage.
+    const prepare =
+      request.retard === "auto"
+        ? chrome.storage.local.remove(RETARD_CALIBRE_KEY).catch(() => {})
+        : Promise.resolve();
+
+    prepare.then(() => {
+      // try/catch : pas forcement d'offscreen document (aucune capture en
+      // cours). La valeur est deja rangee dans storage.local par la popup.
+      chrome.runtime
+        .sendMessage({ type: "RETARD", retard: request.retard })
+        .then(() => console.log("⏱️ Retard transmis a l'offscreen :", request.retard))
+        .catch(() => console.log("ℹ️ Pas de capture en cours : retard range pour plus tard"));
+    });
+    return; // pas de reponse attendue
+  }
+
+  // L'offscreen a fini de mesurer le bon retard : on le retient, pour que les
+  // prochains lancements l'appliquent des la premiere seconde.
+  if (request.type === "RETARD_CALIBRE") {
+    chrome.storage.local
+      .set({ [RETARD_CALIBRE_KEY]: request.valeur })
+      .then(() => console.log("💾 Retard calibre memorise :", request.valeur, "s"))
+      .catch((err) => console.warn("⚠️ Memorisation du retard impossible :", err));
     return; // pas de reponse attendue
   }
 

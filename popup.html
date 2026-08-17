@@ -40,6 +40,12 @@
       font-size: 12px;
       color: #666;
     }
+    #retardInfo {
+      font-size: 11px;
+      color: #4f46e5;
+      margin: -8px 0 12px 0;
+      min-height: 1.2em;
+    }
     select {
       width: 100%;
       padding: 7px;
@@ -87,6 +93,23 @@
     <option value="polish">Polski</option>
     <option value="hindi">हिन्दी</option>
   </select>
+
+  <!-- Retarder le son permet de le recaler sur les sous-titres, qui arrivent
+       toujours avec un temps de retard (le temps de transcrire). Ca ne rend
+       PAS les sous-titres plus rapides : ca ralentit le son pour qu'il les
+       rejoigne. -->
+  <label for="retardAudio">Retarder le son</label>
+  <select id="retardAudio">
+    <option value="0">Désactivé</option>
+    <option value="auto">Auto (aligné sur la voix)</option>
+    <option value="2">2 s</option>
+    <option value="5">5 s</option>
+    <option value="7">7 s</option>
+    <option value="9">9 s</option>
+    <option value="11">11 s</option>
+    <option value="13">13 s</option>
+  </select>
+  <div id="retardInfo"></div>
 
   <button id="toggleBtn">▶️ Demarrer</button>
   <div id="status">⏸️ Arrete</div>

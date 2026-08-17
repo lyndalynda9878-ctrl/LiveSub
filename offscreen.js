@@ -7,6 +7,32 @@ let audioElement = null;
 let vad = null;
 let analyser = null;
 
+// Noeud de retard insere UNIQUEMENT sur le chemin des haut-parleurs.
+// Voir le montage du graphe dans startCapture : c'est la que se joue toute la
+// fonctionnalite, et c'est la qu'il ne faut pas se tromper de branche.
+let delayNode = null;
+
+// ---------------------------------------------------------------------------
+// Calibration automatique du retard
+// ---------------------------------------------------------------------------
+//
+// Le but, en langage clair : quand un sous-titre apparait, l'utilisateur doit
+// etre en train d'entendre le PREMIER mot de ce sous-titre, pas le dernier. Il
+// doit pouvoir lire et ecouter en meme temps.
+//
+// Le bon retard est donc l'ecart entre le DEBUT du segment et le moment ou son
+// texte s'affiche :
+//     retard = duree du segment + temps de transcription (+ transport)
+// Soit, en pratique, 8 a 12 s -- et pas 2 s. Deux secondes, c'est l'ecart
+// depuis la FIN du segment : avec ce reglage, l'utilisateur a deja fini
+// d'entendre la phrase quand le texte arrive.
+//
+// On ne devine pas ces valeurs : les deux reperes sont deja mesures (voir
+// debutSegment dans transcrireSegment), on les lit.
+let modeRetard = 0; // 0 (desactive) | un nombre de secondes | "auto"
+let echantillonsRetard = [];
+let retardApplique = null; // renseigne des que la calibration a tranche
+
 // ---------------------------------------------------------------------------
 // Messages du service worker
 // ---------------------------------------------------------------------------
@@ -28,7 +54,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // suite sans attendre : si getUserMedia echouait ensuite, l'erreur restait
     // dans cette console et le background enregistrait quand meme "actif" --
     // la popup affichait "✅ Actif" alors que rien ne capturait.
-    startCapture(request.streamId, request.memoBackend, request.langue).then(sendResponse);
+    startCapture(
+      request.streamId,
+      request.memoBackend,
+      request.langue,
+      request.retard,
+      request.retardCalibre
+    ).then(sendResponse);
     return true; // reponse asynchrone
   }
 
@@ -38,6 +70,28 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "LANGUE") {
     langueCourante = request.langue;
     console.log("🗣️ Langue des sous-titres :", langueCourante);
+    return; // pas de reponse attendue
+  }
+
+  // Le retard du son a change dans la popup pendant qu'on capture. Le noeud
+  // existe deja dans le graphe : il suffit de changer sa valeur, le son
+  // s'ajuste sans coupure et sans redemarrage.
+  if (request.type === "RETARD") {
+    modeRetard = request.retard ?? 0;
+
+    if (modeRetard === "auto") {
+      // On repart d'une calibration neuve : le service worker vient d'effacer
+      // l'ancienne mesure, on remet le son a plat et on remesure.
+      echantillonsRetard = [];
+      retardApplique = null;
+      if (delayNode) delayNode.delayTime.value = 0;
+      console.log("⏱️ Retard du son : auto (calibration en cours)");
+    } else {
+      // Reglage manuel : il fige la valeur et coupe toute calibration.
+      retardApplique = Number(modeRetard) || 0;
+      if (delayNode) delayNode.delayTime.value = retardApplique;
+      console.log("⏱️ Retard du son :", retardApplique, "s");
+    }
     return; // pas de reponse attendue
   }
 
@@ -137,6 +191,33 @@ function surMessageWhisper(event) {
       const segment = segmentsEnCours.get(message.id);
       segmentsEnCours.delete(message.id);
       surveillerFile(); // la file se vide aussi ici, pas seulement a l'envoi
+
+      // Calibration du retard. ⚠️ AVANT le filtre des segments sans texte :
+      // un segment vide n'a rien a afficher, mais c'est une mesure de temps
+      // parfaitement valable -- et s'en priver rallongerait la calibration.
+      if (modeRetard === "auto" && retardApplique === null && segment) {
+        const besoin = (Date.now() - segment.debutSegment) / 1000;
+        echantillonsRetard.push(besoin);
+        console.log(
+          `🎚️ Calibration ${echantillonsRetard.length}/5 : ${besoin.toFixed(1)} s`
+        );
+
+        if (echantillonsRetard.length === 5) {
+          // Le MAXIMUM, pas la moyenne : mieux vaut un texte legerement EN
+          // AVANCE sur la voix qu'en retard. Un sous-titre en avance se lit
+          // tranquillement ; un sous-titre en retard ne sert plus a rien.
+          // +0,3 s de marge, et 18 s de plafond (le noeud en accepte 20).
+          retardApplique = Math.min(18, Math.max(...echantillonsRetard) + 0.3);
+          if (delayNode) delayNode.delayTime.value = retardApplique;
+          console.log(`🎚️ Retard calibré : ${retardApplique.toFixed(1)} s`);
+
+          // Memorise par le service worker : les prochains lancements
+          // l'appliqueront tout de suite, sans retraverser la calibration.
+          chrome.runtime
+            .sendMessage({ type: "RETARD_CALIBRE", valeur: retardApplique })
+            .catch(() => {});
+        }
+      }
 
       const texte = message.texte;
       // Sur un segment sans parole nette, Whisper renvoie souvent une chaine
@@ -481,9 +562,20 @@ function transcrireSegment(audio, raison) {
 
   const id = prochainSegmentId++;
   const secondes = (audio.length / TAUX).toFixed(1);
-  // finParole = maintenant : c'est l'instant ou le segment est clos. Il sert a
-  // mesurer la latence jusqu'a l'affichage du sous-titre.
-  segmentsEnCours.set(id, { secondes, finParole: Date.now() });
+
+  // Deux reperes de temps, et il ne faut pas les confondre :
+  //   finParole    = maintenant, l'instant ou le segment est clos. Sert a
+  //                  mesurer la latence de transcription.
+  //   debutSegment = quand la premiere syllabe du segment a ete prononcee.
+  //                  Sert a calibrer le retard du son : pour que l'utilisateur
+  //                  entende le PREMIER mot pile quand le texte s'affiche,
+  //                  c'est de ce repere-la qu'il faut partir.
+  const dureeMs = (audio.length / TAUX) * 1000;
+  segmentsEnCours.set(id, {
+    secondes,
+    finParole: Date.now(),
+    debutSegment: Date.now() - dureeMs,
+  });
 
   // 2e argument : liste des buffers TRANSFERES. Le tableau change de
   // proprietaire au lieu d'etre copie pour passer au worker.
@@ -502,7 +594,7 @@ function transcrireSegment(audio, raison) {
 // Démarrer la capture.
 // Ne rejette JAMAIS : renvoie toujours { success, error?, warning? }, parce que
 // c'est cette reponse qui decide si le background a le droit d'ecrire "actif".
-async function startCapture(streamId, memoBackend, langue) {
+async function startCapture(streamId, memoBackend, langue, retard, retardCalibre) {
   try {
     console.log("🎤 Offscreen : demarrage capture avec streamId :", streamId);
 
@@ -550,11 +642,60 @@ async function startCapture(streamId, memoBackend, langue) {
     // Créer une source audio à partir du flux
     const source = audioContext.createMediaStreamSource(stream);
 
+    // -----------------------------------------------------------------------
+    // Retard du son : sur les haut-parleurs SEULEMENT
+    // -----------------------------------------------------------------------
+    //
+    // Le sous-titre arrive forcement apres la parole : il faut le temps de la
+    // transcrire (~2 s). Retarder le son d'autant le fait coincider avec le
+    // texte affiche.
+    //
+    // ⚠️ LE POINT A NE PAS RATER : le retard ne doit toucher QUE ce qu'on
+    // entend. Le flux analyse (`stream`) part vers le VAD et Whisper SANS
+    // passer par ce noeud. Si on retardait aussi ce chemin-la, la parole
+    // arriverait a Whisper avec 2 s de retard supplementaires, la transcription
+    // sortirait 2 s plus tard, et le decalage serait exactement le meme
+    // qu'avant : l'option ne servirait a rien.
+    //
+    // D'ou deux branches distinctes qui partent de la meme source :
+    //   source ──> delayNode ──> sortie ──> audioElement   (ce qu'on ENTEND, retarde)
+    //   stream ─────────────────────────> VAD ──> Whisper  (ce qu'on ANALYSE, immediat)
+    //
+    // 20 s de capacite maximale. createDelay fixe un PLAFOND : avec 5, une
+    // valeur calibree a 9 s serait silencieusement ramenee a 5 et l'alignement
+    // serait faux sans qu'aucune erreur ne le signale.
+    delayNode = audioContext.createDelay(20);
+    const sortie = audioContext.createMediaStreamDestination();
+    source.connect(delayNode);
+    delayNode.connect(sortie);
+
+    // Trois cas de figure pour la valeur de depart :
+    modeRetard = retard ?? 0;
+    echantillonsRetard = [];
+    retardApplique = null;
+
+    if (modeRetard === "auto" && typeof retardCalibre === "number") {
+      // 1. Mode auto, deja calibre sur cette machine -> on applique tout de
+      //    suite. C'est ce qui evite de repasser par le trou de calibration a
+      //    chaque lancement.
+      retardApplique = retardCalibre;
+      delayNode.delayTime.value = retardCalibre;
+    } else if (modeRetard === "auto") {
+      // 2. Mode auto, jamais calibre -> on part sans retard et on mesure les
+      //    5 premiers segments (voir le case "result").
+      delayNode.delayTime.value = 0;
+    } else {
+      // 3. Reglage manuel (0 = desactive) -> on applique, sans calibrer.
+      delayNode.delayTime.value = Number(modeRetard) || 0;
+    }
+
     // Rediriger le son vers les haut-parleurs (pour que l'utilisateur l'entende)
     audioElement = new Audio();
-    audioElement.srcObject = stream;
+    audioElement.srcObject = sortie.stream;
     audioElement.play();
-    console.log("🔊 Offscreen : son redirige vers les haut-parleurs");
+    console.log(
+      `🔊 Offscreen : son redirige vers les haut-parleurs (retard ${delayNode.delayTime.value} s)`
+    );
 
     // Créer un analyseur pour mesurer le volume (pour la détection de parole)
     analyser = audioContext.createAnalyser();
@@ -568,6 +709,9 @@ async function startCapture(streamId, memoBackend, langue) {
     // Un VAD en panne n'empeche pas d'entendre le son : ce n'est pas un echec
     // de la capture, mais ca ne doit plus passer inapercu non plus -> on le
     // remonte en avertissement jusqu'a la popup.
+    //
+    // On lui passe `stream`, le flux D'ORIGINE, surtout pas la sortie retardee :
+    // voir l'explication au montage du noeud de retard plus haut.
     const vadStatus = await startVAD(stream);
 
     return {
@@ -749,6 +893,23 @@ async function stopCapture() {
     audioElement.srcObject = null;
     audioElement = null;
   }
+
+  // Debrancher le noeud de retard. Sans ca, il resterait connecte au graphe et
+  // le prochain demarrage empilerait un second chemin vers les haut-parleurs --
+  // on entendrait le son en double, decale.
+  if (delayNode) {
+    try {
+      delayNode.disconnect();
+    } catch (err) {
+      console.warn("Erreur deconnexion du noeud de retard (normal si deja ferme)");
+    }
+    delayNode = null;
+  }
+
+  // La calibration ne survit pas a la capture : le prochain demarrage repartira
+  // de la valeur memorisee (mode auto deja calibre) ou remesurera.
+  echantillonsRetard = [];
+  retardApplique = null;
 
   // Arrêter toutes les pistes du flux
   if (mediaStream) {

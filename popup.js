@@ -14,6 +14,7 @@ let warningMessage = null;
 const toggleBtn = document.getElementById("toggleBtn");
 const statusDiv = document.getElementById("status");
 const langueSelect = document.getElementById("langue");
+const retardSelect = document.getElementById("retardAudio");
 
 // ---------------------------------------------------------------------------
 // Langue parlee dans la video
@@ -50,6 +51,75 @@ langueSelect.addEventListener("change", async () => {
   } catch (err) {
     console.warn("Changement de langue non transmis :", err);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Retard du son
+// ---------------------------------------------------------------------------
+//
+// Meme mecanique que la langue, a deux differences pres :
+//   - les valeurs chiffrees sont rangees en NOMBRE, pas en texte
+//     (`select.value` rend toujours une chaine, et c'est un nombre que
+//     l'AudioContext attend pour delayTime) ;
+//   - "auto" reste une CHAINE : ce n'est pas une duree, c'est un mode.
+const CLE_RETARD = "retardAudio";
+const CLE_RETARD_CALIBRE = "retardCalibre";
+const RETARD_PAR_DEFAUT = 0;
+
+const retardInfo = document.getElementById("retardInfo");
+
+// En mode auto, on montre ou en est la mesure : sans ca, l'utilisateur ne
+// saurait pas si le retard est deja cale ou encore en cours de calcul.
+async function afficherInfoRetard() {
+  if (retardSelect.value !== "auto") {
+    retardInfo.textContent = "";
+    return;
+  }
+
+  try {
+    const stored = await chrome.storage.local.get(CLE_RETARD_CALIBRE);
+    const calibre = stored[CLE_RETARD_CALIBRE];
+    retardInfo.textContent =
+      typeof calibre === "number"
+        ? `aligné à ${calibre.toFixed(1)} s`
+        : "calibration…";
+  } catch (err) {
+    retardInfo.textContent = "calibration…";
+  }
+}
+
+async function chargerRetard() {
+  try {
+    const stored = await chrome.storage.local.get(CLE_RETARD);
+    retardSelect.value = String(stored[CLE_RETARD] ?? RETARD_PAR_DEFAUT);
+  } catch (err) {
+    retardSelect.value = String(RETARD_PAR_DEFAUT);
+  }
+  await afficherInfoRetard();
+}
+
+retardSelect.addEventListener("change", async () => {
+  const brut = retardSelect.value;
+  // "auto" est un mode, pas une duree : il ne passe pas par Number().
+  const retard = brut === "auto" ? "auto" : Number(brut);
+
+  try {
+    await chrome.storage.local.set({ [CLE_RETARD]: retard });
+    // Comme pour la langue : le background relaie a l'offscreen, ce qui permet
+    // d'ajuster le retard sans redemarrer la capture. Si rien ne capture, le
+    // relais echoue sans consequence.
+    await chrome.runtime.sendMessage({ type: "SET_RETARD", retard });
+  } catch (err) {
+    console.warn("Changement de retard non transmis :", err);
+  }
+
+  await afficherInfoRetard();
+});
+
+// La calibration se termine pendant que la popup est ouverte : on rafraichit
+// l'affichage au lieu de laisser « calibration… » indefiniment.
+chrome.storage.onChanged.addListener((changes, zone) => {
+  if (zone === "local" && changes[CLE_RETARD_CALIBRE]) afficherInfoRetard();
 });
 
 function setStatus(text, color) {
@@ -157,3 +227,4 @@ chrome.storage.session.onChanged.addListener((changes) => {
 // Au depart, on demande l'etat au background au lieu de supposer "arrete".
 loadState();
 chargerLangue();
+chargerRetard();
