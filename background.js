@@ -225,6 +225,35 @@ async function sendSubtitle(texte, finParole) {
   }
 }
 
+// Un statut peut arriver AVANT que l'etat "actif" soit ecrit : l'offscreen
+// annonce « preparation du modele » pendant que nous sommes encore en train
+// d'attendre sa reponse a START_CAPTURE (voir doStartAudioCapture, etapes 4 a
+// 6). Sans ce garde-manger, le message le plus utile -- celui de la toute
+// premiere minute -- serait justement le seul a ne jamais s'afficher.
+//
+// Variable memoire assumee : elle n'a de sens que dans le fil d'un demarrage,
+// entre deux lignes de la meme fonction. Si le service worker meurt entre les
+// deux, on perd un message d'ambiance, rien de plus.
+let statutEnAttente = null;
+
+// Relaie un message d'etat (« chargement », « calibration »...) vers l'overlay.
+// Meme chemin et memes precautions que sendSubtitle : l'offscreen n'a pas acces
+// a chrome.tabs, et une page sans content script ne doit pas faire de bruit.
+async function sendStatut(texte) {
+  const { active, tabId } = await readState();
+  if (!active || !tabId) {
+    statutEnAttente = texte; // pas encore d'overlay : on le garde pour l'etape 6
+    return;
+  }
+
+  statutEnAttente = null;
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "STATUT", texte });
+  } catch (err) {
+    console.warn("⚠️ Statut non affiche (content.js injoignable) :", err.message);
+  }
+}
+
 // Renvoie toujours l'etat resultant -> c'est lui que la popup affiche.
 function startAudioCapture() {
   return serializeCapture(doStartAudioCapture);
@@ -238,6 +267,10 @@ async function doStartAudioCapture() {
     console.log("ℹ️ Capture deja active sur l'onglet", current.tabId, "- on ignore");
     return current;
   }
+
+  // Un statut reste peut-etre d'un demarrage rate : il n'a plus rien a dire
+  // sur celui-ci.
+  statutEnAttente = null;
 
   try {
     console.log("🎤 Demarrage capture audio...");
@@ -290,6 +323,13 @@ async function doStartAudioCapture() {
 
     // 6. Dire à content.js d'afficher l'overlay
     await toggleOverlay(tab.id, true);
+
+    // 7. L'overlay existe enfin : on lui donne le statut arrive trop tot.
+    if (statutEnAttente) {
+      const texte = statutEnAttente;
+      statutEnAttente = null;
+      chrome.tabs.sendMessage(tab.id, { type: "STATUT", texte }).catch(() => {});
+    }
 
     // Le VAD peut avoir echoue sans empecher la capture : on fait remonter
     // l'avertissement a la popup au lieu de le laisser en console.
@@ -383,6 +423,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // Texte transcrit par l'offscreen -> overlay de l'onglet capture.
   if (request.type === "TRANSCRIPT") {
     sendSubtitle(request.texte, request.finParole);
+    return; // pas de reponse attendue
+  }
+
+  // Message d'etat de l'offscreen (chargement du modele, calibration...) ->
+  // meme onglet, meme chemin que TRANSCRIPT.
+  if (request.type === "STATUT") {
+    sendStatut(request.texte);
     return; // pas de reponse attendue
   }
 

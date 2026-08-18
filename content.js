@@ -25,11 +25,22 @@ document.body.appendChild(subtitleBox);
 
 console.log("✅ Overlay cree sur la page");
 
+// Un vrai sous-titre a-t-il deja ete affiche pour cette capture ?
+//
+// C'est la seule regle qui compte pour les messages d'etat : ils occupent
+// l'overlay tant qu'il n'y a rien de mieux a montrer, et ils s'effacent pour
+// toujours des le premier vrai texte. Un « chargement du modele » qui
+// recouvrirait une phrase transcrite serait pire que pas de message du tout.
+let premierSousTitreAffiche = false;
+
 // Fonction pour afficher/cacher l'overlay
 function toggleOverlay(show) {
   if (show) {
     subtitleBox.style.display = "block";
     subtitleBox.innerText = "🎬 Ecoute du son en cours...";
+    subtitleBox.style.opacity = "1";
+    subtitleBox.style.fontStyle = "normal";
+    premierSousTitreAffiche = false; // nouvelle capture : les statuts reprennent la main
     console.log("✅ Overlay AFFICHE sur la page");
   } else {
     subtitleBox.style.display = "none";
@@ -43,6 +54,11 @@ function afficherSousTitre(texte, finParole) {
   if (!texte) return;
 
   subtitleBox.innerText = texte;
+  premierSousTitreAffiche = true;
+
+  // Retour au style plein : le texte precedent etait peut-etre un statut.
+  subtitleBox.style.opacity = "1";
+  subtitleBox.style.fontStyle = "normal";
 
   // Le texte peut arriver juste avant le TOGGLE_SUBTITLES (les deux voyagent
   // par des chemins differents). On ne force pas l'affichage pour autant :
@@ -56,6 +72,25 @@ function afficherSousTitre(texte, finParole) {
   console.log(`📝 Sous-titre affiche (${latence} s apres la fin de parole) :`, texte);
 }
 
+// Afficher un message d'etat (chargement du modele, calibration...).
+//
+// Volontairement attenue -- plus pale et en italique -- pour qu'on voie d'un
+// coup d'oeil que ce n'est pas de la parole transcrite.
+function afficherStatut(texte) {
+  if (!texte) return;
+
+  // Un statut n'ecrase JAMAIS un vrai sous-titre.
+  if (premierSousTitreAffiche) {
+    console.log("ℹ️ Statut ignore (des sous-titres sont deja affiches) :", texte);
+    return;
+  }
+
+  subtitleBox.innerText = texte;
+  subtitleBox.style.opacity = "0.75";
+  subtitleBox.style.fontStyle = "italic";
+  console.log("💬 Statut affiche :", texte);
+}
+
 // Écouter les messages du service worker
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log("📩 Message recu dans content.js :", request);
@@ -67,6 +102,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.type === "SUBTITLE") {
     afficherSousTitre(request.texte, request.finParole);
+    sendResponse({ success: true });
+  }
+
+  if (request.type === "STATUT") {
+    afficherStatut(request.texte);
     sendResponse({ success: true });
   }
 });

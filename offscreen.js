@@ -33,6 +33,10 @@ let modeRetard = 0; // 0 (desactive) | un nombre de secondes | "auto"
 let echantillonsRetard = [];
 let retardApplique = null; // renseigne des que la calibration a tranche
 
+// « ✅ Pret » ne se dit qu'une fois par capture : ensuite l'overlay appartient
+// aux vrais sous-titres.
+let statutPretEnvoye = false;
+
 // ---------------------------------------------------------------------------
 // Messages du service worker
 // ---------------------------------------------------------------------------
@@ -127,9 +131,24 @@ let whisperWorker = null;
 let prochainSegmentId = 1;
 const segmentsEnCours = new Map();
 
-// Renseigne quand le worker a fini de charger le modele. Tant que c'est faux,
-// les segments partent quand meme : le worker les met dans sa propre file et
-// les traitera des qu'il sera pret.
+// Segments deja partis au worker mais dont on ne veut plus le texte : le filet
+// de securite de transcrireSegment les a sortis de la file. On ne peut pas
+// annuler un travail deja envoye, alors on note son numero et on jettera sa
+// reponse au retour.
+const segmentsAbandonnes = new Set();
+
+// Compteurs de la capture en cours, remis a zero au demarrage. Ils servent au
+// diagnostic : « combien de parole a-t-on perdue au demarrage ? »
+let segmentsIgnoresAttente = 0; // jetes parce que Whisper n'etait pas pret
+let segmentsIgnoresFile = 0;    // jetes parce que la file debordait
+
+// Renseigne quand le worker a fini de charger le modele.
+//
+// Tant que c'est faux, les segments sont JETES (voir transcrireSegment). Avant,
+// ils partaient quand meme et le worker les empilait : au premier lancement sur
+// une machine (telechargement du modele + mesure GPU/CPU, ~90 s), toute cette
+// parole se deversait d'un coup des que Whisper devenait pret -- une minute de
+// sous-titres perimes qui defilaient. Mieux vaut ne rien afficher.
 let whisperPret = false;
 
 // Langue parlee dans la video, choisie par l'utilisateur dans la popup.
@@ -153,6 +172,19 @@ let langueCourante = "french";
 //   - on lui renvoie le verdict mesure par WHISPER_BACKEND.
 // Les messages, eux, marchent parfaitement depuis un offscreen.
 
+// Message d'etat vers l'overlay de la page : « le modele charge », « je
+// calibre »... Sans ca, l'utilisateur voit « Ecoute du son en cours... » pendant
+// une minute au premier lancement et croit que c'est casse.
+//
+// Meme chemin que les sous-titres -- offscreen -> service worker -> content.js --
+// parce qu'un document offscreen n'a pas acces a chrome.tabs. Le .catch() vide
+// est normal : si personne n'ecoute (capture deja arretee), ce n'est pas une
+// erreur, et un statut perdu n'a aucune consequence.
+function envoyerStatut(texte) {
+  console.log("💬 Statut :", texte);
+  chrome.runtime.sendMessage({ type: "STATUT", texte }).catch(() => {});
+}
+
 function surMessageWhisper(event) {
   const message = event.data;
 
@@ -174,12 +206,23 @@ function surMessageWhisper(event) {
         backend: message.backend,
         signature: message.signature,
       });
+
+      // On dit a l'utilisateur ou on en est. Le modele est pret, mais en mode
+      // auto non calibre il reste une etape avant que le son soit aligne :
+      // autant l'annoncer plutot que de laisser l'overlay muet.
+      if (modeRetard === "auto" && retardApplique === null) {
+        envoyerStatut("🎚️ Calibration du décalage…");
+      } else if (!statutPretEnvoye) {
+        statutPretEnvoye = true;
+        envoyerStatut("✅ Prêt");
+      }
       break;
     }
 
     case "progress":
       // Telechargement du modele, au premier lancement.
       console.log(`⬇️  Whisper : ${message.fichier} ${message.pourcent} %`);
+      envoyerStatut(`⬇️ Téléchargement du modèle : ${Math.round(message.pourcent)} %`);
       break;
 
     case "info":
@@ -188,6 +231,16 @@ function surMessageWhisper(event) {
       break;
 
     case "result": {
+      // Segment sorti de la file par le filet de securite (voir
+      // transcrireSegment) : son texte est trop vieux pour etre affiche, et il
+      // ne doit pas non plus servir de mesure de calibration. On le jette ici,
+      // au retour, parce qu'un travail deja parti au worker ne se rappelle pas.
+      if (segmentsAbandonnes.has(message.id)) {
+        segmentsAbandonnes.delete(message.id);
+        console.log(`   (resultat du segment #${message.id} ignore : abandonne)`);
+        break;
+      }
+
       const segment = segmentsEnCours.get(message.id);
       segmentsEnCours.delete(message.id);
       surveillerFile(); // la file se vide aussi ici, pas seulement a l'envoi
@@ -196,7 +249,24 @@ function surMessageWhisper(event) {
       // un segment vide n'a rien a afficher, mais c'est une mesure de temps
       // parfaitement valable -- et s'en priver rallongerait la calibration.
       if (modeRetard === "auto" && retardApplique === null && segment) {
-        const besoin = (Date.now() - segment.debutSegment) / 1000;
+        // ⚠️ On calibre sur le PIRE CAS, pas sur ce qu'on vient d'entendre.
+        //
+        // Mesurer la duree reelle du segment (Date.now() - debutSegment) donnait
+        // une valeur qui dependait du CONTENU : 6,7 s sur un passage a segments
+        // courts, 9,1 s sur de la parole continue. La valeur calibree sur l'un
+        // etait fausse pour l'autre -- et elle est memorisee pour de bon.
+        //
+        // Or la duree d'un segment ne depasse JAMAIS DUREE_MAX : c'est une
+        // constante du code, pas une mesure. On prend donc DUREE_MAX + le seul
+        // terme reellement variable, la latence depuis la fin de la parole
+        // (transcription + attente en file + transport).
+        //
+        // Consequence assumee : sur un passage a segments courts, le texte
+        // apparaitra legerement EN AVANCE sur la voix. C'est le bon sens de
+        // l'erreur -- un sous-titre en avance se lit, un sous-titre en retard ne
+        // sert a rien.
+        const latence = (Date.now() - segment.finParole) / 1000;
+        const besoin = DUREE_MAX + latence;
         echantillonsRetard.push(besoin);
         console.log(
           `🎚️ Calibration ${echantillonsRetard.length}/5 : ${besoin.toFixed(1)} s`
@@ -216,6 +286,11 @@ function surMessageWhisper(event) {
           chrome.runtime
             .sendMessage({ type: "RETARD_CALIBRE", valeur: retardApplique })
             .catch(() => {});
+
+          if (!statutPretEnvoye) {
+            statutPretEnvoye = true;
+            envoyerStatut("✅ Prêt");
+          }
         }
       }
 
@@ -257,6 +332,7 @@ function surMessageWhisper(event) {
 
     case "error": {
       segmentsEnCours.delete(message.id);
+      segmentsAbandonnes.delete(message.id); // pas de reponse a attendre : on oublie
       console.error("❌ Whisper :", message.message);
       break;
     }
@@ -524,6 +600,10 @@ function surTrame(trame) {
 const FILE_ALERTE = 3;
 let fileSignalee = false;
 
+// Au-dela, on n'avertit plus : on jette (voir la fin de transcrireSegment).
+// FILE_ALERTE previent, FILE_MAX agit -- les deux restent independants.
+const FILE_MAX = 4;
+
 function surveillerFile() {
   const enAttente = segmentsEnCours.size;
 
@@ -560,6 +640,20 @@ function transcrireSegment(audio, raison) {
     return;
   }
 
+  // Whisper n'est pas encore pret : on JETTE le segment au lieu de l'empiler.
+  //
+  // Un segment mis en file pendant 90 s produira un sous-titre perime de 90 s.
+  // Il vaut mieux ne rien afficher qu'afficher du faux -- et pendant ce temps
+  // l'overlay explique ce qui se passe (voir envoyerStatut).
+  if (!whisperPret) {
+    segmentsIgnoresAttente++;
+    console.log(
+      `⏭️ Segment ignoré : Whisper n'est pas encore prêt ` +
+        `(${(audio.length / TAUX).toFixed(1)} s, ${segmentsIgnoresAttente} depuis le début)`
+    );
+    return;
+  }
+
   const id = prochainSegmentId++;
   const secondes = (audio.length / TAUX).toFixed(1);
 
@@ -584,8 +678,30 @@ function transcrireSegment(audio, raison) {
     [audio.buffer]
   );
 
-  const attente = whisperPret ? "" : " (le modele charge encore, ca patientera)";
-  console.log(`➡️  Segment #${id} envoye a Whisper : ${secondes} s (${raison})${attente}`);
+  console.log(`➡️  Segment #${id} envoye a Whisper : ${secondes} s (${raison})`);
+
+  // Filet de securite, meme quand Whisper est pret : sur une machine lente la
+  // file peut recommencer a diverger. On abandonne alors les PLUS ANCIENS --
+  // un sous-titre en retard de 30 s est pire qu'un sous-titre manquant, et ce
+  // sont les vieux qui sont perimes, pas les nouveaux.
+  //
+  // Une Map parcourt ses cles dans l'ordre d'insertion : les premieres sont
+  // donc les plus anciennes.
+  if (segmentsEnCours.size > FILE_MAX) {
+    const aJeter = segmentsEnCours.size - FILE_MAX;
+    let jetes = 0;
+    for (const vieuxId of segmentsEnCours.keys()) {
+      if (jetes >= aJeter) break;
+      segmentsEnCours.delete(vieuxId);
+      segmentsAbandonnes.add(vieuxId); // sa reponse sera ignoree au retour
+      jetes++;
+    }
+    segmentsIgnoresFile += jetes;
+    console.warn(
+      `🗑️ File saturee : ${jetes} segment(s) abandonne(s) pour rester a ${FILE_MAX} ` +
+        `(${segmentsIgnoresFile} depuis le début de la capture)`
+    );
+  }
 
   surveillerFile();
 }
@@ -609,10 +725,23 @@ async function startCapture(streamId, memoBackend, langue, retard, retardCalibre
     }
 
     // Whisper se met en route en parallele : le chargement du modele prend
-    // plusieurs secondes et la capture audio n'a pas a l'attendre. Les premiers
-    // segments arriveront peut-etre avant qu'il soit pret -- le worker les garde
-    // dans sa file et les traitera dans l'ordre.
+    // plusieurs secondes et la capture audio n'a pas a l'attendre. Les segments
+    // produits avant qu'il soit pret sont JETES, pas mis en file (voir
+    // transcrireSegment) : on l'annonce a l'utilisateur juste en dessous.
     demarrerWhisper(memoBackend);
+
+    // Compteurs et statuts repartent de zero a chaque capture.
+    segmentsAbandonnes.clear();
+    segmentsIgnoresAttente = 0;
+    segmentsIgnoresFile = 0;
+    statutPretEnvoye = false;
+
+    // Au tout premier lancement sur une machine, il se passe une minute entre
+    // ce point et le premier sous-titre (telechargement du modele + mesure
+    // GPU/CPU). Sans un mot, l'utilisateur croit que l'extension est cassee.
+    if (!whisperPret) {
+      envoyerStatut("⏳ Préparation du modèle… (première utilisation : jusqu'à 1 min)");
+    }
 
     // Créer le contexte audio
     audioContext = new AudioContext();
