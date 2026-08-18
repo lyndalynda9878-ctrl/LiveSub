@@ -50,17 +50,23 @@ const DECALAGES = [0, 0.6, 1.2, 1.8];
 
 // La premiere variante sert de REFERENCE : c'est celle qui tourne aujourd'hui
 // et qui a ete validee. Les suivantes sont comparees a son texte.
-// Note sur `opt` (niveau d'optimisation du graphe ONNX) : sans lui, q8 et fp16
-// ne CHARGENT pas du tout sur cette version d'ONNX Runtime -- ce sont des
-// passes de fusion "extended" qui plantent, pas les poids. D'ou les variantes
-// qui abaissent ce niveau : c'est le seul moyen de savoir si le modele
-// quantifie est utilisable ici.
-const OC = "onnx-community/whisper-tiny";
+//
+// whisper-base est-il tenable en production ? La question n'est pas la qualite
+// du texte -- base ecrit mieux que tiny, c'est connu -- mais le TEMPS PAR
+// SEGMENT. En production on mesure 2,2 s en anglais et 3,7 a 4,2 s en francais,
+// avec deja un debut de file d'attente. Si base double ce temps, la file
+// diverge et les sous-titres arrivent 15 s trop tard : mieux ecrits, mais
+// inutilisables.
+//
+// Les trois variantes tournent sur des fichiers LOCAUX (models/, rempli par
+// `npm run build:model`). Avec env.allowRemoteModels = false, une variante
+// absente de models/ echoue au lieu d'aller la chercher sur internet.
+const BASE = "Xenova/whisper-base";
 
 const CONFIGS = [
   {
-    nom: "Xenova · fp32",
-    detail: "la variante retenue (reference)",
+    nom: "tiny · fp32",
+    detail: "la variante de production (reference)",
     modele: "Xenova/whisper-tiny",
     dtype: "fp32",
     // On ecrit le niveau noir sur blanc plutot que de laisser le defaut : la
@@ -69,18 +75,21 @@ const CONFIGS = [
     opt: "all",
   },
   {
-    nom: "onnx-community · q8 (opt basic)",
+    nom: "base · q8",
     detail: "quantifie 8 bits, fusions extended desactivees",
-    modele: OC,
+    modele: BASE,
     dtype: "q8",
+    // Sans ca, q8 ne CHARGE pas : "Missing required scale ... MatMulNBits".
+    // Ce ne sont pas les poids, ce sont des passes de fusion de niveau
+    // extended d'ONNX Runtime. Constate sur tiny, meme cause ici.
     opt: "basic",
   },
   {
-    nom: "onnx-community · encodeur q8",
-    detail: "encodeur quantifie, decodeur fp32 (le decodeur est ce qui casse)",
-    modele: OC,
-    dtype: '{"encoder_model":"q8","decoder_model_merged":"fp32"}',
-    opt: "basic",
+    nom: "base · fp32",
+    detail: "meme precision que la production, modele plus gros",
+    modele: BASE,
+    dtype: "fp32",
+    opt: "all",
   },
 ];
 

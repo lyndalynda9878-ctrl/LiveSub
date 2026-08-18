@@ -3,3 +3,8 @@ node_modules/
 # Regenere par `npm install` (script postinstall -> scripts/copy-assets.js).
 # Contient notamment un .wasm de ~13 Mo, inutile de le versionner.
 vendor/
+
+# Regenere par `npm install` (postinstall -> scripts/fetch-model.js), ou a la
+# main par `npm run build:model`. ~150 Mo de poids de modele : hors de question
+# de les versionner.
+models/

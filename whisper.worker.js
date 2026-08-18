@@ -34,10 +34,26 @@ env.backends.onnx.wasm.wasmPaths = new URL("./vendor/transformers/", self.locati
 env.backends.onnx.wasm.numThreads = 1;
 env.backends.onnx.wasm.proxy = false;
 
-// Le modele n'est pas dans l'extension : on le telecharge depuis Hugging Face
-// (Chrome le met ensuite en cache). Le passer en local viendra plus tard.
-env.allowLocalModels = false;
-env.allowRemoteModels = true;
+// Le modele vit DANS l'extension, comme les librairies de vendor/.
+//
+// Avant, il etait telecharge depuis Hugging Face au demarrage. Ce n'etait pas
+// « une fois puis en cache » : mesure sur trois captures consecutives, trois
+// telechargements complets de ~150 Mo. Sans internet, l'extension ne demarrait
+// pas -- ce qui contredit l'argument central du projet.
+//
+// allowRemoteModels = false est LA garantie, et pas une preference : si un
+// fichier manque, le chargement doit echouer bruyamment (voir
+// verifierModeleLocal) et surtout PAS repartir en douce sur internet. C'est ce
+// qui rend le « 100 % hors ligne » verifiable au lieu d'etre une intention.
+//
+// models/ est rempli par `npm run build:model` (scripts/fetch-model.js) et
+// gitignore, exactement comme vendor/.
+env.allowLocalModels = true;
+env.allowRemoteModels = false;
+
+// Comme pour les .wasm plus haut : on derive l'URL de self.location, parce que
+// les API chrome.* ne sont pas garanties dans un worker dedie.
+env.localModelPath = new URL("./models/", self.location.href).href;
 
 // whisper-tiny MULTILINGUE (surtout pas la variante .en, qui ne fait que
 // l'anglais : LiveSub doit sous-titrer du francais).
@@ -358,9 +374,38 @@ async function chargerAvecRepli(device) {
   return repli.transcrire;
 }
 
+// Le modele est-il vraiment la ?
+//
+// Sans ce controle, un models/ absent donnerait « Impossible de charger le
+// modele sur le CPU » -- vrai, mais inexploitable : on chercherait du cote du
+// backend alors qu'il manque juste des fichiers. Avec allowRemoteModels a
+// false, il n'y a plus de repli silencieux sur internet, donc l'erreur doit
+// dire quoi faire. Meme esprit que le message sur vendor/ dans offscreen.js.
+//
+// Une requete locale (chrome-extension://), pas un aller sur le reseau.
+async function verifierModeleLocal() {
+  const base = `${env.localModelPath}${MODEL}/`;
+  try {
+    const reponse = await fetch(base + "config.json");
+    if (reponse.ok) return;
+  } catch {
+    // fetch jette sur un fichier absent d'une extension : meme conclusion.
+  }
+  throw new Error(
+    `Modele introuvable : ${MODEL} n'est pas dans models/. ` +
+      "Lance `npm run build:model` (une seule fois, il faut internet), puis " +
+      "recharge l'extension. Rien n'est telecharge au demarrage : " +
+      "env.allowRemoteModels vaut false, et c'est voulu."
+  );
+}
+
 // Decide quel backend utiliser, et renvoie le pipeline correspondant.
 // `memo` vient de chrome.storage via la page : { backend, signature } ou null.
 async function choisirBackend({ memo, forcer, mesurer }) {
+  // En premier : si les fichiers manquent, aucun backend ne marchera, et
+  // l'utilisateur merite de savoir pourquoi.
+  await verifierModeleLocal();
+
   // --- Cas 0 : on est le worker enfant d'une mesure. -------------------------
   // Un seul backend impose, aucun repli : si ce backend ne marche pas, le
   // parent doit le savoir, pas recevoir le chiffre d'un autre backend.
