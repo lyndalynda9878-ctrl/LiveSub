@@ -57,6 +57,19 @@ const MODELE_DEFAUT = "Xenova/whisper-tiny";
 // phrase legitime -- on ne coupe que les boucles.
 const MAX_JETONS = 60;
 
+// Interdit a Whisper de repeter une meme suite de 6 jetons dans une sortie.
+//
+// MAX_JETONS borne la LONGUEUR d'une boucle de repetition ; celui-ci l'empeche
+// de commencer. Les deux se completent : sans lui, une boucle occupe quand meme
+// les 60 jetons et produit un sous-titre entierement faux.
+//
+// 6 et pas 3 : la parole naturelle repete des suites courtes tout le temps
+// (« je ne sais pas, je ne sais pas »). A 3, on casserait ces repetitions
+// legitimes en forcant le modele a ecrire autre chose -- c'est-a-dire a
+// inventer, exactement ce qu'on cherche a eviter. A 6, une suite de 6 mots
+// identiques n'arrive quasiment jamais dans de la vraie parole.
+const NO_REPEAT_NGRAM = 6;
+
 // Langue imposee a Whisper.
 //
 // Avant, on laissait la detection automatique (`language` absent). Elle se
@@ -487,6 +500,7 @@ self.onmessage = (event) => {
         const resultat = await transcrire(audio, {
           language: langue || LANGUE_DEFAUT,
           max_new_tokens: MAX_JETONS,
+          no_repeat_ngram_size: NO_REPEAT_NGRAM,
         });
         self.postMessage({
           type: "result",

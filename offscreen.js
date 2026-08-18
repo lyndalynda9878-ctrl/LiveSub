@@ -141,6 +141,8 @@ const segmentsAbandonnes = new Set();
 // diagnostic : « combien de parole a-t-on perdue au demarrage ? »
 let segmentsIgnoresAttente = 0; // jetes parce que Whisper n'etait pas pret
 let segmentsIgnoresFile = 0;    // jetes parce que la file debordait
+let segmentsIgnoresSilence = 0; // jetes parce que quasiment pas de parole dedans
+let sousTitresRejetes = 0;      // textes recus mais refuses (radotage, phrase fantome)
 
 // Renseigne quand le worker a fini de charger le modele.
 //
@@ -183,6 +185,104 @@ let langueCourante = "french";
 function envoyerStatut(texte) {
   console.log("💬 Statut :", texte);
   chrome.runtime.sendMessage({ type: "STATUT", texte }).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Garde-fous sur le TEXTE recu de Whisper
+// ---------------------------------------------------------------------------
+//
+// Meme avec un segment bien rempli, whisper-tiny peut encore inventer. Deux
+// formes, tres reconnaissables, et deux filtres separes :
+//   - le radotage : il part en boucle sur les memes mots ;
+//   - la phrase fantome : il recite un morceau de ses donnees d'entrainement
+//     (des sous-titres YouTube), toujours la meme poignee de phrases.
+//
+// ⚠️ Regle absolue ici : un filtre qui supprime du VRAI texte ne se voit pas --
+// le sous-titre manque, sans erreur, sans trace. Chaque rejet est donc
+// journalise avec sa raison ET le texte rejete, pour qu'un faux positif soit
+// visible en console.
+
+// Forme comparable d'un texte : minuscules, sans accents, sans ponctuation,
+// espaces reduits. La ponctuation devient un ESPACE et non rien du tout, pour
+// que « sous-titres » et « d'Amara » donnent « sous titres » et « d amara ».
+function normaliserTexte(texte) {
+  return texte
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")             // accents
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")  // ponctuation, tirets, apostrophes...
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Nombre de mots en dessous duquel on ne juge pas la diversite : sur une phrase
+// courte, un vocabulaire pauvre est normal (« oui, oui, oui d'accord »).
+const RADOTAGE_MOTS_MIN = 8;
+
+// Part de mots DIFFERENTS en dessous de laquelle le texte radote. 0,40 veut
+// dire : moins de 4 mots distincts pour 10 mots ecrits.
+const RADOTAGE_DIVERSITE_MIN = 0.4;
+
+// Nombre de repetitions COLLEES tolerees pour un meme mot (« non non non... »).
+const RADOTAGE_SUITE_MAX = 5;
+
+function estUnRadotage(texte) {
+  const mots = normaliserTexte(texte).split(" ").filter(Boolean);
+  if (mots.length === 0) return false;
+
+  // 1. Vocabulaire trop pauvre pour la longueur du texte.
+  if (mots.length >= RADOTAGE_MOTS_MIN) {
+    const differents = new Set(mots).size;
+    if (differents / mots.length < RADOTAGE_DIVERSITE_MIN) return true;
+  }
+
+  // 2. Le meme mot colle a lui-meme un nombre anormal de fois.
+  let suite = 1;
+  for (let i = 1; i < mots.length; i++) {
+    suite = mots[i] === mots[i - 1] ? suite + 1 : 1;
+    if (suite > RADOTAGE_SUITE_MAX) return true;
+  }
+
+  return false;
+}
+
+// Les phrases que whisper-tiny recite quand il n'a rien entendu. Elles sont
+// ecrites sous leur forme NORMALISEE (voir normaliserTexte) : c'est a cette
+// forme-la qu'on compare.
+//
+// ⚠️ La comparaison est une EGALITE sur le sous-titre entier, jamais une
+// inclusion. « Merci d'avoir regardé cette vidéo, maintenant passons a la
+// suite » est de la vraie parole et doit passer ; seule la phrase toute seule
+// est une hallucination.
+const PHRASES_FANTOMES = [
+  // Francais
+  "sous titres realises par la communaute d amara org",
+  "sous titrage societe radio canada",
+  "merci d avoir regarde cette video",
+  "merci d avoir regarde",
+  "n oubliez pas de vous abonner",
+  "abonnez vous",
+  "sous titrage st 501",
+  // Anglais
+  "thank you for watching",
+  "thanks for watching",
+  "don t forget to subscribe",
+  "please subscribe to my channel",
+  "subscribe to my channel",
+  // Marqueurs que Whisper produit sur du son sans parole. « you » seul en fait
+  // partie : c'est sa sortie la plus frequente sur du silence.
+  "music",
+  "musique",
+  "blank audio",
+  "you",
+];
+
+function estPhraseFantome(texte) {
+  // Rien que des notes de musique : la normalisation les effacerait (ce ne sont
+  // ni des lettres ni des chiffres), donc on regarde le texte brut.
+  if (/^[\s♪♫♬♩]+$/u.test(texte)) return true;
+
+  return PHRASES_FANTOMES.includes(normaliserTexte(texte));
 }
 
 function surMessageWhisper(event) {
@@ -299,6 +399,26 @@ function surMessageWhisper(event) {
       // vide ou juste de la ponctuation : inutile de polluer la console.
       if (!texte || !/[\p{L}\p{N}]/u.test(texte)) {
         console.log("   (segment sans texte exploitable)");
+        break;
+      }
+
+      // Whisper a recite une phrase de son entrainement au lieu d'ecouter.
+      if (estPhraseFantome(texte)) {
+        sousTitresRejetes++;
+        console.warn(
+          `🚫 Sous-titre rejeté (phrase fantôme) : "${texte}" ` +
+            `(${sousTitresRejetes} rejet(s) depuis le début)`
+        );
+        break;
+      }
+
+      // Whisper est parti en boucle.
+      if (estUnRadotage(texte)) {
+        sousTitresRejetes++;
+        console.warn(
+          `🚫 Sous-titre rejeté (radotage) : "${texte}" ` +
+            `(${sousTitresRejetes} rejet(s) depuis le début)`
+        );
         break;
       }
 
@@ -455,9 +575,58 @@ const DUREE_MIN_ENVOI = 3;
 // jusqu'a 1,5 s de latence en plus sur le dernier bout d'une phrase.
 const SILENCE_MAX = 1.5;
 
+// ---------------------------------------------------------------------------
+// Garde-fou : un segment doit contenir de la VRAIE parole
+// ---------------------------------------------------------------------------
+//
+// Le VAD nous donne, pour chaque trame, la probabilite qu'elle contienne de la
+// parole. On jetait cette information ; on s'en sert maintenant pour refuser
+// d'envoyer a Whisper un segment majoritairement silencieux.
+//
+// Pourquoi : sur du silence, du bruit ou de la musique, whisper-tiny n'echoue
+// pas, il INVENTE -- il se rabat sur les phrases les plus frequentes de son
+// entrainement (des sous-titres YouTube : « Thank you for watching »,
+// « n'oubliez pas de vous abonner »). Le meilleur moyen d'eviter ces phrases
+// est de ne pas le faire travailler sur du vide.
+//
+// Au-dessus de ce seuil, la trame compte comme parlee. 0,5 = le point neutre du
+// modele Silero (il sort une probabilite entre 0 et 1). A ne pas confondre avec
+// positiveSpeechThreshold, qui sert au VAD a decider quand OUVRIR un segment :
+// ici on ne decide rien, on compte.
+const SEUIL_TRAME_PAROLE = 0.5;
+
+// Proportion minimale de trames parlees pour qu'un segment merite Whisper.
+//
+// ⚠️ Cette valeur a ete MESUREE, pas choisie. Un premier essai a 0,30 rejetait
+// de la VRAIE parole -- exactement le defaut invisible qu'il faut eviter : le
+// sous-titre manque, sans erreur, sans trace.
+//
+// Mesures sur les deux extraits du depot (test/speech.wav et test/speech-fr.mp3),
+// en reconstituant les formes de segment que la production peut produire
+// (PRE_PAROLE en tete, puis parole, puis le silence de fin -- borne a ~2,2 s par
+// la redemption du VAD et SILENCE_MAX) :
+//
+//   son SANS parole      : silence 0 %, bruit de fond 0 %, musique seule 2 %
+//   vraie parole, pire cas : 19 %  (1,5 s de parole suivie de 2,2 s de silence)
+//   vraie parole, courant  : 26 a 75 %
+//
+// Le trou entre 2 % et 19 % est large : on se place au milieu. 0,10 laisse
+// passer toute la vraie parole mesuree (5x de marge sous le pire cas) tout en
+// bloquant le silence, le bruit et la musique (5x au-dessus du pire cas).
+//
+// Remonter cette valeur vers 0,30 fait reapparaitre le probleme. Tout rejet est
+// journalise avec sa proportion : regarder la console avant d'y toucher.
+const PART_PAROLE_MIN = 0.1;
+
 let tampon = [];        // trames accumulees (Float32Array de 16 kHz)
 let tamponSamples = 0;  // leur total en echantillons, pour eviter de recompter
 let enParole = false;
+
+// Parallele a `tampon`, une entree par trame : cette trame contenait-elle de la
+// parole ? Les deux tableaux DOIVENT etre modifies ensemble partout (ajout,
+// purge au repos, recouvrement, vidage) -- sinon la proportion se decale et le
+// garde-fou se met a rejeter n'importe quoi.
+let tamponParole = [];
 
 // Ce que le tampon contient de DEJA ENVOYE : le recouvrement repris au segment
 // precedent. Sert a ne pas retranscrire deux fois le meme demi-mot si le VAD
@@ -489,11 +658,23 @@ function dureeNouveaute() {
 
 function viderTampon() {
   tampon = [];
+  tamponParole = []; // toujours en meme temps que `tampon`
   tamponSamples = 0;
   reportSamples = 0;
   enAttente = false;
   silenceSamples = 0;
   attenteAvantParole = false;
+}
+
+// Proportion de trames parlees dans le tampon actuel, entre 0 et 1.
+// Un tampon vide vaut 0 : rien a transcrire, donc rien a envoyer.
+function partParole() {
+  if (tamponParole.length === 0) return 0;
+  let parlees = 0;
+  for (const estParole of tamponParole) {
+    if (estParole) parlees++;
+  }
+  return parlees / tamponParole.length;
 }
 
 // Colle les trames en un seul Float32Array continu, pret pour Whisper.
@@ -523,18 +704,25 @@ function fermerSegment(raison, recouvrement = 0) {
 
   const audio = assemblerTampon();
 
+  // Mesure AVANT de tailler le recouvrement : c'est la proportion du segment
+  // qu'on envoie, pas celle de ce qu'il en restera.
+  const part = partParole();
+
   if (recouvrement > 0) {
     // On reprend les dernieres trames en repartant de la fin, jusqu'a couvrir
     // la duree voulue. On raisonne en trames entieres : elles font ~32 ms, donc
     // l'arrondi est sans consequence, et ca evite de decouper un Float32Array.
     const cible = recouvrement * TAUX;
     const queue = [];
+    const queueParole = [];
     let gardes = 0;
     for (let i = tampon.length - 1; i >= 0 && gardes < cible; i--) {
       queue.unshift(tampon[i]);
+      queueParole.unshift(tamponParole[i]); // la trame garde son etiquette
       gardes += tampon[i].length;
     }
     tampon = queue;
+    tamponParole = queueParole;
     tamponSamples = gardes;
     reportSamples = gardes; // tout ce qui reste vient d'etre envoye
     enAttente = false;
@@ -543,13 +731,14 @@ function fermerSegment(raison, recouvrement = 0) {
     viderTampon();
   }
 
-  transcrireSegment(audio, raison);
+  transcrireSegment(audio, raison, part);
 }
 
 // Appelee pour CHAQUE trame analysee par le VAD (~32 ms), qu'il y ait parole
 // ou non. C'est ici qu'on decide de couper.
-function surTrame(trame) {
+function surTrame(trame, estParole) {
   tampon.push(trame);
+  tamponParole.push(estParole);
   tamponSamples += trame.length;
 
   if (!enParole) {
@@ -570,6 +759,7 @@ function surTrame(trame) {
     // depasse PRE_PAROLE, sinon il grossirait indefiniment pendant les silences.
     while (dureeTampon() > PRE_PAROLE && tampon.length > 1) {
       tamponSamples -= tampon.shift().length;
+      tamponParole.shift(); // meme trame, meme sort
     }
     // On vient peut-etre de jeter des trames comptees dans le report : sans ce
     // recalage, dureeNouveaute() sous-estimerait le neuf et on finirait par
@@ -632,7 +822,7 @@ function surveillerFile() {
 //
 // `audio` nous appartient (on vient de l'assembler), donc on le transfere
 // directement : aucune copie.
-function transcrireSegment(audio, raison) {
+function transcrireSegment(audio, raison, partDeParole = 1) {
   // Le VAD ne peut pas tourner sans capture, et la capture demarre Whisper :
   // en pratique on ne passe jamais ici sans worker. Garde-fou quand meme.
   if (!whisperWorker) {
@@ -650,6 +840,18 @@ function transcrireSegment(audio, raison) {
     console.log(
       `⏭️ Segment ignoré : Whisper n'est pas encore prêt ` +
         `(${(audio.length / TAUX).toFixed(1)} s, ${segmentsIgnoresAttente} depuis le début)`
+    );
+    return;
+  }
+
+  // Presque rien de parle la-dedans : on n'envoie pas. C'est exactement sur ces
+  // segments-la que Whisper invente (voir PART_PAROLE_MIN).
+  if (partDeParole < PART_PAROLE_MIN) {
+    segmentsIgnoresSilence++;
+    console.log(
+      `⏭️ Segment ignoré : seulement ${Math.round(partDeParole * 100)} % de parole réelle ` +
+        `(${(audio.length / TAUX).toFixed(1)} s, raison « ${raison} », ` +
+        `${segmentsIgnoresSilence} depuis le début)`
     );
     return;
   }
@@ -678,7 +880,12 @@ function transcrireSegment(audio, raison) {
     [audio.buffer]
   );
 
-  console.log(`➡️  Segment #${id} envoye a Whisper : ${secondes} s (${raison})`);
+  // La proportion de parole est journalisee meme quand on accepte : c'est le
+  // seul moyen de verifier que PART_PAROLE_MIN reste loin des vrais segments.
+  console.log(
+    `➡️  Segment #${id} envoye a Whisper : ${secondes} s (${raison}, ` +
+      `${Math.round(partDeParole * 100)} % de parole)`
+  );
 
   // Filet de securite, meme quand Whisper est pret : sur une machine lente la
   // file peut recommencer a diverger. On abandonne alors les PLUS ANCIENS --
@@ -734,6 +941,8 @@ async function startCapture(streamId, memoBackend, langue, retard, retardCalibre
     segmentsAbandonnes.clear();
     segmentsIgnoresAttente = 0;
     segmentsIgnoresFile = 0;
+    segmentsIgnoresSilence = 0;
+    sousTitresRejetes = 0;
     statutPretEnvoye = false;
 
     // Au tout premier lancement sur une machine, il se passe une minute entre
@@ -920,7 +1129,11 @@ async function startVAD(stream) {
       // Toutes les trames passent par ici (~32 ms chacune), parole ou pas :
       // c'est nous qui assemblons et decoupons les segments.
       onFrameProcessed: (probs, trame) => {
-        surTrame(trame);
+        // `probs` vaut { isSpeech, notSpeech } (verifie dans la librairie :
+        // dist/models/v5.js, c'est le modele qu'on utilise). On ne garde que le
+        // verdict oui/non : la proportion de trames parlees du segment sert
+        // ensuite a refuser les segments quasi vides (voir PART_PAROLE_MIN).
+        surTrame(trame, probs.isSpeech > SEUIL_TRAME_PAROLE);
       },
 
       onSpeechStart: () => {
