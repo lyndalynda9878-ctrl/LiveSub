@@ -33,9 +33,71 @@ let delayNode = null;
 //
 // On ne devine pas cette valeur : le repere est mesure (finAudioMs, pose sur
 // chaque trame et transporte par la passe), on le lit.
+//
+// ---------------------------------------------------------------------------
+// ⚠️ IL N'Y A PLUS UN BON RETARD, MAIS DEUX -- UN PAR MODE D'AFFICHAGE.
+// ---------------------------------------------------------------------------
+//
+// La regle est la meme dans les deux cas : ON MESURE L'AGE DU DERNIER MOT
+// REELLEMENT AFFICHE. Ce qui change, c'est quel mot c'est.
+//
+//   « avec la fin provisoire » -> le dernier mot affiche est le dernier mot de
+//   la passe, donc le bout de la fenetre. Repere : `passe.finAudioMs`.
+//
+//   « stable seulement »       -> le dernier mot affiche est le dernier mot
+//   CONFIRME, c'est-a-dire le dernier sur lequel deux passes successives sont
+//   tombees d'accord. LocalAgreement-2 le borne par l'hypothese PRECEDENTE :
+//   un mot ne peut pas etre confirme s'il n'etait pas deja dans la passe
+//   d'avant. Repere : `finAudioPassePrecedente`.
+//
+// L'ecart entre les deux reperes, c'est exactement l'audio avale entre deux
+// passes -- la cadence. D'ou l'attendu : retard stable ≈ retard provisoire + 1
+// cadence.
+//
+// Prendre `finAudioMs` dans les deux cas etait le defaut a corriger : en mode
+// stable, on calait le son sur la fin de la FENETRE alors que l'ecran montrait
+// du texte plus vieux d'une cadence. Le son passait donc systematiquement en
+// avance sur le texte lu.
+//
+// Les deux sont mesures dans le MEME passage de calibration : les deux reperes
+// vivent sur les memes passes, faire calibrer l'utilisateur deux fois n'aurait
+// servi a rien -- et cocher la case doit recaler le son tout de suite.
 let modeRetard = 0; // 0 (desactive) | un nombre de secondes | "auto"
-let echantillonsRetard = [];
+let echantillonsRetard = [];       // mode « avec la fin provisoire »
+let echantillonsRetardStable = []; // mode « stable seulement »
 let retardApplique = null; // renseigne des que la calibration a tranche
+
+// Les deux verdicts de la calibration, une fois qu'elle a tranche. Gardes pour
+// pouvoir basculer d'un mode a l'autre A CHAUD sans remesurer.
+let retardsCalibres = null; // { avecProvisoire, stable }
+
+// Le mode d'affichage courant. L'offscreen ne l'utilise QUE pour choisir lequel
+// des deux retards appliquer au son : c'est content.js qui decide ce qui
+// s'affiche. Defaut false = stable seul, comme dans content.js et la popup.
+let afficherProvisoire = false;
+
+// Applique au noeud de retard la valeur calibree qui correspond au mode
+// d'affichage courant. Appelee a la fin de la calibration, et a chaque fois que
+// la case de la popup change -- c'est ce qui fait que cocher/decocher recale le
+// son immediatement, sans redemarrer la capture ni remesurer.
+//
+// Ne fait rien hors du mode auto : un reglage manuel est un ordre, pas une
+// suggestion, et il ne doit pas bouger sous les pieds de l'utilisateur.
+function appliquerRetardDuMode(origine) {
+  if (modeRetard !== "auto" || !retardsCalibres) return;
+
+  const valeur = afficherProvisoire
+    ? retardsCalibres.avecProvisoire
+    : retardsCalibres.stable;
+  if (typeof valeur !== "number") return;
+
+  retardApplique = valeur;
+  if (delayNode) delayNode.delayTime.value = valeur;
+  console.log(
+    `🎚️ Retard du son : ${valeur.toFixed(1)} s ` +
+      `(${afficherProvisoire ? "avec provisoire" : "stable seul"}, ${origine})`
+  );
+}
 
 // « ✅ Pret » ne se dit qu'une fois par capture : ensuite l'overlay appartient
 // aux vrais sous-titres.
@@ -67,7 +129,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       request.memoBackend,
       request.langue,
       request.retard,
-      request.retardCalibre
+      request.retardCalibre,
+      request.afficherProvisoire
     ).then(sendResponse);
     return true; // reponse asynchrone
   }
@@ -89,8 +152,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (modeRetard === "auto") {
       // On repart d'une calibration neuve : le service worker vient d'effacer
-      // l'ancienne mesure, on remet le son a plat et on remesure.
+      // l'ancienne mesure, on remet le son a plat et on remesure. Les DEUX
+      // series repartent de zero, sinon la moitie du verdict serait un melange
+      // de l'ancienne et de la nouvelle mesure.
       echantillonsRetard = [];
+      echantillonsRetardStable = [];
+      retardsCalibres = null;
       retardApplique = null;
       if (delayNode) delayNode.delayTime.value = 0;
       console.log("⏱️ Retard du son : auto (calibration en cours)");
@@ -108,6 +175,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     stopCapture().then(() => sendResponse({ success: true }));
     return true; // reponse asynchrone
   }
+});
+
+// La case « Afficher la fin provisoire » de la popup. On l'ecoute directement
+// dans le storage : un document offscreen est un contexte d'extension, il y a
+// acces, et ca evite un aller-retour par le service worker pour une valeur
+// qu'on ne fait que LIRE. content.js fait exactement pareil de son cote.
+//
+// ⚠️ APRES l'enregistrement du listener ci-dessus, jamais avant : c'est la
+// regle du fichier (voir le commentaire en tete de ce bloc). Ce qui s'intercale
+// avant retarde la reponse a START_CAPTURE, et la capture echoue sur « Le
+// module audio n'a pas repondu ».
+chrome.storage.onChanged.addListener((changes, zone) => {
+  if (zone !== "local" || !changes.afficherProvisoire) return;
+  afficherProvisoire = Boolean(changes.afficherProvisoire.newValue);
+  appliquerRetardDuMode("bascule à chaud");
 });
 
 // ---------------------------------------------------------------------------
@@ -352,10 +434,28 @@ function surMessageWhisper(event) {
       // muette n'a rien a afficher, mais c'est un chronometre parfaitement
       // valable, et s'en priver rallongerait la calibration.
       if (modeRetard === "auto" && retardApplique === null) {
-        const besoin = (Date.now() - passe.finAudioMs) / 1000;
+        const maintenant = Date.now();
+
+        // Repere 1 : la fin de la fenetre, donc le dernier mot du provisoire.
+        const besoin = (maintenant - passe.finAudioMs) / 1000;
         echantillonsRetard.push(besoin);
+
+        // Repere 2 : la fin de l'hypothese PRECEDENTE, donc le dernier mot que
+        // le prefixe commun peut rendre stable.
+        //
+        // Tant qu'aucune passe n'a encore ete acceptee (premiere passe de la
+        // capture, ou juste apres une fermeture de fenetre), il n'y a pas
+        // d'hypothese precedente : on retombe sur le meme repere. Cet
+        // echantillon-la SOUS-ESTIME donc le retard stable -- sans consequence,
+        // puisqu'on garde le MAXIMUM des cinq et que les suivants, eux, ont un
+        // predecesseur.
+        const repereStable = finAudioPassePrecedente || passe.finAudioMs;
+        const besoinStable = (maintenant - repereStable) / 1000;
+        echantillonsRetardStable.push(besoinStable);
+
         console.log(
-          `🎚️ Calibration ${echantillonsRetard.length}/5 : ${besoin.toFixed(1)} s`
+          `🎚️ Calibration ${echantillonsRetard.length}/5 : ${besoin.toFixed(1)} s ` +
+            `(avec provisoire) / ${besoinStable.toFixed(1)} s (stable seul)`
         );
 
         if (echantillonsRetard.length === 5) {
@@ -363,12 +463,29 @@ function surMessageWhisper(event) {
           // AVANCE sur la voix qu'en retard. Un sous-titre en avance se lit
           // tranquillement ; un sous-titre en retard ne sert plus a rien.
           // +0,3 s de marge, et 18 s de plafond (le noeud en accepte 20).
-          retardApplique = Math.min(18, Math.max(...echantillonsRetard) + 0.3);
-          if (delayNode) delayNode.delayTime.value = retardApplique;
-          console.log(`🎚️ Retard calibré : ${retardApplique.toFixed(1)} s`);
+          const arrondir = (echantillons) =>
+            Math.round(Math.min(18, Math.max(...echantillons) + 0.3) * 10) / 10;
+
+          retardsCalibres = {
+            avecProvisoire: arrondir(echantillonsRetard),
+            stable: arrondir(echantillonsRetardStable)
+          };
+
+          console.log(
+            `🎚️ Retards calibrés : ${retardsCalibres.avecProvisoire.toFixed(1)} s ` +
+              `(avec provisoire) / ${retardsCalibres.stable.toFixed(1)} s (stable seul) ` +
+              `— écart ${(retardsCalibres.stable - retardsCalibres.avecProvisoire).toFixed(1)} s, ` +
+              `soit une cadence`
+          );
+
+          appliquerRetardDuMode("calibration");
 
           chrome.runtime
-            .sendMessage({ type: "RETARD_CALIBRE", valeur: retardApplique })
+            .sendMessage({
+              type: "RETARD_CALIBRE",
+              avecProvisoire: retardsCalibres.avecProvisoire,
+              stable: retardsCalibres.stable
+            })
             .catch(() => {});
 
           if (!statutPretEnvoye) {
@@ -404,11 +521,22 @@ function surMessageWhisper(event) {
         );
       } else {
         accepterTexte(texte);
+
+        // Le ruban vient d'avancer jusqu'au prefixe commun avec l'hypothese
+        // PRECEDENTE : le dernier mot stable ne peut donc pas etre plus recent
+        // que la fin de cette passe-la. C'est le repere qu'on envoie a
+        // content.js pour qu'il mesure l'age de ce qu'il affiche vraiment.
+        if (finAudioPassePrecedente) finAudioStableMs = finAudioPassePrecedente;
+        finAudioPassePrecedente = passe.finAudioMs;
+
         const age = ((Date.now() - passe.finAudioMs) / 1000).toFixed(1);
+        const ageStable = finAudioStableMs
+          ? ((Date.now() - finAudioStableMs) / 1000).toFixed(1)
+          : age;
         console.log(
           `📝 Passe #${passe.id} en ${(message.ms / 1000).toFixed(1)} s ` +
-            `(âge du son : ${age} s) | stable « …${ruban.slice(-70)} » ` +
-            `| provisoire « ${provisoire} »`
+            `(âge du son : ${age} s avec provisoire, ${ageStable} s stable seul) ` +
+            `| stable « …${ruban.slice(-70)} » | provisoire « ${provisoire} »`
         );
         envoyerFlux(passe.finAudioMs);
       }
@@ -420,6 +548,18 @@ function surMessageWhisper(event) {
         // Le motif compte : sur « fenetre pleine » on a coupe en plein mot, et
         // c'est le recouvrement qui le retranscrira (voir figerFenetre).
         figerFenetre(passe.cloturante);
+
+        // TOUT le provisoire vient de devenir stable : le texte stable atteint
+        // maintenant la fin de la fenetre. C'est le seul moment ou les deux
+        // reperes se rejoignent -- et c'est ce qui garantit qu'aucun mot de fin
+        // de phrase n'est perdu en mode stable : la cloture les y verse tous.
+        //
+        // (Sur « fenetre pleine » on a jete le dernier demi-mot, donc le stable
+        // s'arrete en realite un mot avant. On surestime alors sa fraicheur de
+        // ~0,4 s, ce qui pousse le son a passer legerement en avance -- le bon
+        // sens de l'erreur.)
+        finAudioStableMs = passe.finAudioMs;
+
         cloturerFenetre(passe);
         envoyerFlux(passe.finAudioMs);
       }
@@ -592,9 +732,22 @@ let fenetreSamples = 0;
 let enParole = false;
 
 // Horodatage du DERNIER echantillon entre dans la fenetre. C'est l'age de ce
-// point-la, au moment ou le texte s'affiche, qui donne le bon retard du son
-// (voir la calibration en haut de fichier).
+// point-la, au moment ou le texte s'affiche, qui donne le bon retard du son en
+// mode « avec la fin provisoire » (voir la calibration en haut de fichier).
 let finAudioMs = 0;
+
+// Les deux reperes du mode « stable seulement ».
+//
+// `finAudioStableMs` : jusqu'ou va le son dont le texte est DEJA dans le ruban.
+// C'est lui qu'on envoie a content.js, qui mesure l'age de ce qu'il affiche
+// vraiment. Il reste en arriere de `finAudioMs` d'environ une cadence.
+//
+// `finAudioPassePrecedente` : la fin de fenetre de la passe qui a fourni
+// `motsPassePrecedente`. Les deux vont ensemble et sont remis a zero ensemble
+// (voir reinitialiserTexteFenetre) : le prefixe commun est calcule contre cette
+// hypothese-la, donc le ruban ne peut pas depasser ce point.
+let finAudioStableMs = 0;
+let finAudioPassePrecedente = 0;
 
 // La passe en vol, ou null. UN SEUL element possible : c'est toute la regle du
 // moteur. { id, trames, finAudioMs, envoiMs, cloturante }
@@ -705,6 +858,10 @@ function reinitialiserTexteFenetre() {
   provisoire = "";
   motsPassePrecedente = [];
   motsConfirmes = 0;
+  // Va de pair avec motsPassePrecedente : plus d'hypothese precedente, donc
+  // plus de repere. Le laisser trainer ferait croire que du texte de la fenetre
+  // d'AVANT est encore en attente de confirmation.
+  finAudioPassePrecedente = 0;
 }
 
 // Sommes-nous au repos ? (rien en cours, rien a finir, rien d'affiche en
@@ -836,12 +993,27 @@ function cloturerFenetre(passe) {
 // acces a chrome.tabs), et c'est le service worker qui sait quel onglet est
 // capture.
 //
-// `finAudio` = l'instant ou le dernier echantillon transcrit a ete capte.
-// content.js s'en sert pour mesurer l'AGE du mot le plus recent au moment ou il
-// s'affiche -- c'est ce chiffre-la qui donne le bon retard du son.
+// On envoie TOUJOURS les deux textes, ruban ET provisoire, quel que soit le
+// mode d'affichage : c'est content.js qui choisit ce qu'il montre. Le moteur,
+// lui, ne connait pas les modes -- il produit, il n'affiche pas.
+//
+// Deux reperes temporels l'accompagnent, un par mode, parce que les deux modes
+// n'affichent pas le meme dernier mot :
+//   `finAudio`       = fin de la fenetre        -> age du dernier mot PROVISOIRE
+//   `finAudioStable` = fin de l'hypothese d'avant -> age du dernier mot STABLE
+//
+// content.js prend celui qui correspond a ce qu'il affiche, et mesure l'age du
+// mot le plus recent au moment ou il apparait. C'est ce chiffre-la qui donne le
+// bon retard du son.
 function envoyerFlux(finAudio) {
   chrome.runtime
-    .sendMessage({ type: "FLUX", ruban, provisoire, finAudio })
+    .sendMessage({
+      type: "FLUX",
+      ruban,
+      provisoire,
+      finAudio,
+      finAudioStable: finAudioStableMs || null
+    })
     .catch(() => {});
 }
 
@@ -971,7 +1143,14 @@ function surTrame(trame, estParole) {
 // Démarrer la capture.
 // Ne rejette JAMAIS : renvoie toujours { success, error?, warning? }, parce que
 // c'est cette reponse qui decide si le background a le droit d'ecrire "actif".
-async function startCapture(streamId, memoBackend, langue, retard, retardCalibre) {
+async function startCapture(
+  streamId,
+  memoBackend,
+  langue,
+  retard,
+  retardCalibre,
+  modeProvisoire
+) {
   try {
     console.log("🎤 Offscreen : demarrage capture avec streamId :", streamId);
 
@@ -1068,14 +1247,29 @@ async function startCapture(streamId, memoBackend, langue, retard, retardCalibre
     // Trois cas de figure pour la valeur de depart :
     modeRetard = retard ?? 0;
     echantillonsRetard = [];
+    echantillonsRetardStable = [];
     retardApplique = null;
 
-    if (modeRetard === "auto" && typeof retardCalibre === "number") {
+    // Le mode d'affichage arrive du service worker. Il ne sert ICI qu'a choisir
+    // laquelle des deux valeurs calibrees appliquer au son ; ensuite c'est
+    // storage.onChanged qui suit les bascules (voir appliquerRetardDuMode).
+    afficherProvisoire = Boolean(modeProvisoire);
+
+    // La memoire ne vaut que si elle porte les DEUX modes. Une valeur d'une
+    // generation precedente (un simple nombre) est refusee net : mieux vaut
+    // 30 s de recalibration qu'un son cale sur un texte qui n'existe plus.
+    retardsCalibres =
+      retardCalibre &&
+      typeof retardCalibre.avecProvisoire === "number" &&
+      typeof retardCalibre.stable === "number"
+        ? retardCalibre
+        : null;
+
+    if (modeRetard === "auto" && retardsCalibres) {
       // 1. Mode auto, deja calibre sur cette machine -> on applique tout de
-      //    suite. C'est ce qui evite de repasser par le trou de calibration a
-      //    chaque lancement.
-      retardApplique = retardCalibre;
-      delayNode.delayTime.value = retardCalibre;
+      //    suite celui qui correspond au mode d'affichage. C'est ce qui evite
+      //    de repasser par le trou de calibration a chaque lancement.
+      appliquerRetardDuMode("mémorisé");
     } else if (modeRetard === "auto") {
       // 2. Mode auto, jamais calibre -> on part sans retard et on mesure les
       //    5 premiers segments (voir le case "result").
@@ -1298,8 +1492,10 @@ async function stopCapture() {
   }
 
   // La calibration ne survit pas a la capture : le prochain demarrage repartira
-  // de la valeur memorisee (mode auto deja calibre) ou remesurera.
+  // des valeurs memorisees (mode auto deja calibre) ou remesurera.
   echantillonsRetard = [];
+  echantillonsRetardStable = [];
+  retardsCalibres = null;
   retardApplique = null;
 
   // Arrêter toutes les pistes du flux
@@ -1331,6 +1527,10 @@ async function stopCapture() {
   viderFenetre();
   reinitialiserTexteFenetre();
   ruban = "";
+  // Les reperes aussi : sans ca, la prochaine capture daterait ses premiers
+  // mots stables de la video precedente et calculerait un age absurde.
+  finAudioMs = 0;
+  finAudioStableMs = 0;
 
   console.log("✅ Offscreen : tout est bien ferme");
 }

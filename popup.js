@@ -15,6 +15,7 @@ const toggleBtn = document.getElementById("toggleBtn");
 const statusDiv = document.getElementById("status");
 const langueSelect = document.getElementById("langue");
 const retardSelect = document.getElementById("retardAudio");
+const provisoireCase = document.getElementById("afficherProvisoire");
 
 // ---------------------------------------------------------------------------
 // Langue parlee dans la video
@@ -54,6 +55,45 @@ langueSelect.addEventListener("change", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Afficher la fin provisoire ?
+// ---------------------------------------------------------------------------
+//
+// Le moteur produit deux textes : le STABLE (deux passes successives sont
+// tombees d'accord dessus, il ne bougera plus jamais) et la FIN PROVISOIRE (la
+// derniere hypothese, que la passe suivante a le droit de corriger).
+//
+// Decoche -- le DEFAUT -- on n'affiche que le stable : le texte ne fait que
+// s'allonger, plus rien ne se reecrit sous les yeux. Prix assume : environ une
+// cadence de retard en plus (~2 s).
+//
+// ⚠️ On n'ecrit QUE dans storage.local, et on ne previent personne : c'est
+// content.js qui ecoute storage.onChanged et bascule tout seul, dans l'onglet,
+// sans redemarrer la capture. Passer par le service worker n'apporterait rien
+// ici -- et le ferait echouer quand rien ne capture.
+const CLE_PROVISOIRE = "afficherProvisoire";
+const PROVISOIRE_PAR_DEFAUT = false;
+
+async function chargerProvisoire() {
+  try {
+    const stored = await chrome.storage.local.get(CLE_PROVISOIRE);
+    provisoireCase.checked = Boolean(stored[CLE_PROVISOIRE] ?? PROVISOIRE_PAR_DEFAUT);
+  } catch (err) {
+    provisoireCase.checked = PROVISOIRE_PAR_DEFAUT;
+  }
+}
+
+provisoireCase.addEventListener("change", async () => {
+  try {
+    await chrome.storage.local.set({ [CLE_PROVISOIRE]: provisoireCase.checked });
+  } catch (err) {
+    console.warn("Option d'affichage non memorisee :", err);
+  }
+  // Le bon retard du son n'est pas le meme dans les deux modes : l'info affichee
+  // sous le menu doit suivre.
+  await afficherInfoRetard();
+});
+
+// ---------------------------------------------------------------------------
 // Retard du son
 // ---------------------------------------------------------------------------
 //
@@ -64,9 +104,10 @@ langueSelect.addEventListener("change", async () => {
 //   - "auto" reste une CHAINE : ce n'est pas une duree, c'est un mode.
 const CLE_RETARD = "retardAudio";
 // ⚠️ Doit rester identique a RETARD_CALIBRE_KEY dans background.js : le nom
-// porte le moteur, pour qu'une mesure faite par l'ancien moteur (par blocs) ne
-// soit pas reappliquee au moteur de flux. Voir le commentaire la-bas.
-const CLE_RETARD_CALIBRE = "retardCalibreFlux";
+// porte le moteur ET la forme de la valeur, pour qu'une mesure faite par un
+// moteur ou un affichage precedent ne soit jamais reappliquee. Voir le long
+// commentaire la-bas. La valeur est un objet { avecProvisoire, stable }.
+const CLE_RETARD_CALIBRE = "retardCalibreFluxParMode";
 const RETARD_PAR_DEFAUT = 0;
 
 const retardInfo = document.getElementById("retardInfo");
@@ -82,9 +123,16 @@ async function afficherInfoRetard() {
   try {
     const stored = await chrome.storage.local.get(CLE_RETARD_CALIBRE);
     const calibre = stored[CLE_RETARD_CALIBRE];
+
+    // Deux valeurs sont mesurees en un seul passage, une par mode d'affichage :
+    // le texte stable arrive une cadence plus tard que la fin provisoire, donc
+    // il faut retarder le son d'autant en plus. On montre celle QUI S'APPLIQUE.
+    const mode = provisoireCase.checked ? "avecProvisoire" : "stable";
+    const valeur = calibre && calibre[mode];
+
     retardInfo.textContent =
-      typeof calibre === "number"
-        ? `aligné à ${calibre.toFixed(1)} s`
+      typeof valeur === "number"
+        ? `aligné à ${valeur.toFixed(1)} s (${provisoireCase.checked ? "avec provisoire" : "stable"})`
         : "calibration…";
   } catch (err) {
     retardInfo.textContent = "calibration…";
@@ -230,4 +278,6 @@ chrome.storage.session.onChanged.addListener((changes) => {
 // Au depart, on demande l'etat au background au lieu de supposer "arrete".
 loadState();
 chargerLangue();
-chargerRetard();
+// La case doit etre lue AVANT le retard : afficherInfoRetard s'en sert pour
+// choisir laquelle des deux valeurs calibrees elle annonce.
+chargerProvisoire().then(chargerRetard);

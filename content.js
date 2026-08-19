@@ -78,8 +78,8 @@ console.log("✅ Overlay cree sur la page");
 // recouvrirait une phrase transcrite serait pire que pas de message du tout.
 let premierTexteAffiche = false;
 
-// Le texte VISE (ruban + provisoire), decoupe en mots, et combien sont
-// reellement a l'ecran. L'ecart entre les deux, c'est ce qu'il reste a reveler.
+// Le texte VISE, decoupe en mots, et combien sont reellement a l'ecran.
+// L'ecart entre les deux, c'est ce qu'il reste a reveler.
 let motsCible = [];
 let nbAffiches = 0;
 let minuterie = null;
@@ -87,6 +87,36 @@ let minuterie = null;
 // Instant ou le dernier son transcrit a ete capte, pour la passe en cours
 // d'affichage. Sert a mesurer l'AGE du mot le plus recent quand il apparait.
 let finAudioCible = null;
+
+// ---------------------------------------------------------------------------
+// Deux modes d'affichage : « stable seulement » ou « avec la fin provisoire »
+// ---------------------------------------------------------------------------
+//
+// L'offscreen envoie TOUJOURS les deux textes -- `ruban` (stable, ne bougera
+// plus jamais) et `provisoire` (la fin que la passe suivante a le droit de
+// corriger). C'est ICI, a l'affichage, qu'on decide lequel on montre.
+//
+// AFFICHER LE PROVISOIRE, c'est accepter que du texte deja lu SE REECRIVE sous
+// les yeux : « Je ne me » devient « Je n'aime pas, je deteste. » Ce n'est pas
+// un defaut qu'on peut corriger, c'est la definition meme du provisoire.
+//
+// NE MONTRER QUE LE STABLE supprime ce phenomene par construction : le ruban ne
+// recule jamais, donc le texte ne peut QUE s'allonger. Le prix est connu et
+// assume : un mot n'apparait qu'une fois qu'une SECONDE passe l'a confirme,
+// soit environ une cadence de retard en plus (~2 s).
+//
+// Le choix se fait a l'oeil, pas au chiffre -- d'ou une option, basculable A
+// CHAUD (voir l'ecoute de storage.onChanged plus bas) pour comparer les deux
+// modes sur la meme video sans redemarrer la capture.
+//
+// Defaut : false, donc mode stable. C'est le reproche « ca se reecrit » qu'on
+// cherche a faire disparaitre ; celui qui veut la reactivite maximale coche.
+const CLE_AFFICHER_PROVISOIRE = "afficherProvisoire";
+let afficherProvisoire = false;
+
+// Le dernier FLUX recu, garde tel quel. Sans lui, une bascule de mode devrait
+// attendre la passe suivante pour se voir : on veut qu'elle soit immediate.
+let dernierFlux = null;
 
 // Delai entre deux mots reveles. Assez lent pour qu'on voie les mots arriver,
 // assez rapide pour ne jamais accumuler de retard : une passe apporte rarement
@@ -209,10 +239,43 @@ function planifierRevelation() {
 
 // Reception du flux : ruban (stable) + provisoire (fin incertaine).
 //
+// On garde le message TEL QUEL avant de l'appliquer : c'est ce qui permet a une
+// bascule de mode de se voir tout de suite, sans attendre la passe suivante.
+function afficherFlux(ruban, provisoire, finAudio, finAudioStable) {
+  dernierFlux = { ruban, provisoire, finAudio, finAudioStable };
+  appliquerFlux();
+}
+
+// Ecrit a l'ecran le dernier flux recu, dans le mode d'affichage courant.
+//
 // Le ruban ne s'efface JAMAIS. Entre deux phrases, il n'arrive simplement plus
 // rien de nouveau et le dernier texte reste affiche.
-function afficherFlux(ruban, provisoire, finAudio) {
-  const nouveau = decouperEnMots(`${ruban || ""} ${provisoire || ""}`);
+function appliquerFlux() {
+  if (!dernierFlux) return;
+
+  const { ruban, provisoire, finAudio, finAudioStable } = dernierFlux;
+
+  // LE point de bascule, et il tient en une ligne : en mode stable on ignore
+  // purement et simplement le provisoire. Tout le reste de la fonction --
+  // alignement, revelation mot a mot, defilement -- ne change pas d'un iota.
+  const fin = afficherProvisoire ? provisoire : "";
+
+  // Le repere temporel doit suivre le mode, sinon la mesure d'age (et donc la
+  // calibration du retard du son) parlerait d'un texte qui n'est pas affiche :
+  //   - avec le provisoire, le dernier mot montre est le dernier de la fenetre
+  //     -> `finAudio` ;
+  //   - en stable seul, il est celui que DEUX passes ont confirme, donc plus
+  //     ancien d'environ une cadence -> `finAudioStable`.
+  // Repli sur `finAudio` si l'offscreen ne fournit pas encore le second repere
+  // (rien de stable n'a encore ete confirme).
+  const repere = afficherProvisoire ? finAudio : finAudioStable || finAudio;
+
+  const nouveau = decouperEnMots(`${ruban || ""} ${fin}`);
+
+  // Rien a montrer : on ne touche a rien. C'est le cas des toutes premieres
+  // secondes en mode stable, quand aucune passe n'a encore ete confirmee --
+  // l'ecran garde ce qu'il a (message d'etat, ou texte de la phrase d'avant)
+  // plutot que de clignoter a vide.
   if (!nouveau.length) return;
 
   // ⚠️ Une revelation en retard n'a pas le droit de retarder la suivante. Si
@@ -230,15 +293,24 @@ function afficherFlux(ruban, provisoire, finAudio) {
   // C'est ce qui empeche l'affichage de traîner derriere la parole.
   nbAffiches = Math.max(nbAffiches, motsCible.length - RETARD_MAX_MOTS);
 
-  finAudioCible = finAudio || null;
+  // Le tout premier texte de la capture remplace un message d'etat (« Ecoute du
+  // son en cours… »). Avec nbAffiches a 0, `rendre` ecrivait une chaine vide :
+  // la boite se vidait completement pendant un pas de revelation avant que le
+  // premier mot n'apparaisse. Mesure au banc : 80 ms d'ecran noir. On montre
+  // donc le premier mot tout de suite -- le message cede la place a du texte,
+  // pas a du vide.
+  if (!premierTexteAffiche && nbAffiches === 0) nbAffiches = 1;
+
+  finAudioCible = repere || null;
 
   // Trace d'arrivee, distincte de la trace d'affichage plus bas. Les deux
   // ensemble disent OU le temps passe : entre le micro et ce message (le
   // moteur), ou entre ce message et l'ecran (la revelation).
   console.log(
-    `📥 Flux reçu : ${motsCible.length} mots (${nbAffiches} déjà à l'écran, ` +
+    `📥 Flux [${afficherProvisoire ? "avec provisoire" : "stable seul"}] : ` +
+      `${motsCible.length} mots (${nbAffiches} déjà à l'écran, ` +
       `${motsCible.length - nbAffiches} à révéler), son vieux de ` +
-      `${finAudio ? ((Date.now() - finAudio) / 1000).toFixed(1) : "?"} s`
+      `${repere ? ((Date.now() - repere) / 1000).toFixed(1) : "?"} s`
   );
 
   premierTexteAffiche = true;
@@ -280,6 +352,7 @@ function toggleOverlay(show) {
     motsCible = [];
     nbAffiches = 0;
     finAudioCible = null;
+    dernierFlux = null;
     premierTexteAffiche = false;
 
     subtitleBox.style.display = "block";
@@ -306,7 +379,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === "FLUX") {
-    afficherFlux(request.ruban, request.provisoire, request.finAudio);
+    afficherFlux(
+      request.ruban,
+      request.provisoire,
+      request.finAudio,
+      request.finAudioStable
+    );
     sendResponse({ success: true });
   }
 
@@ -315,6 +393,49 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ success: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// L'option d'affichage : lue au chargement, puis suivie A CHAUD
+// ---------------------------------------------------------------------------
+//
+// Un content script accede directement a chrome.storage : pas besoin de passer
+// par le service worker, et surtout pas besoin de redemarrer la capture. On
+// coche dans la popup, l'ecran change a la passe... non, tout de suite : on
+// re-applique le dernier flux recu.
+//
+// C'est ce qui rend la comparaison possible A L'OEIL, sur la meme video et la
+// meme phrase -- ce qu'aucun chiffre ne remplace.
+function appliquerMode(valeur, origine) {
+  const avant = afficherProvisoire;
+  afficherProvisoire = Boolean(valeur);
+  if (afficherProvisoire === avant && origine !== "chargement") return;
+
+  console.log(
+    `👁️ Affichage : ${afficherProvisoire ? "ruban + fin provisoire" : "texte stable seulement"}` +
+      ` (${origine})`
+  );
+
+  // Re-appliquer tout de suite. En passant en mode stable la cible RETRECIT :
+  // alignerSurAffiche trouve alors que toute la cible est deja a l'ecran, donc
+  // la fin provisoire disparait d'un coup, sans re-animer un seul mot deja lu.
+  appliquerFlux();
+}
+
+try {
+  chrome.storage.local.get(CLE_AFFICHER_PROVISOIRE, (stored) => {
+    // Absent du storage = jamais coche = mode stable. C'est le defaut voulu.
+    appliquerMode(stored && stored[CLE_AFFICHER_PROVISOIRE], "chargement");
+  });
+
+  chrome.storage.onChanged.addListener((changes, zone) => {
+    if (zone !== "local" || !changes[CLE_AFFICHER_PROVISOIRE]) return;
+    appliquerMode(changes[CLE_AFFICHER_PROVISOIRE].newValue, "bascule à chaud");
+  });
+} catch (err) {
+  // Sans storage on reste sur le defaut : le texte ne se reecrit pas, c'est le
+  // comportement le plus sur des deux.
+  console.warn("Option d'affichage illisible, mode stable par defaut :", err);
+}
 
 // Par défaut, l'overlay est caché
 toggleOverlay(false);

@@ -34,7 +34,9 @@ l'offscreen n'a pas accès à `chrome.tabs` → `content.js` révèle les mots u
   (`GET_STATE`), ne le devine pas.
 - `content.js` — overlay de sous-titres : boîte de **deux lignes de hauteur fixe**, les
   mots nouveaux révélés **un par un** (`PAS_REVELATION`), le début qui sort par le haut.
-  `RETARD_MAX_MOTS` empêche l'affichage de traîner derrière la parole.
+  `RETARD_MAX_MOTS` empêche l'affichage de traîner derrière la parole. C'est aussi lui
+  qui décide **ce qu'on montre** — stable seul, ou stable + provisoire (voir « Les deux
+  modes d'affichage »).
 - `offscreen.html` / `offscreen.js` — capture audio (getUserMedia sur l'onglet) + VAD
   (Silero via `@ricky0123/vad-web` ; `getStream/pauseStream/resumeStream` pour écouter
   l'onglet et PAS le micro ; `model: "v5"`).
@@ -84,6 +86,75 @@ Comment ça marche :
 Ordres de grandeur mesurés sur cette machine (Intel Iris Xe, extrait de ~10 s) :
 CPU ~2,3 s, GPU ~4 à 5 s. *(L'ancien chiffre de « ~12 s » n'est plus d'actualité : il
 datait de l'inférence sur le fil principal, chargement du modèle compris.)*
+
+## Les deux modes d'affichage : « ça se réécrit » n'est pas un bug
+Le moteur produit **deux** textes : le `ruban` (stable — deux passes successives sont
+tombées d'accord dessus, il ne bougera plus jamais) et le `provisoire` (la dernière
+hypothèse, que la passe suivante a le droit de corriger).
+
+Afficher le provisoire, **c'est** accepter que du texte déjà lu se réécrive sous les
+yeux : « nouve. » devient « nouvelle », « rembobi. » devient « rembobiner ». Ce n'est
+pas un défaut qu'on peut corriger — c'est la définition du mot « provisoire ».
+
+D'où une **option**, et pas un remplacement : case « Afficher la fin provisoire » dans la
+popup, **décochée par défaut**, rangée dans `chrome.storage.local` sous
+`afficherProvisoire`.
+
+- **Décochée (défaut) — stable seulement.** Le texte ne peut que s'allonger. Prix assumé :
+  un mot n'apparaît qu'une fois confirmé, soit **une cadence de retard en plus**.
+- **Cochée — avec la fin provisoire.** Plus réactif, mais les derniers mots se corrigent
+  en direct.
+
+⚠️ **La bascule est à chaud, et c'est le point important** : le choix se juge à l'œil, sur
+la même vidéo et la même phrase. `content.js` et `offscreen.js` écoutent chacun
+`chrome.storage.onChanged` — aucun redémarrage de capture, aucune recalibration.
+`offscreen.js` **n'est pas au courant des modes** pour ce qu'il produit : il envoie
+toujours `ruban` ET `provisoire`. C'est l'affichage qui tranche.
+
+Mesuré au banc, 2 min 10 s de parole continue (voir « Comment tester ») :
+
+| | avec provisoire | stable seulement |
+|---|---|---|
+| mots déjà affichés qui **changent** | **50** | **0** |
+| mots prononcés jamais affichés | 0 | 0 |
+| écrans vides | 0 | 0 |
+| âge du son affiché | 1,9 s | 3,2 s |
+
+Aucun mot n'est perdu en mode stable : c'est la **clôture de fenêtre** qui le garantit —
+`figerFenetre` verse tout le provisoire dans le ruban quand la fenêtre se ferme, donc la
+fin de phrase finit toujours par s'afficher.
+
+## Le retard du son : DEUX valeurs, une par mode
+Le retard audio aligne ce qu'on **entend** sur ce qu'on **lit**. La règle est la même dans
+les deux modes — *on mesure l'âge du dernier mot réellement affiché* — mais ce mot n'est
+pas le même :
+
+- **avec provisoire** → le dernier mot est le bout de la fenêtre. Repère : `finAudioMs`.
+- **stable seulement** → le dernier mot est le dernier **confirmé**. LocalAgreement-2 le
+  borne par l'hypothèse *précédente* : un mot ne peut pas être confirmé s'il n'était pas
+  déjà dans la passe d'avant. Repère : `finAudioPassePrecedente`.
+
+L'écart entre les deux repères est exactement l'audio avalé entre deux passes — **une
+cadence**. Mesuré : 1,8 s / 3,3 s sur machine normale (écart 1,5 s), 4,3 s / 8,3 s sur
+machine lente simulée (écart 4,0 s).
+
+Prendre `finAudioMs` dans les deux cas était le défaut : en mode stable on calait le son
+sur la fin de la *fenêtre* alors que l'écran montrait du texte plus vieux d'une cadence,
+donc le son passait systématiquement en avance sur le texte lu.
+
+Les **deux** valeurs sont mesurées dans le même passage de calibration (les deux repères
+vivent sur les mêmes passes) et mémorisées ensemble sous
+`retardCalibreFluxParMode = { avecProvisoire, stable }`. Cocher la case recale donc le son
+**tout de suite**, sans remesurer.
+
+⚠️ **Le nom de la clé porte la génération, et ce n'est toujours pas cosmétique.** Une
+valeur mémorisée par une génération précédente est fausse pour celle-ci, et comme elle
+est mémorisée pour de bon elle ne serait jamais remesurée. Trois générations à ce jour :
+`retardCalibre` (moteur par blocs, ~9 s), `retardCalibreFlux` (flux, un seul mode),
+`retardCalibreFluxParMode` (l'actuelle). Les deux premières sont effacées dans
+`onInstalled` — mais **le ménage n'est qu'un confort** : la vraie protection est que
+`readRetardCalibre` ne lit que le nom courant, et refuse toute valeur qui n'a pas les deux
+champs attendus. Vérifié au banc sur un storage contenant les trois clés.
 
 ## Le flux : une fenêtre qu'on re-transcrit, pas des blocs qu'on oublie
 C'est le cœur du moteur, et c'est ce qui donne l'effet « sous-titres YouTube » : les mots
@@ -175,6 +246,13 @@ le moteur pour de vrai — dérive de latence, ruban qui recule, mots perdus, de
 figés, mots révélés un par un. Voir la mémoire `banc-essai-node-vm`. Ça ne remplace pas
 Chrome pour la latence réelle, la qualité du texte, le VAD et WebGPU.
 
+Le banc le plus utile est celui **en deux temps** : on fait tourner le moteur une fois, on
+enregistre la suite exacte des messages `FLUX`, puis on la **rejoue dans deux instances de
+`content.js`** — une par mode. Les deux modes voient alors rigoureusement le même flux, ce
+qui rend la comparaison honnête (mots réécrits, mots perdus, âge du son). C'est comme ça
+que le tableau des deux modes plus haut a été obtenu, et c'est là qu'on injecte une
+bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot ni image.
+
 ## Avancement
 - ✅ Structure de l'extension (popup, overlay, messages).
 - ✅ Capture audio de l'onglet + VAD (segments de parole), avec état popup robuste.
@@ -186,8 +264,16 @@ Chrome pour la latence réelle, la qualité du texte, le VAD et WebGPU.
 - ✅ **Mode flux** : fenêtre re-transcrite + LocalAgreement-2 + une seule inférence en vol,
   overlay qui révèle les mots un par un sur deux lignes. Les sous-titres s'écrivent au fil
   de la parole. Voir « Le flux » plus haut.
+- ✅ **Option « texte stable seulement »** (défaut) : plus rien ne se réécrit sous les yeux,
+  bascule à chaud pour comparer. Retard du son calibré par mode. Voir les deux sections
+  dédiées plus haut.
 - ⬜ Traduction, personnalisation de l'overlay, historique/export, hors-ligne complet
   (bundler le modèle).
+- ⬜ **Qualité du texte sur son BRUITÉ** — le reproche qui reste. whisper-base a été écarté
+  sur une mesure faite sur du son *propre* (WER 0 %, donc aucun gain à espérer), mais le
+  problème se pose sur du son bruité (documentaire avec musique : « lourire » pour
+  « nourrir »). Cette condition n'a jamais été mesurée : la décision a été prise sur les
+  mauvaises données. À reprendre — tiny/base/small × trois niveaux de musique.
 - ⬜ Pistes de latence non explorées : multithread WASM (on est à `numThreads = 1` à
   cause des workers `blob:` bloqués par la CSP — 2 à 3× à gagner si on débloque). Ça se
   verrait directement : moins de temps par passe = mots révélés plus tôt.

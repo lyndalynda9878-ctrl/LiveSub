@@ -119,19 +119,40 @@ const RETARD_DEFAUT = 0;
 // l'utilisateur qui met a jour l'extension aurait un son en retard de 9 s sur
 // un texte en avance de 2 s, sans aucun message d'erreur. En changeant de cle,
 // l'ancienne mesure est simplement ignoree et la calibration recommence.
-const RETARD_CALIBRE_KEY = "retardCalibreFlux";
+//
+// EXACTEMENT LA MEME CHOSE VIENT DE SE REPRODUIRE AVEC L'AFFICHAGE, d'ou un
+// deuxieme changement de cle.
+//
+// Il n'y a plus UN bon retard mais DEUX, un par mode d'affichage :
+//   - << avec la fin provisoire >> : le dernier mot affiche est le dernier de
+//     la fenetre. Le bon retard est son age, ~2 s.
+//   - << stable seulement >> : le dernier mot affiche est celui que DEUX passes
+//     ont confirme. Il est plus vieux d'une cadence, et le bon retard aussi.
+//
+// La valeur rangee est donc un objet { avecProvisoire, stable }, et non plus un
+// nombre. Une ancienne valeur (un nombre) relue sous le meme nom serait traitee
+// comme un objet sans champs -> `undefined` partout, silencieusement. On change
+// de nom pour que ce cas ne puisse tout simplement pas se produire.
+const RETARD_CALIBRE_KEY = "retardCalibreFluxParMode";
 
-// L'ancienne cle, gardee UNIQUEMENT pour etre effacee (voir oublierAncienRetard).
-const RETARD_CALIBRE_KEY_BLOCS = "retardCalibre";
+// Les cles des generations precedentes, gardees UNIQUEMENT pour etre effacees.
+//   "retardCalibre"     : moteur par blocs, ~9 s -- la valeur a ne jamais revoir.
+//   "retardCalibreFlux" : moteur de flux, mais un seul mode d'affichage.
+const RETARD_CALIBRE_CLES_PERIMEES = ["retardCalibre", "retardCalibreFlux"];
 
-// Efface la mesure de l'ancien moteur : elle ne servira plus jamais, autant ne
-// pas la laisser trainer dans le storage de l'utilisateur.
+// Efface les mesures perimees : elles ne serviront plus jamais, autant ne pas
+// les laisser trainer dans le storage de l'utilisateur.
+//
+// Ce menage est un CONFORT, pas la protection. La protection, c'est le NOM de
+// la cle : readRetardCalibre ne lit que RETARD_CALIBRE_KEY. Meme si ce
+// nettoyage ne tournait jamais -- onInstalled ne se declenche qu'a
+// l'installation ou a la mise a jour -- l'ancienne valeur ne serait pas relue,
+// elle resterait juste inerte dans le storage.
 //
 // Dans onInstalled et PAS au premier niveau du fichier : le service worker est
-// reveille sans arret (voir plus haut), et ce menage n'a de sens qu'une fois,
-// a l'installation ou a la mise a jour.
+// reveille sans arret (voir plus haut), et ce menage n'a de sens qu'une fois.
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.local.remove(RETARD_CALIBRE_KEY_BLOCS).catch(() => {});
+  chrome.storage.local.remove(RETARD_CALIBRE_CLES_PERIMEES).catch(() => {});
 });
 
 async function readRetard() {
@@ -144,13 +165,36 @@ async function readRetard() {
   }
 }
 
+// Rend { avecProvisoire, stable } ou null. C'est l'offscreen qui choisit lequel
+// des deux appliquer, puisque c'est lui qui suit le mode d'affichage.
 async function readRetardCalibre() {
   try {
-    return (await chrome.storage.local.get(RETARD_CALIBRE_KEY))[RETARD_CALIBRE_KEY] ?? null;
+    const valeur = (await chrome.storage.local.get(RETARD_CALIBRE_KEY))[RETARD_CALIBRE_KEY];
+    // Ceinture et bretelles : on n'accepte que la forme attendue. Un nombre
+    // (l'ancienne forme) est refuse net plutot qu'a moitie utilise.
+    return valeur && typeof valeur === "object" ? valeur : null;
   } catch (err) {
     // Sans memoire, l'offscreen recalibrera : c'est lent mais correct.
     console.warn("⚠️ Lecture du retard calibre impossible :", err);
     return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mode d'affichage (stable seul / avec la fin provisoire)
+// ---------------------------------------------------------------------------
+// C'est content.js qui l'applique a l'ecran, et il le lit lui-meme dans le
+// storage. Le background ne le lit que pour UNE raison : l'offscreen doit
+// savoir lequel des deux retards calibres appliquer au son des haut-parleurs.
+const PROVISOIRE_KEY = "afficherProvisoire";
+
+async function readAfficherProvisoire() {
+  try {
+    return Boolean((await chrome.storage.local.get(PROVISOIRE_KEY))[PROVISOIRE_KEY]);
+  } catch (err) {
+    // Sans memoire, le defaut : mode stable.
+    console.warn("⚠️ Lecture du mode d'affichage impossible :", err);
+    return false;
   }
 }
 
@@ -338,9 +382,11 @@ async function doStartAudioCapture() {
       langue: await readLangue(),
       // Et pour le retard applique au son des haut-parleurs.
       retard: await readRetard(),
-      // En mode "auto", la valeur deja calibree (null si jamais mesuree) :
-      // elle evite de repasser par la calibration a chaque lancement.
-      retardCalibre: await readRetardCalibre()
+      // En mode "auto", les valeurs deja calibrees (null si jamais mesurees) :
+      // elles evitent de repasser par la calibration a chaque lancement.
+      retardCalibre: await readRetardCalibre(),
+      // Et le mode d'affichage, qui dit laquelle des deux s'applique.
+      afficherProvisoire: await readAfficherProvisoire()
     });
 
     if (!response || !response.success) {
@@ -501,12 +547,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return; // pas de reponse attendue
   }
 
-  // L'offscreen a fini de mesurer le bon retard : on le retient, pour que les
-  // prochains lancements l'appliquent des la premiere seconde.
+  // L'offscreen a fini de mesurer les bons retards : on les retient, pour que
+  // les prochains lancements les appliquent des la premiere seconde.
+  //
+  // Les DEUX modes sont mesures en un seul passage, sur les memes passes : il
+  // n'y a aucune raison de faire calibrer l'utilisateur deux fois -- et cocher
+  // la case doit recaler le son tout de suite, pas relancer une calibration.
   if (request.type === "RETARD_CALIBRE") {
+    const valeurs = {
+      avecProvisoire: request.avecProvisoire,
+      stable: request.stable
+    };
     chrome.storage.local
-      .set({ [RETARD_CALIBRE_KEY]: request.valeur })
-      .then(() => console.log("💾 Retard calibre memorise :", request.valeur, "s"))
+      .set({ [RETARD_CALIBRE_KEY]: valeurs })
+      .then(() =>
+        console.log(
+          `💾 Retards calibres memorises : ${valeurs.avecProvisoire} s (avec provisoire) / ` +
+            `${valeurs.stable} s (stable seul)`
+        )
+      )
       .catch((err) => console.warn("⚠️ Memorisation du retard impossible :", err));
     return; // pas de reponse attendue
   }

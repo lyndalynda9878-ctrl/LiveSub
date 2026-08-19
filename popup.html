@@ -56,6 +56,28 @@
       background: white;
       cursor: pointer;
     }
+    /* Une case a cocher : le label est a cote, pas au-dessus. */
+    .option {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .option input {
+      margin: 2px 0 0 0;
+      cursor: pointer;
+      flex: none;
+    }
+    .option label {
+      margin: 0;
+      cursor: pointer;
+      line-height: 1.35;
+    }
+    .option .aide {
+      display: block;
+      color: #999;
+      font-size: 11px;
+    }
     #status {
       margin-top: 10px;
       font-size: 12px;
@@ -110,6 +132,24 @@
     <option value="13">13 s</option>
   </select>
   <div id="retardInfo"></div>
+
+  <!-- Le moteur produit deux textes : le STABLE (confirme par deux passes, il
+       ne bougera plus jamais) et la FIN PROVISOIRE (la derniere hypothese, que
+       la passe suivante a le droit de corriger).
+
+       Decoche = on n'affiche que le stable : le texte ne fait que s'allonger,
+       plus rien ne se reecrit sous les yeux, au prix d'environ 2 s de retard
+       en plus. Coche = on montre aussi la fin provisoire : plus reactif, mais
+       les derniers mots se corrigent en direct.
+
+       Ca se juge a l'oeil : la case bascule A CHAUD, sans arreter la capture. -->
+  <div class="option">
+    <input type="checkbox" id="afficherProvisoire">
+    <label for="afficherProvisoire">
+      Afficher la fin provisoire
+      <span class="aide">Plus reactif, mais les derniers mots se corrigent</span>
+    </label>
+  </div>
 
   <button id="toggleBtn">▶️ Demarrer</button>
   <div id="status">⏸️ Arrete</div>
