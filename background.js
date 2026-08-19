@@ -105,7 +105,34 @@ const RETARD_DEFAUT = 0;
 // Le retard mesure en mode auto, une fois la calibration faite. Absent tant
 // qu'on n'a jamais calibre -- l'offscreen calibrera alors au prochain
 // demarrage.
-const RETARD_CALIBRE_KEY = "retardCalibre";
+//
+// ⚠️ LE NOM DE LA CLE PORTE LE NOM DU MOTEUR, et ce n'est pas cosmetique.
+//
+// Le bon retard depend entierement de la facon dont le texte est produit. Le
+// moteur par blocs affichait une phrase entiere d'un coup : il fallait retarder
+// le son de 8 a 12 s pour que l'utilisateur entende le PREMIER mot du
+// sous-titre en le lisant. Le moteur de flux ajoute les mots au fil de la
+// parole : le bon retard n'est plus que 2 a 3 s.
+//
+// Une valeur mesuree par l'ancien moteur est donc FAUSSE pour celui-ci -- et
+// comme elle est memorisee pour de bon, elle ne serait jamais remesuree :
+// l'utilisateur qui met a jour l'extension aurait un son en retard de 9 s sur
+// un texte en avance de 2 s, sans aucun message d'erreur. En changeant de cle,
+// l'ancienne mesure est simplement ignoree et la calibration recommence.
+const RETARD_CALIBRE_KEY = "retardCalibreFlux";
+
+// L'ancienne cle, gardee UNIQUEMENT pour etre effacee (voir oublierAncienRetard).
+const RETARD_CALIBRE_KEY_BLOCS = "retardCalibre";
+
+// Efface la mesure de l'ancien moteur : elle ne servira plus jamais, autant ne
+// pas la laisser trainer dans le storage de l'utilisateur.
+//
+// Dans onInstalled et PAS au premier niveau du fichier : le service worker est
+// reveille sans arret (voir plus haut), et ce menage n'a de sens qu'une fois,
+// a l'installation ou a la mise a jour.
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.storage.local.remove(RETARD_CALIBRE_KEY_BLOCS).catch(() => {});
+});
 
 async function readRetard() {
   try {
@@ -203,25 +230,31 @@ async function toggleOverlay(tabId, active) {
   }
 }
 
-// Relaie un texte transcrit vers l'overlay de l'onglet capture.
+// Relaie le flux de texte vers l'overlay de l'onglet capture.
 //
 // L'offscreen produit le texte mais ne peut pas l'envoyer lui-meme : il n'a pas
 // acces a chrome.tabs. C'est donc nous qui faisons le pont, et nous seuls
 // savons quel onglet est capture (chrome.storage.session).
 //
+// Ce message a remplace SUBTITLE. La difference n'est pas cosmetique : SUBTITLE
+// portait UN sous-titre qui remplacait le precedent, FLUX porte l'etat COMPLET
+// du texte -- `ruban` (ce qui est stable) et `provisoire` (la fin encore
+// incertaine). C'est ce qui permet a l'overlay d'ajouter des mots au lieu de
+// tout reecrire.
+//
 // Meme precaution que toggleOverlay : une page sans content script (chrome://,
 // page ouverte avant l'installation) ne doit pas faire de bruit a chaque
-// segment -- on log une fois en warn et on continue.
-async function sendSubtitle(texte, finParole) {
+// passe -- on log une fois en warn et on continue.
+async function sendFlux(ruban, provisoire, finAudio) {
   const { active, tabId } = await readState();
   if (!active || !tabId) return; // capture arretee entre-temps
 
   try {
-    // finParole voyage jusqu'a content.js, qui mesure la latence bout en bout
-    // au moment ou il affiche vraiment le texte.
-    await chrome.tabs.sendMessage(tabId, { type: "SUBTITLE", texte, finParole });
+    // finAudio voyage jusqu'a content.js, qui mesure l'AGE du mot le plus
+    // recent au moment ou il l'affiche vraiment.
+    await chrome.tabs.sendMessage(tabId, { type: "FLUX", ruban, provisoire, finAudio });
   } catch (err) {
-    console.warn("⚠️ Sous-titre non affiche (content.js injoignable) :", err.message);
+    console.warn("⚠️ Flux non affiche (content.js injoignable) :", err.message);
   }
 }
 
@@ -420,14 +453,14 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log("📩 Message recu dans background :", request);
 
-  // Texte transcrit par l'offscreen -> overlay de l'onglet capture.
-  if (request.type === "TRANSCRIPT") {
-    sendSubtitle(request.texte, request.finParole);
+  // Flux de texte de l'offscreen -> overlay de l'onglet capture.
+  if (request.type === "FLUX") {
+    sendFlux(request.ruban, request.provisoire, request.finAudio);
     return; // pas de reponse attendue
   }
 
   // Message d'etat de l'offscreen (chargement du modele, calibration...) ->
-  // meme onglet, meme chemin que TRANSCRIPT.
+  // meme onglet, meme chemin que FLUX.
   if (request.type === "STATUT") {
     sendStatut(request.texte);
     return; // pas de reponse attendue

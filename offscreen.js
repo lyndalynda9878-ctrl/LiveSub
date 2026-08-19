@@ -16,19 +16,23 @@ let delayNode = null;
 // Calibration automatique du retard
 // ---------------------------------------------------------------------------
 //
-// Le but, en langage clair : quand un sous-titre apparait, l'utilisateur doit
-// etre en train d'entendre le PREMIER mot de ce sous-titre, pas le dernier. Il
-// doit pouvoir lire et ecouter en meme temps.
+// Le but, en langage clair : quand un mot apparait a l'ecran, l'utilisateur
+// doit etre en train de l'entendre. Il lit et il ecoute en meme temps.
 //
-// Le bon retard est donc l'ecart entre le DEBUT du segment et le moment ou son
-// texte s'affiche :
-//     retard = duree du segment + temps de transcription (+ transport)
-// Soit, en pratique, 8 a 12 s -- et pas 2 s. Deux secondes, c'est l'ecart
-// depuis la FIN du segment : avec ce reglage, l'utilisateur a deja fini
-// d'entendre la phrase quand le texte arrive.
+// ⚠️ CE CALCUL A CHANGE AVEC LE FLUX -- et il a beaucoup diminue.
 //
-// On ne devine pas ces valeurs : les deux reperes sont deja mesures (voir
-// debutSegment dans transcrireSegment), on les lit.
+// Avant, un sous-titre s'affichait d'un bloc et couvrait 7 s de passe : au
+// moment ou il apparaissait, la voix de son PREMIER mot etait deja loin
+// derriere. Il fallait donc retarder le son de la duree du segment PLUS le
+// temps de transcription, soit 8 a 12 s.
+//
+// Maintenant les mots s'ajoutent au fil de la parole : le mot qui vient
+// d'apparaitre vient d'etre prononce. Le bon retard n'est plus qu'un seul
+// terme, l'AGE DE L'AUDIO LE PLUS RECENT quand son texte s'affiche -- soit, a
+// peu de chose pres, la duree d'une inference. On attend 2 a 3 s.
+//
+// On ne devine pas cette valeur : le repere est mesure (finAudioMs, pose sur
+// chaque trame et transporte par la passe), on le lit.
 let modeRetard = 0; // 0 (desactive) | un nombre de secondes | "auto"
 let echantillonsRetard = [];
 let retardApplique = null; // renseigne des que la calibration a tranche
@@ -126,31 +130,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // repondu ». Whisper n'a de toute facon rien a faire tant qu'on ne capture pas.
 let whisperWorker = null;
 
-// Chaque segment envoye recoit un numero ; le worker le renvoie avec le texte,
-// ce qui permet de retrouver a quel segment la reponse correspond.
-let prochainSegmentId = 1;
-const segmentsEnCours = new Map();
-
-// Segments deja partis au worker mais dont on ne veut plus le texte : le filet
-// de securite de transcrireSegment les a sortis de la file. On ne peut pas
-// annuler un travail deja envoye, alors on note son numero et on jettera sa
-// reponse au retour.
-const segmentsAbandonnes = new Set();
-
-// Compteurs de la capture en cours, remis a zero au demarrage. Ils servent au
-// diagnostic : « combien de parole a-t-on perdue au demarrage ? »
-let segmentsIgnoresAttente = 0; // jetes parce que Whisper n'etait pas pret
-let segmentsIgnoresFile = 0;    // jetes parce que la file debordait
-let segmentsIgnoresSilence = 0; // jetes parce que quasiment pas de parole dedans
-let sousTitresRejetes = 0;      // textes recus mais refuses (radotage, phrase fantome)
+// Il n'y a PLUS de file de segments ni de numeros a rattraper : une seule
+// inference est en vol a la fois (voir passeEnVol, plus bas). Toute la
+// machinerie qui surveillait, alertait et vidait la file a disparu avec elle --
+// c'etait le remede a un mal que le moteur ne produit plus.
 
 // Renseigne quand le worker a fini de charger le modele.
 //
-// Tant que c'est faux, les segments sont JETES (voir transcrireSegment). Avant,
-// ils partaient quand meme et le worker les empilait : au premier lancement sur
-// une machine (telechargement du modele + mesure GPU/CPU, ~90 s), toute cette
-// parole se deversait d'un coup des que Whisper devenait pret -- une minute de
-// sous-titres perimes qui defilaient. Mieux vaut ne rien afficher.
+// Tant que c'est faux, aucune passe n'est lancee (voir peutLancerPasse). Avant,
+// les segments partaient quand meme et le worker les empilait : au premier
+// lancement sur une machine (telechargement du modele + mesure GPU/CPU, ~90 s),
+// toute cette parole se deversait d'un coup des que Whisper devenait pret --
+// une minute de sous-titres perimes qui defilaient. Mieux vaut ne rien afficher.
 let whisperPret = false;
 
 // Langue parlee dans la video, choisie par l'utilisateur dans la popup.
@@ -331,42 +322,37 @@ function surMessageWhisper(event) {
       break;
 
     case "result": {
-      // Segment sorti de la file par le filet de securite (voir
-      // transcrireSegment) : son texte est trop vieux pour etre affiche, et il
-      // ne doit pas non plus servir de mesure de calibration. On le jette ici,
-      // au retour, parce qu'un travail deja parti au worker ne se rappelle pas.
-      if (segmentsAbandonnes.has(message.id)) {
-        segmentsAbandonnes.delete(message.id);
-        console.log(`   (resultat du segment #${message.id} ignore : abandonne)`);
+      // Resultat d'une passe qui n'a plus de fenetre a laquelle s'appliquer :
+      // capture arretee entre-temps, ou fenetre videe. On le jette.
+      if (!passeEnVol || passeEnVol.id !== message.id) {
+        console.log(`   (résultat de la passe #${message.id} ignoré : périmé)`);
         break;
       }
 
-      const segment = segmentsEnCours.get(message.id);
-      segmentsEnCours.delete(message.id);
-      surveillerFile(); // la file se vide aussi ici, pas seulement a l'envoi
+      const passe = passeEnVol;
+      passeEnVol = null;
+      passesFaites++;
 
-      // Calibration du retard. ⚠️ AVANT le filtre des segments sans texte :
-      // un segment vide n'a rien a afficher, mais c'est une mesure de temps
-      // parfaitement valable -- et s'en priver rallongerait la calibration.
-      if (modeRetard === "auto" && retardApplique === null && segment) {
-        // ⚠️ On calibre sur le PIRE CAS, pas sur ce qu'on vient d'entendre.
-        //
-        // Mesurer la duree reelle du segment (Date.now() - debutSegment) donnait
-        // une valeur qui dependait du CONTENU : 6,7 s sur un passage a segments
-        // courts, 9,1 s sur de la parole continue. La valeur calibree sur l'un
-        // etait fausse pour l'autre -- et elle est memorisee pour de bon.
-        //
-        // Or la duree d'un segment ne depasse JAMAIS DUREE_MAX : c'est une
-        // constante du code, pas une mesure. On prend donc DUREE_MAX + le seul
-        // terme reellement variable, la latence depuis la fin de la parole
-        // (transcription + attente en file + transport).
-        //
-        // Consequence assumee : sur un passage a segments courts, le texte
-        // apparaitra legerement EN AVANCE sur la voix. C'est le bon sens de
-        // l'erreur -- un sous-titre en avance se lit, un sous-titre en retard ne
-        // sert a rien.
-        const latence = (Date.now() - segment.finParole) / 1000;
-        const besoin = DUREE_MAX + latence;
+      // --- Calibration du retard du son ------------------------------------
+      //
+      // ⚠️ CE QUI A CHANGE AVEC LE FLUX.
+      //
+      // Avant, un sous-titre couvrait 7 s de passe : quand il s'affichait, la
+      // voix correspondante etait deja loin, et il fallait retarder le son de
+      // DUREE_MAX + latence (~9 s) pour que l'utilisateur entende le PREMIER
+      // mot du sous-titre au moment ou il le lisait.
+      //
+      // Ce n'est plus vrai. Les mots s'ajoutent au fur et a mesure, et le mot
+      // qui vient d'apparaitre a l'ecran vient d'etre prononce. Le bon retard
+      // est donc l'AGE DE L'AUDIO LE PLUS RECENT au moment de l'affichage --
+      // c'est-a-dire, a peu de chose pres, la duree d'une inference. On attend
+      // 2 a 3 s la ou on avait 9.
+      //
+      // ⚠️ Cette mesure passe AVANT le filtre des passes sans texte : une passe
+      // muette n'a rien a afficher, mais c'est un chronometre parfaitement
+      // valable, et s'en priver rallongerait la calibration.
+      if (modeRetard === "auto" && retardApplique === null) {
+        const besoin = (Date.now() - passe.finAudioMs) / 1000;
         echantillonsRetard.push(besoin);
         console.log(
           `🎚️ Calibration ${echantillonsRetard.length}/5 : ${besoin.toFixed(1)} s`
@@ -381,8 +367,6 @@ function surMessageWhisper(event) {
           if (delayNode) delayNode.delayTime.value = retardApplique;
           console.log(`🎚️ Retard calibré : ${retardApplique.toFixed(1)} s`);
 
-          // Memorise par le service worker : les prochains lancements
-          // l'appliqueront tout de suite, sans retraverser la calibration.
           chrome.runtime
             .sendMessage({ type: "RETARD_CALIBRE", valeur: retardApplique })
             .catch(() => {});
@@ -394,65 +378,64 @@ function surMessageWhisper(event) {
         }
       }
 
-      const texte = message.texte;
-      // Sur un segment sans parole nette, Whisper renvoie souvent une chaine
-      // vide ou juste de la ponctuation : inutile de polluer la console.
-      if (!texte || !/[\p{L}\p{N}]/u.test(texte)) {
-        console.log("   (segment sans texte exploitable)");
-        break;
-      }
-
-      // Whisper a recite une phrase de son entrainement au lieu d'ecouter.
-      if (estPhraseFantome(texte)) {
-        sousTitresRejetes++;
-        console.warn(
-          `🚫 Sous-titre rejeté (phrase fantôme) : "${texte}" ` +
-            `(${sousTitresRejetes} rejet(s) depuis le début)`
-        );
-        break;
-      }
-
-      // Whisper est parti en boucle.
-      if (estUnRadotage(texte)) {
-        sousTitresRejetes++;
-        console.warn(
-          `🚫 Sous-titre rejeté (radotage) : "${texte}" ` +
-            `(${sousTitresRejetes} rejet(s) depuis le début)`
-        );
-        break;
-      }
-
-      const duree = segment ? `${segment.secondes} s de parole` : "segment";
-      // Latence reelle : temps entre la fermeture du segment et maintenant.
-      // Elle inclut l'attente en file quand Whisper a du retard, pas seulement
-      // l'inference -- c'est bien ce qu'on veut mesurer.
-      const latence = segment ? (Date.now() - segment.finParole) / 1000 : null;
-      console.log(
-        `📝 « ${texte} »\n   (${duree}, transcrit en ${(message.ms / 1000).toFixed(1)} s ` +
-          `sur ${message.backend}` +
-          (latence === null ? "" : `, latence ${latence.toFixed(1)} s`) +
-          `)`
-      );
-
-      // Vers l'overlay de la page. On passe par le service worker : un document
-      // offscreen ne peut pas parler directement a un content script (il n'a pas
-      // acces a chrome.tabs), et c'est le service worker qui sait quel onglet
-      // est capture.
+      // --- Garde-fous sur le texte de la passe -----------------------------
       //
-      // On joint finParole pour que content.js mesure la latence jusqu'a
-      // l'affichage REEL, bout en bout (meme machine, donc Date.now()
-      // comparable d'un contexte a l'autre).
-      chrome.runtime.sendMessage({
-        type: "TRANSCRIPT",
-        texte,
-        finParole: segment ? segment.finParole : null,
-      });
+      // ⚠️ REGLE COMMUNE AUX TROIS : quand une passe est refusee, ON NE TOUCHE
+      // A RIEN. Le ruban, le provisoire et l'affichage restent exactement tels
+      // quels -- l'utilisateur ne voit pas son texte disparaitre, il voit
+      // seulement les mots ne pas avancer pendant une passe.
+      //
+      // Et `motsPassePrecedente` n'est PAS mis a jour : une hypothese inventee
+      // ne doit pas servir de point de comparaison a la suivante, sinon elle
+      // contaminerait le prefixe commun et du texte faux deviendrait stable.
+      const texte = message.texte;
+      let refus = null;
+      if (!texte || !/[\p{L}\p{N}]/u.test(texte)) refus = "sans texte exploitable";
+      else if (estPhraseFantome(texte)) refus = "phrase fantôme";
+      else if (estUnRadotage(texte)) refus = "radotage";
+
+      if (refus === "sans texte exploitable") {
+        console.log(`   (passe #${passe.id} sans texte exploitable)`);
+      } else if (refus) {
+        textesRejetes++;
+        console.warn(
+          `🚫 Passe #${passe.id} rejetée (${refus}) : "${texte}" ` +
+            `(${textesRejetes} rejet(s) depuis le début, affichage inchangé)`
+        );
+      } else {
+        accepterTexte(texte);
+        const age = ((Date.now() - passe.finAudioMs) / 1000).toFixed(1);
+        console.log(
+          `📝 Passe #${passe.id} en ${(message.ms / 1000).toFixed(1)} s ` +
+            `(âge du son : ${age} s) | stable « …${ruban.slice(-70)} » ` +
+            `| provisoire « ${provisoire} »`
+        );
+        envoyerFlux(passe.finAudioMs);
+      }
+
+      // --- Cloture de la fenetre -------------------------------------------
+      // Cette passe etait la derniere de sa fenetre : son provisoire n'aura
+      // jamais de passe suivante pour le corriger, il devient definitif.
+      if (passe.cloturante) {
+        // Le motif compte : sur « fenetre pleine » on a coupe en plein mot, et
+        // c'est le recouvrement qui le retranscrira (voir figerFenetre).
+        figerFenetre(passe.cloturante);
+        cloturerFenetre(passe);
+        envoyerFlux(passe.finAudioMs);
+      }
+
+      // --- Et on repart aussitot -------------------------------------------
+      // C'est LA que la cadence se regle toute seule : la passe suivante part
+      // au moment ou la precedente rend la main, jamais avant. Une machine
+      // lente fait moins de passes, elle ne prend pas de retard.
+      lancerPasseSiPossible();
       break;
     }
 
     case "error": {
-      segmentsEnCours.delete(message.id);
-      segmentsAbandonnes.delete(message.id); // pas de reponse a attendre : on oublie
+      // La passe a echoue : on libere la place, et on laisse l'affichage tel
+      // quel. La prochaine trame relancera.
+      if (passeEnVol && passeEnVol.id === message.id) passeEnVol = null;
       console.error("❌ Whisper :", message.message);
       break;
     }
@@ -497,56 +480,53 @@ function demarrerWhisper(memo) {
 }
 
 // ---------------------------------------------------------------------------
-// Decoupage des segments : on n'attend plus forcement le silence
+// Le moteur : une FENETRE qu'on re-transcrit, au lieu de blocs qu'on oublie
 // ---------------------------------------------------------------------------
 //
-// Le VAD ne ferme un segment que sur une pause. Sur quelqu'un qui parle sans
-// s'arreter, ca donnait des segments de 20 a 40 s : le sous-titre arrivait
-// bien apres la phrase. On assemble donc les segments NOUS-MEMES, a partir des
-// trames que le VAD nous passe une par une (onFrameProcessed), et on coupe des
-// qu'on atteint DUREE_MAX -- meme si ca parle encore.
+// AVANT : la parole etait decoupee en blocs de 7 s ; chaque bloc etait
+// transcrit UNE fois, puis oublie, et son texte REMPLACAIT le precedent a
+// l'ecran. D'ou l'effet qu'on veut supprimer : une phrase entiere qui saute
+// toutes les 7 secondes, sans lien avec la precedente.
 //
-// C'est pour ca qu'on ignore l'audio fourni par onSpeechEnd : il contient tout
-// le passage depuis le debut de la parole, donc ce qu'on a deja envoye. On ne
-// garde de onSpeechEnd que le SIGNAL de fin.
+// MAINTENANT : on garde la phrase EN COURS dans une fenetre, et on la
+// re-transcrit ENTIEREMENT, depuis son debut, des que Whisper est libre.
+//
+// Pourquoi c'est jouable : Whisper complete TOUT extrait a 30 s avant de le
+// traiter. Transcrire 4 s ou 11 s coute donc presque pareil. Re-transcrire
+// depuis le debut est quasi gratuit -- et chaque passe a PLUS de contexte que
+// la precedente, jamais moins. C'est l'exact inverse du decoupage en blocs, ou
+// chaque bloc etait aveugle a ce qui le precedait.
+//
+// ⚠️ LA REGLE QUI TIENT TOUT LE RESTE : UNE SEULE INFERENCE EN VOL.
+// Des qu'une passe rend son texte, on relance sur la fenetre telle qu'elle est
+// A CET INSTANT. L'audio arrive pendant le calcul sera couvert par la passe
+// suivante. Il n'y a donc aucune file d'attente, et la latence ne PEUT PAS
+// diverger : la cadence s'adapte toute seule a la machine. C'est ce qui rend
+// obsolete toute la surveillance de file de la version precedente.
 
 const TAUX = 16000; // le VAD travaille en 16 kHz mono
 
-// 7 s, et pas 2,5 s comme avant. C'est contre-intuitif -- attendre plus pour
-// etre moins en retard -- mais c'est ce que disent les mesures.
+// Longueur maximale de la fenetre. Au-dela : on fige le texte courant et on
+// repart sur une fenetre neuve.
 //
-// Whisper complete TOUT extrait a 30 s avant de le traiter. Un segment de 2,5 s
-// lui coute donc presque aussi cher qu'un de 7 s : ~1,4 s de calcul dans les
-// deux cas. Couper fin ne fait rien gagner, ca multiplie juste le nombre
-// d'appels. A 2,5 s, on demandait une inference toutes les ~2,5 s pour ~1,4 s
-// de calcul plus les segments fermes en avance par les silences : le debit
-// demande depassait le debit possible, la file grossissait sans jamais se
-// vider, et le retard grandissait de +0,3 s par seconde d'audio -- mesure : 5 s
-// de retard au bout de 10 s, 32 s au bout de 90 s.
-//
-// A 7 s, on divise le nombre d'inferences par ~3 pour le meme cout unitaire.
-// Et ca corrige aussi le TEXTE : whisper-tiny est tres instable en dessous de
-// ~5 s, il n'a pas assez de contexte et se rabat sur les phrases les plus
-// frequentes de son entrainement (d'ou les « Thank you for watching » et
-// « don't forget to subscribe » observes dans les tests).
-//
-// Le prix a payer : le premier sous-titre d'une phrase arrive apres 7 s de
-// parole au lieu de 2,5 s. Mais avant il arrivait avec 30 s de retard, donc
-// c'est un gain net.
-const DUREE_MAX = 7;
+// Pourquoi une borne. Sans elle, quelqu'un qui parle trois minutes sans
+// s'arreter donnerait une fenetre de trois minutes -- que Whisper tronquerait
+// de toute facon a 30 s (son maximum), en perdant le debut, sans rien dire. Et
+// la memoire grandirait sans fin. 12 s laisse largement de quoi construire une
+// phrase tout en restant sous les 30 s.
+const FENETRE_MAX = 12;
 
-// Quand on coupe a DUREE_MAX, la coupure tombe n'importe ou -- souvent en plein
-// milieu d'un mot. Whisper recevait alors un demi-mot en fin de segment et un
-// demi-mot au debut du suivant, et il inventait la suite dans les deux cas.
+// Ce qu'on garde de la fin d'une fenetre pour amorcer la suivante : la coupure
+// a FENETRE_MAX tombe n'importe ou, souvent en plein mot.
+const RECOUVREMENT_FENETRE = 0.5;
+
+// Audio NOUVEAU minimum avant de relancer une passe.
 //
-// On garde donc la fin du segment comme debut du suivant : le mot coupe est
-// entier d'un cote au moins. Le mot en question peut apparaitre deux fois de
-// suite a l'ecran, mais chaque sous-titre remplace le precedent -- une legere
-// repetition est bien moins genante qu'un mot invente.
-//
-// Uniquement sur les coupures a DUREE_MAX : quand c'est le VAD qui ferme sur un
-// silence, la phrase est finie, il n'y a rien a rattraper.
-const RECOUVREMENT = 0.5;
+// Sans ce plancher, on relancerait sur une fenetre quasi identique a la
+// precedente : meme cout, meme texte, rien de gagne -- et on empecherait
+// surtout la fenetre de s'allonger. 0,7 s, c'est a peu pres un mot : en
+// dessous, il n'y a litteralement rien de neuf a entendre.
+const MIN_NOUVEAU = 0.7;
 
 // Ce qu'on garde en reserve avant le declenchement du VAD, pour ne pas manger
 // le debut du premier mot. (La librairie a son propre preSpeechPadMs, mais il
@@ -554,34 +534,17 @@ const RECOUVREMENT = 0.5;
 const PRE_PAROLE = 0.3;
 
 // En dessous, ce n'est pas de la parole : Whisper n'en tirerait que du bruit.
+// S'applique AUSSI a la passe finale : sur 0,3 s de son, whisper-tiny n'ecoute
+// pas, il recite (voir PHRASES_FANTOMES).
 const DUREE_MIN = 0.4;
 
-// Duree en dessous de laquelle on prefere ATTENDRE la suite plutot qu'envoyer.
-//
-// DUREE_MAX borne le haut, mais le VAD ferme aussi sur les silences : sans
-// plancher, on continue d'envoyer des bouts d'une seconde. Or c'est exactement
-// la que whisper-tiny invente -- faute de contexte, il sort les phrases les
-// plus frequentes de son entrainement (« Thank you for watching », « And
-// not! »). Mesure : avec DUREE_MAX a 7 s mais aucun plancher, la moitie des
-// sous-titres etaient encore des hallucinations.
-//
-// Donc quand le VAD ferme sur un segment trop court, on ne l'envoie pas tout de
-// suite : on laisse une chance a la phrase de reprendre, et on recolle les deux
-// morceaux.
-const DUREE_MIN_ENVOI = 3;
-
-// ... mais pas indefiniment : si le silence dure, la phrase est vraiment finie
-// et il faut afficher ce qu'on a, meme court. C'est le prix de l'attente :
-// jusqu'a 1,5 s de latence en plus sur le dernier bout d'une phrase.
-const SILENCE_MAX = 1.5;
-
 // ---------------------------------------------------------------------------
-// Garde-fou : un segment doit contenir de la VRAIE parole
+// Garde-fou : une fenetre doit contenir de la VRAIE parole
 // ---------------------------------------------------------------------------
 //
 // Le VAD nous donne, pour chaque trame, la probabilite qu'elle contienne de la
-// parole. On jetait cette information ; on s'en sert maintenant pour refuser
-// d'envoyer a Whisper un segment majoritairement silencieux.
+// parole. On s'en sert pour refuser d'envoyer a Whisper une fenetre
+// majoritairement silencieuse.
 //
 // Pourquoi : sur du silence, du bruit ou de la musique, whisper-tiny n'echoue
 // pas, il INVENTE -- il se rabat sur les phrases les plus frequentes de son
@@ -589,328 +552,419 @@ const SILENCE_MAX = 1.5;
 // « n'oubliez pas de vous abonner »). Le meilleur moyen d'eviter ces phrases
 // est de ne pas le faire travailler sur du vide.
 //
+// ⚠️ CE QUI A CHANGE : la proportion se calcule maintenant sur la FENETRE
+// entiere, et non plus sur un segment ferme. Le SEUIL, lui, ne bouge pas -- il
+// avait ete mesure, pas choisi (voir plus bas).
+//
 // Au-dessus de ce seuil, la trame compte comme parlee. 0,5 = le point neutre du
 // modele Silero (il sort une probabilite entre 0 et 1). A ne pas confondre avec
 // positiveSpeechThreshold, qui sert au VAD a decider quand OUVRIR un segment :
 // ici on ne decide rien, on compte.
 const SEUIL_TRAME_PAROLE = 0.5;
 
-// Proportion minimale de trames parlees pour qu'un segment merite Whisper.
+// Proportion minimale de trames parlees pour qu'une fenetre merite Whisper.
 //
 // ⚠️ Cette valeur a ete MESUREE, pas choisie. Un premier essai a 0,30 rejetait
 // de la VRAIE parole -- exactement le defaut invisible qu'il faut eviter : le
 // sous-titre manque, sans erreur, sans trace.
 //
-// Mesures sur les deux extraits du depot (test/speech.wav et test/speech-fr.mp3),
-// en reconstituant les formes de segment que la production peut produire
-// (PRE_PAROLE en tete, puis parole, puis le silence de fin -- borne a ~2,2 s par
-// la redemption du VAD et SILENCE_MAX) :
-//
 //   son SANS parole      : silence 0 %, bruit de fond 0 %, musique seule 2 %
-//   vraie parole, pire cas : 19 %  (1,5 s de parole suivie de 2,2 s de silence)
+//   vraie parole, pire cas : 19 %
 //   vraie parole, courant  : 26 a 75 %
 //
 // Le trou entre 2 % et 19 % est large : on se place au milieu. 0,10 laisse
-// passer toute la vraie parole mesuree (5x de marge sous le pire cas) tout en
-// bloquant le silence, le bruit et la musique (5x au-dessus du pire cas).
-//
-// Remonter cette valeur vers 0,30 fait reapparaitre le probleme. Tout rejet est
+// passer toute la vraie parole mesuree tout en bloquant le silence, le bruit et
+// la musique. Remonter vers 0,30 fait reapparaitre le probleme. Tout rejet est
 // journalise avec sa proportion : regarder la console avant d'y toucher.
+//
+// La fenetre est un cas PLUS FAVORABLE que l'ancien segment : elle commence sur
+// de la parole et s'arrete peu apres, elle contient donc proportionnellement
+// moins de silence. Le seuil garde donc au moins la meme marge qu'avant.
 const PART_PAROLE_MIN = 0.1;
 
-let tampon = [];        // trames accumulees (Float32Array de 16 kHz)
-let tamponSamples = 0;  // leur total en echantillons, pour eviter de recompter
+// ---------------------------------------------------------------------------
+// Etat de la fenetre
+// ---------------------------------------------------------------------------
+
+let fenetre = [];       // trames (Float32Array, ~32 ms chacune)
+let fenetreParole = []; // meme longueur : cette trame contenait-elle de la parole ?
+let fenetreSamples = 0;
 let enParole = false;
 
-// Parallele a `tampon`, une entree par trame : cette trame contenait-elle de la
-// parole ? Les deux tableaux DOIVENT etre modifies ensemble partout (ajout,
-// purge au repos, recouvrement, vidage) -- sinon la proportion se decale et le
-// garde-fou se met a rejeter n'importe quoi.
-let tamponParole = [];
+// Horodatage du DERNIER echantillon entre dans la fenetre. C'est l'age de ce
+// point-la, au moment ou le texte s'affiche, qui donne le bon retard du son
+// (voir la calibration en haut de fichier).
+let finAudioMs = 0;
 
-// Ce que le tampon contient de DEJA ENVOYE : le recouvrement repris au segment
-// precedent. Sert a ne pas retranscrire deux fois le meme demi-mot si le VAD
-// ferme juste apres une coupure a DUREE_MAX.
-let reportSamples = 0;
+// La passe en vol, ou null. UN SEUL element possible : c'est toute la regle du
+// moteur. { id, trames, finAudioMs, envoiMs, cloturante }
+let passeEnVol = null;
+let prochainePasseId = 1;
 
-// Le VAD a ferme, mais le segment etait trop court pour etre envoye tel quel :
-// on garde tout et on attend de voir si la phrase reprend (voir
-// DUREE_MIN_ENVOI). `silenceSamples` compte le silence ecoule depuis.
-let enAttente = false;
-let silenceSamples = 0;
+// Taille de la fenetre au dernier envoi, pour mesurer l'audio NOUVEAU.
+let samplesAuDernierEnvoi = 0;
 
-// Etions-nous en attente juste avant que le VAD ne crie « parole » ?
+// Une cloture est demandee : la prochaine passe sera la DERNIERE de cette
+// fenetre, et son texte sera definitif. Vaut null, "fin de parole" (le VAD a
+// signale la fin) ou "fenetre pleine" (FENETRE_MAX atteint).
+let cloture = null;
+
+// Une cloture « fin de parole » annulee par une reprise de la phrase. Si cette
+// reprise se revele etre du bruit (onVADMisfire), il faut la remettre : sans
+// cette memoire l'information est perdue, et la fenetre ne se fermerait plus.
+let clotureAvantParole = null;
+
+// ---------------------------------------------------------------------------
+// Etat du TEXTE : stable / provisoire
+// ---------------------------------------------------------------------------
 //
-// Sert uniquement au cas de la fausse alerte : si ce declenchement se revele
-// etre du bruit, il faut pouvoir revenir a l'etat d'avant au lieu de tout
-// jeter. Sans cette memoire, l'information est perdue -- onSpeechStart remet
-// deja enAttente a false.
-let attenteAvantParole = false;
+// C'est ce qui permet d'AJOUTER des mots au lieu de remplacer la phrase.
+//
+// Deux passes successives partagent presque tout leur texte, puisque l'audio du
+// debut est le meme. Leur PREFIXE COMMUN n'a donc plus aucune raison de
+// changer : on le declare STABLE et on le verse dans le ruban pour de bon. Ce
+// qui vient apres reste PROVISOIRE : la passe suivante peut encore le corriger.
+//
+// C'est l'algorithme LocalAgreement-2 de whisper-streaming.
 
-function dureeTampon() {
-  return tamponSamples / TAUX;
+// Tout le texte devenu stable. Ne recule jamais.
+let ruban = "";
+
+// La fin encore incertaine, telle que la voit la derniere passe acceptee.
+let provisoire = "";
+
+// L'hypothese de la passe PRECEDENTE, pour la comparer a la suivante.
+let motsPassePrecedente = [];
+
+// Combien de mots de la fenetre COURANTE sont deja passes dans le ruban.
+let motsConfirmes = 0;
+
+// Le ruban n'a pas a porter toute la session : l'overlay n'affiche que deux
+// lignes. On garde de quoi les remplir largement, pas davantage.
+const RUBAN_MAX = 300;
+
+// Compteurs de la capture en cours, remis a zero au demarrage. Ils servent au
+// diagnostic.
+let passesIgnoreesAttente = 0; // pas lancees : Whisper n'etait pas pret
+let passesIgnoreesSilence = 0; // pas lancees : fenetre quasi muette
+let textesRejetes = 0;         // textes recus mais refuses (radotage, fantome)
+let passesFaites = 0;
+
+// ---------------------------------------------------------------------------
+// Fenetre : mesures et manipulations
+// ---------------------------------------------------------------------------
+
+function dureeFenetre() {
+  return fenetreSamples / TAUX;
 }
 
-// Duree de ce qui n'a encore jamais ete envoye a Whisper.
-function dureeNouveaute() {
-  return (tamponSamples - reportSamples) / TAUX;
+// Duree de ce qui est entre dans la fenetre depuis le dernier envoi.
+function dureeNouveau() {
+  return (fenetreSamples - samplesAuDernierEnvoi) / TAUX;
 }
 
-function viderTampon() {
-  tampon = [];
-  tamponParole = []; // toujours en meme temps que `tampon`
-  tamponSamples = 0;
-  reportSamples = 0;
-  enAttente = false;
-  silenceSamples = 0;
-  attenteAvantParole = false;
-}
-
-// Proportion de trames parlees dans le tampon actuel, entre 0 et 1.
-// Un tampon vide vaut 0 : rien a transcrire, donc rien a envoyer.
+// Proportion de trames parlees dans la fenetre, entre 0 et 1.
+// Une fenetre vide vaut 0 : rien a transcrire, donc rien a envoyer.
 function partParole() {
-  if (tamponParole.length === 0) return 0;
+  if (fenetreParole.length === 0) return 0;
   let parlees = 0;
-  for (const estParole of tamponParole) {
+  for (const estParole of fenetreParole) {
     if (estParole) parlees++;
   }
-  return parlees / tamponParole.length;
+  return parlees / fenetreParole.length;
 }
 
 // Colle les trames en un seul Float32Array continu, pret pour Whisper.
-function assemblerTampon() {
-  const audio = new Float32Array(tamponSamples);
+// Le tableau produit est NEUF : on peut le transferer au worker sans perdre la
+// fenetre, qui doit survivre pour la passe suivante.
+function assemblerFenetre() {
+  const audio = new Float32Array(fenetreSamples);
   let position = 0;
-  for (const trame of tampon) {
+  for (const trame of fenetre) {
     audio.set(trame, position);
     position += trame.length;
   }
   return audio;
 }
 
-// Ferme le segment courant et l'envoie a Whisper. `raison` sert au log.
-//
-// `recouvrement` (en secondes) = ce qu'on garde de la FIN de ce segment pour
-// demarrer le suivant. Voir le commentaire de RECOUVREMENT.
-function fermerSegment(raison, recouvrement = 0) {
-  // On teste ce qu'il y a de NOUVEAU, pas la taille du tampon : juste apres une
-  // coupure a DUREE_MAX, le tampon contient deja le recouvrement, qui a ete
-  // envoye avec le segment precedent. Le renvoyer seul afficherait un
-  // sous-titre en double.
-  if (dureeNouveaute() < DUREE_MIN) {
-    viderTampon();
-    return;
+// Remplace la fenetre par la liste de trames donnee.
+function remplacerFenetre(trames, paroles) {
+  fenetre = trames;
+  fenetreParole = paroles;
+  fenetreSamples = trames.reduce((total, t) => total + t.length, 0);
+  samplesAuDernierEnvoi = 0;
+}
+
+function viderFenetre() {
+  remplacerFenetre([], []);
+  cloture = null;
+}
+
+// Etat texte de la fenetre courante, remis a neuf.
+function reinitialiserTexteFenetre() {
+  provisoire = "";
+  motsPassePrecedente = [];
+  motsConfirmes = 0;
+}
+
+// Sommes-nous au repos ? (rien en cours, rien a finir, rien d'affiche en
+// provisoire) Dans ce cas la fenetre ne sert que de reserve d'amorce.
+function auRepos() {
+  return (
+    !enParole && !cloture && !passeEnVol && motsPassePrecedente.length === 0 && !provisoire
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Stable / provisoire : LocalAgreement-2
+// ---------------------------------------------------------------------------
+
+function decouperEnMots(texte) {
+  return String(texte || "").trim().split(/\s+/).filter(Boolean);
+}
+
+// On COMPARE des formes normalisees (minuscules, sans accents ni ponctuation)
+// pour qu'une virgule ajoutee d'une passe a l'autre ne fasse pas croire a un
+// changement de mot -- mais on AFFICHE le mot d'origine, ponctuation comprise.
+function prefixeCommun(a, b) {
+  let i = 0;
+  while (i < a.length && i < b.length && normaliserTexte(a[i]) === normaliserTexte(b[i])) {
+    i++;
+  }
+  return i;
+}
+
+// Verse des mots dans le ruban, en le bornant a RUBAN_MAX.
+function ajouterAuRuban(mots) {
+  if (!mots.length) return;
+  ruban = ruban ? `${ruban} ${mots.join(" ")}` : mots.join(" ");
+
+  if (ruban.length > RUBAN_MAX) {
+    // ⚠️ On coupe sur une frontiere de MOT. content.js aligne l'affichage sur
+    // les mots : un ruban tranche en plein mot lui ferait croire que tout a
+    // change, et il re-revelerait du texte deja lu.
+    ruban = ruban.slice(ruban.length - RUBAN_MAX);
+    const espace = ruban.indexOf(" ");
+    if (espace > 0) ruban = ruban.slice(espace + 1);
+  }
+}
+
+// Applique le texte d'une passe : ce qui est confirme part au ruban, le reste
+// devient le provisoire.
+function accepterTexte(texte) {
+  const mots = decouperEnMots(texte);
+  const commun = prefixeCommun(motsPassePrecedente, mots);
+
+  if (commun > motsConfirmes) {
+    // On verse la version de la passe LA PLUS RECENTE (meilleure ponctuation).
+    ajouterAuRuban(mots.slice(motsConfirmes, commun));
+    motsConfirmes = commun;
   }
 
-  const audio = assemblerTampon();
+  provisoire = mots.slice(motsConfirmes).join(" ");
+  motsPassePrecedente = mots;
+}
 
-  // Mesure AVANT de tailler le recouvrement : c'est la proportion du segment
-  // qu'on envoie, pas celle de ce qu'il en restera.
-  const part = partParole();
+// Fin de fenetre : le provisoire n'a plus de passe suivante pour le corriger,
+// il devient definitif.
+//
+// `motif` dit POURQUOI la fenetre se ferme, et ca change ce qu'on fige :
+//
+//   "fin de parole"  -> la personne s'est tue. Le dernier mot est entier, on
+//                       garde tout.
+//
+//   "fenetre pleine" -> on a coupe au chronometre, en plein milieu de la
+//                       parole. Le dernier mot est donc coupe en deux, et
+//                       Whisper l'a rendu tel qu'il l'a entendu : un demi-mot.
+//                       On le JETTE -- le recouvrement garde son debut, la
+//                       fenetre suivante le retranscrira en entier.
+//
+// ⚠️ Sans ce tri, le demi-mot etait fige POUR DE BON dans le ruban, puis le
+// recouvrement ajoutait la version complete juste apres. Mesure au banc, sur
+// 45 s de parole continue : « apres une pa. pause et doit », « la deuxi.
+// deuxieme phrase » -- un demi-mot double a chaque fermeture, soit toutes les
+// ~11 s.
+//
+// Et on ne jette QUE dans ce cas : partout ailleurs (fenetre abandonnee, texte
+// fige sans recouvrement), personne ne repasserait derriere pour rattraper le
+// mot -- il serait perdu.
+function figerFenetre(motif) {
+  let mots = provisoire ? decouperEnMots(provisoire) : [];
 
-  if (recouvrement > 0) {
-    // On reprend les dernieres trames en repartant de la fin, jusqu'a couvrir
-    // la duree voulue. On raisonne en trames entieres : elles font ~32 ms, donc
-    // l'arrondi est sans consequence, et ca evite de decouper un Float32Array.
-    const cible = recouvrement * TAUX;
-    const queue = [];
-    const queueParole = [];
+  // On ne jette le dernier mot que s'il en reste au moins un : sur un provisoire
+  // d'un seul mot, mieux vaut un demi-mot que rien du tout -- le recouvrement
+  // le ramenera, et le doublon se verra a peine.
+  if (motif === "fenetre pleine" && mots.length > 1) mots = mots.slice(0, -1);
+
+  if (mots.length) ajouterAuRuban(mots);
+  reinitialiserTexteFenetre();
+}
+
+// Fin d'une fenetre : on ne garde que ce qui est arrive PENDANT l'inference de
+// la passe cloturante -- la phrase a pu reprendre entre-temps, et cet audio-la
+// n'a encore ete transcrit par personne.
+//
+// Si la fenetre etait simplement PLEINE (et non finie), on garde en plus un
+// bout de sa fin : la coupure a FENETRE_MAX tombe n'importe ou, souvent en
+// plein mot, et Whisper inventerait la suite des deux cotes.
+//
+// Prix a payer, assume : ce recouvrement est re-transcrit, donc un mot peut
+// apparaitre deux fois dans le ruban a la jonction. Un mot en double se lit ;
+// un mot invente, non.
+function cloturerFenetre(passe) {
+  const apres = fenetre.slice(passe.trames);
+  const apresParole = fenetreParole.slice(passe.trames);
+
+  const tete = [];
+  const teteParole = [];
+  if (passe.cloturante === "fenetre pleine") {
+    const cible = RECOUVREMENT_FENETRE * TAUX;
     let gardes = 0;
-    for (let i = tampon.length - 1; i >= 0 && gardes < cible; i--) {
-      queue.unshift(tampon[i]);
-      queueParole.unshift(tamponParole[i]); // la trame garde son etiquette
-      gardes += tampon[i].length;
+    for (let i = passe.trames - 1; i >= 0 && gardes < cible; i--) {
+      tete.unshift(fenetre[i]);
+      teteParole.unshift(fenetreParole[i]); // la trame garde son etiquette
+      gardes += fenetre[i].length;
     }
-    tampon = queue;
-    tamponParole = queueParole;
-    tamponSamples = gardes;
-    reportSamples = gardes; // tout ce qui reste vient d'etre envoye
-    enAttente = false;
-    silenceSamples = 0;
-  } else {
-    viderTampon();
   }
 
-  transcrireSegment(audio, raison, part);
+  remplacerFenetre(tete.concat(apres), teteParole.concat(apresParole));
+  cloture = null;
 }
 
-// Appelee pour CHAQUE trame analysee par le VAD (~32 ms), qu'il y ait parole
-// ou non. C'est ici qu'on decide de couper.
-function surTrame(trame, estParole) {
-  tampon.push(trame);
-  tamponParole.push(estParole);
-  tamponSamples += trame.length;
-
-  if (!enParole) {
-    // Cas 1 : on retient un segment trop court en esperant la suite. On garde
-    // TOUT (y compris ce silence : Whisper s'en accommode tres bien, et ca
-    // conserve le rythme de la phrase si elle reprend).
-    if (enAttente) {
-      silenceSamples += trame.length;
-      // Le silence s'installe : la phrase etait bel et bien finie, on envoie ce
-      // qu'on a plutot que de faire attendre le sous-titre davantage.
-      if (silenceSamples / TAUX >= SILENCE_MAX) {
-        fermerSegment("silence prolonge");
-      }
-      return;
-    }
-
-    // Cas 2 : au repos. Le tampon ne sert que de reserve : on jette ce qui
-    // depasse PRE_PAROLE, sinon il grossirait indefiniment pendant les silences.
-    while (dureeTampon() > PRE_PAROLE && tampon.length > 1) {
-      tamponSamples -= tampon.shift().length;
-      tamponParole.shift(); // meme trame, meme sort
-    }
-    // On vient peut-etre de jeter des trames comptees dans le report : sans ce
-    // recalage, dureeNouveaute() sous-estimerait le neuf et on finirait par
-    // jeter des segments valables.
-    reportSamples = Math.min(reportSamples, tamponSamples);
-    return;
-  }
-
-  // Ca parle toujours mais le segment est plein : on coupe sans attendre, en
-  // gardant la fin pour le segment suivant (la coupure tombe en plein mot).
-  if (dureeTampon() >= DUREE_MAX) {
-    fermerSegment("duree max", RECOUVREMENT);
-  }
+// Vers l'overlay de la page. On passe par le service worker : un document
+// offscreen ne peut pas parler directement a un content script (il n'a pas
+// acces a chrome.tabs), et c'est le service worker qui sait quel onglet est
+// capture.
+//
+// `finAudio` = l'instant ou le dernier echantillon transcrit a ete capte.
+// content.js s'en sert pour mesurer l'AGE du mot le plus recent au moment ou il
+// s'affiche -- c'est ce chiffre-la qui donne le bon retard du son.
+function envoyerFlux(finAudio) {
+  chrome.runtime
+    .sendMessage({ type: "FLUX", ruban, provisoire, finAudio })
+    .catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
-// Surveillance de la file
+// Lancement des passes
 // ---------------------------------------------------------------------------
-//
-// Whisper traite les segments un par un. Tant qu'il transcrit plus vite que la
-// parole n'arrive, la file reste vide et la latence est celle d'un segment. Des
-// qu'il ralentit (machine chargee, segments plus courts donc plus nombreux), la
-// file s'allonge et la latence derive sans jamais revenir toute seule : c'est le
-// signe que le reglage est trop agressif pour cette machine.
-//
-// On previent au franchissement du seuil, pas a chaque segment : sinon
-// l'avertissement noierait la console au moment ou on en a le plus besoin.
-const FILE_ALERTE = 3;
-let fileSignalee = false;
 
-// Au-dela, on n'avertit plus : on jette (voir la fin de transcrireSegment).
-// FILE_ALERTE previent, FILE_MAX agit -- les deux restent independants.
-const FILE_MAX = 4;
+// Peut-on lancer une passe maintenant ?
+function peutLancerPasse() {
+  if (!whisperWorker) return false;
 
-function surveillerFile() {
-  const enAttente = segmentsEnCours.size;
-
-  if (!fileSignalee && enAttente > FILE_ALERTE) {
-    fileSignalee = true;
-    console.warn(
-      `⚠️  La transcription prend du retard : ${enAttente} segments en attente. ` +
-        `Les sous-titres vont s'afficher de plus en plus tard. ` +
-        `Si ca persiste, rallonger encore DUREE_MAX (actuellement ${DUREE_MAX} s) : ` +
-        `un segment long ne coute pas plus cher qu'un court, Whisper les complete ` +
-        `tous a 30 s.`
-    );
-    return;
-  }
-
-  // Retour a la normale : utile a savoir, ca distingue un a-coup passager
-  // (le chargement du modele, par exemple) d'un vrai sous-dimensionnement.
-  if (fileSignalee && enAttente <= 1) {
-    fileSignalee = false;
-    console.log("✅ La transcription a rattrape son retard (file vide).");
-  }
-}
-
-// Envoie un segment de parole au worker. Rien a decoder : le VAD produit deja
-// du Float32Array mono a 16 kHz, exactement ce que Whisper attend.
-//
-// `audio` nous appartient (on vient de l'assembler), donc on le transfere
-// directement : aucune copie.
-function transcrireSegment(audio, raison, partDeParole = 1) {
-  // Le VAD ne peut pas tourner sans capture, et la capture demarre Whisper :
-  // en pratique on ne passe jamais ici sans worker. Garde-fou quand meme.
-  if (!whisperWorker) {
-    console.warn("⚠️  Segment ignore : le worker Whisper n'est pas demarre");
-    return;
-  }
-
-  // Whisper n'est pas encore pret : on JETTE le segment au lieu de l'empiler.
-  //
-  // Un segment mis en file pendant 90 s produira un sous-titre perime de 90 s.
-  // Il vaut mieux ne rien afficher qu'afficher du faux -- et pendant ce temps
+  // Whisper n'est pas encore pret : on ne met RIEN en file. Un travail empile
+  // pendant 90 s produirait un texte perime de 90 s. Pendant ce temps
   // l'overlay explique ce qui se passe (voir envoyerStatut).
-  if (!whisperPret) {
-    segmentsIgnoresAttente++;
-    console.log(
-      `⏭️ Segment ignoré : Whisper n'est pas encore prêt ` +
-        `(${(audio.length / TAUX).toFixed(1)} s, ${segmentsIgnoresAttente} depuis le début)`
-    );
+  if (!whisperPret) return false;
+
+  // La regle du moteur : jamais deux inferences en vol.
+  if (passeEnVol) return false;
+
+  if (dureeFenetre() < DUREE_MIN) return false;
+
+  // Une cloture doit partir meme si presque rien de neuf n'est arrive : c'est
+  // la derniere chance de transcrire cette fenetre.
+  if (!cloture && dureeNouveau() < MIN_NOUVEAU) return false;
+
+  return true;
+}
+
+function lancerPasseSiPossible() {
+  if (!peutLancerPasse()) {
+    // On ne compte que ce qui est reellement perdu : une fenetre pleine de
+    // parole qu'on n'a pas pu traiter parce que Whisper n'etait pas pret.
+    if (!whisperPret && cloture && dureeFenetre() >= DUREE_MIN) {
+      passesIgnoreesAttente++;
+      viderFenetre();
+      reinitialiserTexteFenetre();
+    }
     return;
   }
+
+  const part = partParole();
+  const cloturante = cloture;
 
   // Presque rien de parle la-dedans : on n'envoie pas. C'est exactement sur ces
-  // segments-la que Whisper invente (voir PART_PAROLE_MIN).
-  if (partDeParole < PART_PAROLE_MIN) {
-    segmentsIgnoresSilence++;
+  // fenetres-la que Whisper invente (voir PART_PAROLE_MIN).
+  if (part < PART_PAROLE_MIN) {
+    passesIgnoreesSilence++;
     console.log(
-      `⏭️ Segment ignoré : seulement ${Math.round(partDeParole * 100)} % de parole réelle ` +
-        `(${(audio.length / TAUX).toFixed(1)} s, raison « ${raison} », ` +
-        `${segmentsIgnoresSilence} depuis le début)`
+      `⏭️ Passe ignorée : seulement ${Math.round(part * 100)} % de parole réelle ` +
+        `(${dureeFenetre().toFixed(1)} s, ${passesIgnoreesSilence} depuis le début)`
     );
+    // ⚠️ On repousse le seuil de MIN_NOUVEAU, sinon `dureeNouveau()` resterait
+    // au-dessus et on repasserait ici a CHAQUE trame -- une trentaine de lignes
+    // de console par seconde, sur le cas precis ou on veut pouvoir lire.
+    samplesAuDernierEnvoi = fenetreSamples;
+
+    // Meme muette, une fenetre close doit liberer la place.
+    if (cloturante) {
+      figerFenetre();
+      viderFenetre();
+    }
     return;
   }
 
-  const id = prochainSegmentId++;
-  const secondes = (audio.length / TAUX).toFixed(1);
+  const audio = assemblerFenetre();
+  const id = prochainePasseId++;
 
-  // Deux reperes de temps, et il ne faut pas les confondre :
-  //   finParole    = maintenant, l'instant ou le segment est clos. Sert a
-  //                  mesurer la latence de transcription.
-  //   debutSegment = quand la premiere syllabe du segment a ete prononcee.
-  //                  Sert a calibrer le retard du son : pour que l'utilisateur
-  //                  entende le PREMIER mot pile quand le texte s'affiche,
-  //                  c'est de ce repere-la qu'il faut partir.
-  const dureeMs = (audio.length / TAUX) * 1000;
-  segmentsEnCours.set(id, {
-    secondes,
-    finParole: Date.now(),
-    debutSegment: Date.now() - dureeMs,
-  });
+  passeEnVol = {
+    id,
+    trames: fenetre.length, // pour retrouver ce qui est arrive PENDANT l'inference
+    finAudioMs,
+    envoiMs: Date.now(),
+    cloturante,
+  };
+  samplesAuDernierEnvoi = fenetreSamples;
+  cloture = null; // la demande est consommee par CETTE passe
 
-  // 2e argument : liste des buffers TRANSFERES. Le tableau change de
-  // proprietaire au lieu d'etre copie pour passer au worker.
+  // 2e argument : liste des buffers TRANSFERES. `audio` vient d'etre assemble
+  // rien que pour ce message, la fenetre elle-meme n'est pas touchee.
   whisperWorker.postMessage(
     { type: "transcribe", id, audio, langue: langueCourante },
     [audio.buffer]
   );
 
-  // La proportion de parole est journalisee meme quand on accepte : c'est le
-  // seul moyen de verifier que PART_PAROLE_MIN reste loin des vrais segments.
   console.log(
-    `➡️  Segment #${id} envoye a Whisper : ${secondes} s (${raison}, ` +
-      `${Math.round(partDeParole * 100)} % de parole)`
+    `➡️  Passe #${id} : ${dureeFenetre().toFixed(1)} s de fenêtre` +
+      (cloturante ? ` (clôture : ${cloturante})` : "") +
+      `, ${Math.round(part * 100)} % de parole`
   );
+}
 
-  // Filet de securite, meme quand Whisper est pret : sur une machine lente la
-  // file peut recommencer a diverger. On abandonne alors les PLUS ANCIENS --
-  // un sous-titre en retard de 30 s est pire qu'un sous-titre manquant, et ce
-  // sont les vieux qui sont perimes, pas les nouveaux.
-  //
-  // Une Map parcourt ses cles dans l'ordre d'insertion : les premieres sont
-  // donc les plus anciennes.
-  if (segmentsEnCours.size > FILE_MAX) {
-    const aJeter = segmentsEnCours.size - FILE_MAX;
-    let jetes = 0;
-    for (const vieuxId of segmentsEnCours.keys()) {
-      if (jetes >= aJeter) break;
-      segmentsEnCours.delete(vieuxId);
-      segmentsAbandonnes.add(vieuxId); // sa reponse sera ignoree au retour
-      jetes++;
+// ---------------------------------------------------------------------------
+// Arrivee des trames du VAD
+// ---------------------------------------------------------------------------
+
+// Appelee pour CHAQUE trame analysee par le VAD (~32 ms), qu'il y ait parole ou
+// non. C'est ici que la fenetre grandit, et qu'on decide de relancer.
+function surTrame(trame, estParole) {
+  fenetre.push(trame);
+  fenetreParole.push(estParole);
+  fenetreSamples += trame.length;
+  finAudioMs = Date.now();
+
+  // Au repos : la fenetre ne sert que de reserve d'amorce, on jette ce qui
+  // depasse PRE_PAROLE. Sans ca elle grossirait indefiniment pendant les
+  // silences.
+  if (auRepos()) {
+    while (dureeFenetre() > PRE_PAROLE && fenetre.length > 1) {
+      fenetreSamples -= fenetre.shift().length;
+      fenetreParole.shift(); // meme trame, meme sort
     }
-    segmentsIgnoresFile += jetes;
-    console.warn(
-      `🗑️ File saturee : ${jetes} segment(s) abandonne(s) pour rester a ${FILE_MAX} ` +
-        `(${segmentsIgnoresFile} depuis le début de la capture)`
-    );
+    samplesAuDernierEnvoi = 0;
+    return;
   }
 
-  surveillerFile();
+  // La fenetre est pleine : on la fera clore par la prochaine passe. On ne
+  // coupe PAS ici -- une passe est peut-etre en vol sur cette fenetre-la, et
+  // son texte doit encore pouvoir s'y appliquer.
+  if (!cloture && dureeFenetre() >= FENETRE_MAX) {
+    cloture = "fenetre pleine";
+  }
+
+  lancerPasseSiPossible();
 }
 
 
@@ -932,17 +986,21 @@ async function startCapture(streamId, memoBackend, langue, retard, retardCalibre
     }
 
     // Whisper se met en route en parallele : le chargement du modele prend
-    // plusieurs secondes et la capture audio n'a pas a l'attendre. Les segments
-    // produits avant qu'il soit pret sont JETES, pas mis en file (voir
-    // transcrireSegment) : on l'annonce a l'utilisateur juste en dessous.
+    // plusieurs secondes et la capture audio n'a pas a l'attendre. Tant qu'il
+    // n'est pas pret, aucune passe n'est lancee et rien n'est mis en file (voir
+    // peutLancerPasse) : on l'annonce a l'utilisateur juste en dessous.
     demarrerWhisper(memoBackend);
 
     // Compteurs et statuts repartent de zero a chaque capture.
-    segmentsAbandonnes.clear();
-    segmentsIgnoresAttente = 0;
-    segmentsIgnoresFile = 0;
-    segmentsIgnoresSilence = 0;
-    sousTitresRejetes = 0;
+    passeEnVol = null;
+    passesFaites = 0;
+    passesIgnoreesAttente = 0;
+    passesIgnoreesSilence = 0;
+    textesRejetes = 0;
+    ruban = "";
+    reinitialiserTexteFenetre();
+    viderFenetre();
+    clotureAvantParole = null;
     statutPretEnvoye = false;
 
     // Au tout premier lancement sur une machine, il se passe une minute entre
@@ -1138,60 +1196,51 @@ async function startVAD(stream) {
 
       onSpeechStart: () => {
         console.log("🗣️ PAROLE DETECTEE ! (debut)");
-        // Le tampon contient deja PRE_PAROLE secondes de son : le debut du
+        // La fenetre contient deja PRE_PAROLE secondes de son : le debut du
         // premier mot est dedans, on repart de la sans rien jeter.
         //
-        // Et si on etait en attente (segment trop court), le tampon contient en
-        // plus tout le morceau precedent : la phrase se recolle d'elle-meme.
+        // Et si le VAD venait de signaler une fin qu'AUCUNE passe n'a encore
+        // consommee, c'est que la phrase reprend : on annule la cloture, et les
+        // deux morceaux se recollent d'eux-memes dans la meme fenetre. C'est ce
+        // qui evite les fenetres d'une seconde -- celles sur lesquelles
+        // whisper-tiny n'ecoute pas mais recite (voir PHRASES_FANTOMES).
+        //
         // On note l'etat d'avant : si cette « parole » se revele etre du bruit
-        // (onVADMisfire), il faudra y revenir sans jeter ce qu'on retenait.
-        attenteAvantParole = enAttente;
+        // (onVADMisfire), il faudra remettre la cloture.
+        clotureAvantParole = cloture;
+        if (cloture === "fin de parole") cloture = null;
         enParole = true;
-        enAttente = false;
-        silenceSamples = 0;
       },
 
       // On ignore l'audio que la librairie nous tend : il repart du debut de la
-      // parole, donc il contient ce qu'on a deja envoye a chaque coupure. Seul
-      // le signal de fin nous interesse.
+      // parole et ne connait pas notre fenetre. Seul le SIGNAL de fin nous
+      // interesse.
       onSpeechEnd: () => {
         console.log("🔇 PAROLE TERMINEE ! (fin)");
         enParole = false;
 
-        // Assez de matiere : on envoie tout de suite.
-        if (dureeNouveaute() >= DUREE_MIN_ENVOI) {
-          fermerSegment("fin de parole");
-          return;
-        }
-
-        // Trop court : on retient, en esperant que la phrase reprenne. C'est
-        // surTrame qui tranchera, au bout de SILENCE_MAX.
-        enAttente = true;
-        silenceSamples = 0;
+        // Une derniere passe sur la fenetre complete : ce texte-la sera
+        // definitif. On ne vide surtout pas la fenetre ici -- c'est le RETOUR
+        // de cette passe qui le fera (voir cloturerFenetre), sinon on
+        // transcrirait dans le vide.
+        if (!cloture) cloture = "fin de parole";
+        lancerPasseSiPossible();
       },
 
       onVADMisfire: () => {
         console.log("❌ Fausse alerte du VAD (bruit)");
         enParole = false;
 
-        // AVANT : viderTampon() -- on jetait TOUT le tampon.
+        // On ne jette RIEN. L'ancienne version vidait tout le tampon ici, et un
+        // simple bruit (musique, effet sonore) suffisait alors a effacer de la
+        // vraie parole jamais transcrite -- 4 a 5,5 % du son sur une source
+        // avec musique.
         //
-        // C'etait faux des qu'on retenait un segment court en attendant la
-        // suite de la phrase : un simple bruit (musique, effet sonore) suffisait
-        // a effacer de la vraie parole, jamais transcrite. Mesure sur une
-        // source avec musique : 4 a 5,5 % du son captee partait comme ca.
-        //
-        // MAINTENANT : on ne jette que le bruit. Si on retenait quelque chose,
-        // on retourne simplement en attente, tampon intact.
-        if (attenteAvantParole) {
-          enAttente = true;
-          attenteAvantParole = false;
-          return;
-        }
-
-        // Rien n'etait retenu : pas besoin de vider non plus. La branche « au
-        // repos » de surTrame ramene le tampon a PRE_PAROLE toute seule, ce qui
-        // preserve l'amorce du mot suivant.
+        // Si ce declenchement avait annule une cloture, on la remet : la phrase
+        // precedente etait bel et bien finie.
+        if (clotureAvantParole) cloture = clotureAvantParole;
+        clotureAvantParole = null;
+        lancerPasseSiPossible();
       }
     });
 
@@ -1273,11 +1322,15 @@ async function stopCapture() {
   isCapturing = false;
   analyser = null;
 
-  // Le tampon de trames ne doit pas survivre a la capture : sans ca, la
-  // prochaine commencerait avec la fin de l'audio de la precedente.
+  // Ni la fenetre ni le ruban ne doivent survivre a la capture : sans ca, la
+  // prochaine commencerait avec la fin de l'audio de la precedente, et
+  // l'overlay rouvrirait sur le texte de la video d'avant.
   enParole = false;
-  viderTampon();
-  fileSignalee = false;
+  passeEnVol = null;
+  clotureAvantParole = null;
+  viderFenetre();
+  reinitialiserTexteFenetre();
+  ruban = "";
 
   console.log("✅ Offscreen : tout est bien ferme");
 }

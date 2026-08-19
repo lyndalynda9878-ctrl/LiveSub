@@ -63,7 +63,10 @@ langueSelect.addEventListener("change", async () => {
 //     l'AudioContext attend pour delayTime) ;
 //   - "auto" reste une CHAINE : ce n'est pas une duree, c'est un mode.
 const CLE_RETARD = "retardAudio";
-const CLE_RETARD_CALIBRE = "retardCalibre";
+// ⚠️ Doit rester identique a RETARD_CALIBRE_KEY dans background.js : le nom
+// porte le moteur, pour qu'une mesure faite par l'ancien moteur (par blocs) ne
+// soit pas reappliquee au moteur de flux. Voir le commentaire la-bas.
+const CLE_RETARD_CALIBRE = "retardCalibreFlux";
 const RETARD_PAR_DEFAUT = 0;
 
 const retardInfo = document.getElementById("retardInfo");
