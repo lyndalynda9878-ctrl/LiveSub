@@ -547,6 +547,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return; // pas de reponse attendue
   }
 
+  // La popup a coche/decoche « Afficher la fin provisoire ».
+  //
+  // L'overlay, lui, n'a besoin de personne : content.js lit le storage tout
+  // seul (un content script y a acces). Ce relais ne sert qu'a l'offscreen, qui
+  // n'a PAS acces a chrome.storage et doit pourtant savoir lequel des deux
+  // retards calibres appliquer au son. Meme chemin que SET_LANGUE et
+  // SET_RETARD : si rien ne capture, l'envoi echoue sans consequence, la valeur
+  // sera lue au prochain demarrage (voir readAfficherProvisoire).
+  if (request.type === "SET_PROVISOIRE") {
+    chrome.runtime
+      .sendMessage({ type: "PROVISOIRE", afficherProvisoire: request.afficherProvisoire })
+      .then(() => console.log("👁️ Mode d'affichage transmis a l'offscreen :", request.afficherProvisoire))
+      .catch(() => console.log("ℹ️ Pas de capture en cours : mode d'affichage range pour plus tard"));
+    return; // pas de reponse attendue
+  }
+
   // L'offscreen a fini de mesurer les bons retards : on les retient, pour que
   // les prochains lancements les appliquent des la premiere seconde.
   //

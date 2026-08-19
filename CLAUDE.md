@@ -106,10 +106,16 @@ popup, **décochée par défaut**, rangée dans `chrome.storage.local` sous
   en direct.
 
 ⚠️ **La bascule est à chaud, et c'est le point important** : le choix se juge à l'œil, sur
-la même vidéo et la même phrase. `content.js` et `offscreen.js` écoutent chacun
-`chrome.storage.onChanged` — aucun redémarrage de capture, aucune recalibration.
+la même vidéo et la même phrase — aucun redémarrage de capture, aucune recalibration.
 `offscreen.js` **n'est pas au courant des modes** pour ce qu'il produit : il envoie
 toujours `ruban` ET `provisoire`. C'est l'affichage qui tranche.
+
+Les deux destinataires ne sont **pas** prévenus de la même façon, et ce n'est pas un
+caprice (voir « `chrome.storage` est indisponible dans l'offscreen ») :
+- `content.js` lit `chrome.storage` lui-même et écoute `storage.onChanged` — un content
+  script y a accès ;
+- `offscreen.js` est prévenu par **message** (`SET_PROVISOIRE` → `PROVISOIRE`), relayé par
+  le service worker, exactement comme la langue et le retard.
 
 Mesuré au banc, 2 min 10 s de parole continue (voir « Comment tester ») :
 
@@ -204,6 +210,24 @@ la latence *et* le texte. Sous ~5 s de contexte, whisper-tiny n'écoute plus, il
 phrases les plus fréquentes de son entraînement (« Thank you for watching »).
 
 ## Contraintes techniques connues
+- ⚠️ **`chrome.storage` est indisponible dans un document offscreen.** Vérifié dans
+  Chrome : `typeof chrome === "object"` mais `typeof chrome.storage === "undefined"`.
+  Tout ce qui touche au storage passe donc par le service worker — c'est déjà le cas du
+  backend, de la langue et du retard, et ça vaut aussi pour le mode d'affichage.
+
+  **Ce que ça coûte quand on l'oublie** (arrivé une fois, à ne pas refaire) : un
+  `chrome.storage.onChanged.addListener` ajouté dans `offscreen.js` lève un `TypeError`
+  **au chargement**. Le fichier meurt à cette ligne : tout ce qui suit n'est jamais évalué,
+  et les `let` déclarés plus bas restent en zone morte. Le listener de messages, lui, était
+  déjà enregistré — donc `START_CAPTURE` arrive, `startCapture` rejette, et comme la
+  réponse était branchée en `.then(sendResponse)` **sans `.catch`**, `sendResponse` n'est
+  jamais appelé. Le service worker attend sa réponse indéfiniment, la popup reste sur
+  « Démarrage… », et **rien n'apparaît nulle part** : ni erreur, ni échec, ni délai. Le
+  bouton Démarrer ne répond plus.
+
+  D'où deux règles : *(1)* l'offscreen ne touche jamais `chrome.storage` ; *(2)* tout
+  `return true` dans un `onMessage` doit avoir un `.catch` qui répond — sinon la moindre
+  erreur devient un blocage muet.
 - CSP MV3 : `wasm-unsafe-eval` requis pour le WASM ; les workers `blob:` sont bloqués
   → `numThreads = 1` et `proxy = false`.
 - Whisper : `dtype: "fp32"`, **sur les deux backends**. Choix mesuré, pas par défaut —
@@ -245,6 +269,14 @@ jouer une piste de parole simulée trame par trame sur une horloge virtuelle et 
 le moteur pour de vrai — dérive de latence, ruban qui recule, mots perdus, demi-mots
 figés, mots révélés un par un. Voir la mémoire `banc-essai-node-vm`. Ça ne remplace pas
 Chrome pour la latence réelle, la qualité du texte, le VAD et WebGPU.
+
+⚠️ **Un banc Node ne prouve rien sur ce que le navigateur rend disponible.** Le bouchon
+`chrome` du banc est écrit à la main : s'il offre `chrome.storage` à `offscreen.js`, le
+banc passe au vert sur du code que Chrome refuse. C'est exactement comme ça que le bug
+ci-dessus est passé. Les bouchons doivent **ressembler à la réalité, pas la rendre
+confortable** — celui de l'offscreen n'a donc plus de `chrome.storage` du tout. Et toute
+modif qui touche au démarrage se vérifie **dans Chrome, popup réel ouvert**, pas seulement
+au banc.
 
 Le banc le plus utile est celui **en deux temps** : on fait tourner le moteur une fois, on
 enregistre la suite exacte des messages `FLUX`, puis on la **rejoue dans deux instances de

@@ -66,10 +66,13 @@ langueSelect.addEventListener("change", async () => {
 // s'allonger, plus rien ne se reecrit sous les yeux. Prix assume : environ une
 // cadence de retard en plus (~2 s).
 //
-// ⚠️ On n'ecrit QUE dans storage.local, et on ne previent personne : c'est
-// content.js qui ecoute storage.onChanged et bascule tout seul, dans l'onglet,
-// sans redemarrer la capture. Passer par le service worker n'apporterait rien
-// ici -- et le ferait echouer quand rien ne capture.
+// Deux destinataires, et ils ne se previennent pas de la meme facon :
+//   - l'OVERLAY (content.js) lit le storage tout seul et bascule a chaud. Un
+//     content script a acces a chrome.storage, rien d'autre a faire.
+//   - l'OFFSCREEN n'a PAS acces a chrome.storage (verifie dans Chrome :
+//     `chrome.storage` y est indefini). Il faut donc le prevenir par message,
+//     via le service worker -- exactement comme la langue et le retard.
+// D'ou les deux lignes ci-dessous : on range, puis on previent.
 const CLE_PROVISOIRE = "afficherProvisoire";
 const PROVISOIRE_PAR_DEFAUT = false;
 
@@ -85,8 +88,14 @@ async function chargerProvisoire() {
 provisoireCase.addEventListener("change", async () => {
   try {
     await chrome.storage.local.set({ [CLE_PROVISOIRE]: provisoireCase.checked });
+    // Le background relaie a l'offscreen, qui recale le son sur le bon retard.
+    // Si rien ne capture, le relais echoue sans consequence.
+    await chrome.runtime.sendMessage({
+      type: "SET_PROVISOIRE",
+      afficherProvisoire: provisoireCase.checked,
+    });
   } catch (err) {
-    console.warn("Option d'affichage non memorisee :", err);
+    console.warn("Changement d'affichage non transmis :", err);
   }
   // Le bon retard du son n'est pas le meme dans les deux modes : l'info affichee
   // sous le menu doit suivre.

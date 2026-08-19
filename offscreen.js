@@ -131,7 +131,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       request.retard,
       request.retardCalibre,
       request.afficherProvisoire
-    ).then(sendResponse);
+    )
+      .then(sendResponse)
+      // ⚠️ CE CATCH N'EST PAS DECORATIF.
+      //
+      // `return true` promet une reponse. Si la promesse est rejetee sans etre
+      // rattrapee, sendResponse n'est JAMAIS appele : le service worker attend
+      // sa reponse indefiniment, la popup reste sur « Demarrage… », et rien
+      // n'apparait nulle part -- ni erreur, ni echec, ni delai.
+      //
+      // C'est ce qui s'est produit quand une erreur de chargement a laisse ce
+      // fichier a moitie evalue : startCapture rejetait avant meme son try, et
+      // le bouton Demarrer ne repondait plus. Un bug muet par construction.
+      // Desormais, quoi qu'il arrive, la popup recoit une reponse.
+      .catch((err) => {
+        console.error("❌ startCapture a rejete :", err);
+        sendResponse({
+          success: false,
+          error: "Le module audio a echoue : " + (err && err.message ? err.message : err),
+        });
+      });
     return true; // reponse asynchrone
   }
 
@@ -170,6 +189,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return; // pas de reponse attendue
   }
 
+  // La case « Afficher la fin provisoire » a change dans la popup. Ici, ca ne
+  // change RIEN a ce qu'on produit -- on envoie toujours ruban ET provisoire,
+  // c'est content.js qui choisit ce qu'il affiche. Ca ne sert qu'a recaler le
+  // son : le texte stable arrive une cadence plus tard, donc le bon retard
+  // n'est pas le meme dans les deux modes.
+  //
+  // ⚠️ POURQUOI UN MESSAGE ET PAS chrome.storage.onChanged ICI :
+  // `chrome.storage` est INDEFINI dans un document offscreen (verifie dans
+  // Chrome : `typeof chrome.storage === "undefined"`, alors que `chrome` existe).
+  // Une premiere version ecoutait le storage directement : la ligne levait un
+  // TypeError AU CHARGEMENT, tuant tout le reste du fichier, et la capture
+  // restait bloquee sur « Demarrage… » sans le moindre message d'erreur.
+  // C'est exactement pour ca que la langue et le retard passent deja par le
+  // service worker -- on suit la meme voie, il n'y en a pas d'autre.
+  if (request.type === "PROVISOIRE") {
+    afficherProvisoire = Boolean(request.afficherProvisoire);
+    appliquerRetardDuMode("bascule à chaud");
+    return; // pas de reponse attendue
+  }
+
   if (request.type === "STOP_CAPTURE") {
     // Meme raison : on ne confirme l'arret qu'une fois tout relache.
     stopCapture().then(() => sendResponse({ success: true }));
@@ -177,20 +216,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-// La case « Afficher la fin provisoire » de la popup. On l'ecoute directement
-// dans le storage : un document offscreen est un contexte d'extension, il y a
-// acces, et ca evite un aller-retour par le service worker pour une valeur
-// qu'on ne fait que LIRE. content.js fait exactement pareil de son cote.
-//
-// ⚠️ APRES l'enregistrement du listener ci-dessus, jamais avant : c'est la
-// regle du fichier (voir le commentaire en tete de ce bloc). Ce qui s'intercale
-// avant retarde la reponse a START_CAPTURE, et la capture echoue sur « Le
-// module audio n'a pas repondu ».
-chrome.storage.onChanged.addListener((changes, zone) => {
-  if (zone !== "local" || !changes.afficherProvisoire) return;
-  afficherProvisoire = Boolean(changes.afficherProvisoire.newValue);
-  appliquerRetardDuMode("bascule à chaud");
-});
 
 // ---------------------------------------------------------------------------
 // Whisper : le worker de transcription
