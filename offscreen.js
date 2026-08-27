@@ -545,7 +545,19 @@ function surMessageWhisper(event) {
             `(${textesRejetes} rejet(s) depuis le début, affichage inchangé)`
         );
       } else {
-        accepterTexte(texte);
+        // Les instants arrivent a cote du texte, et n'influencent RIEN de ce qui
+        // precede : les garde-fous, LocalAgreement-2 et le ruban se comportent
+        // exactement comme avant. Si l'alignement echoue, `instants` vaut null
+        // et on retombe sur le comportement d'avant l'etape 1.
+        const instants = instantsAbsolus(message.mots, decouperEnMots(texte), passe);
+        if (message.mots && !instants) {
+          motsSansInstant++;
+          console.warn(
+            `⏱️ Passe #${passe.id} : horodatages ecartes (recollage != mots affiches). ` +
+              `${motsSansInstant} depuis le debut. Texte : "${texte}"`
+          );
+        }
+        accepterTexte(texte, instants);
 
         // Le ruban vient d'avancer jusqu'au prefixe commun avec l'hypothese
         // PRECEDENTE : le dernier mot stable ne peut donc pas etre plus recent
@@ -561,7 +573,7 @@ function surMessageWhisper(event) {
         console.log(
           `📝 Passe #${passe.id} en ${(message.ms / 1000).toFixed(1)} s ` +
             `(âge du son : ${age} s avec provisoire, ${ageStable} s stable seul) ` +
-            `| stable « …${ruban.slice(-70)} » | provisoire « ${provisoire} »`
+            `| stable « …${texteDe(rubanMots).slice(-70)} » | provisoire « ${texteDe(provisoireMots)} »`
         );
         envoyerFlux(passe.finAudioMs);
       }
@@ -775,7 +787,11 @@ let finAudioStableMs = 0;
 let finAudioPassePrecedente = 0;
 
 // La passe en vol, ou null. UN SEUL element possible : c'est toute la regle du
-// moteur. { id, trames, finAudioMs, envoiMs, cloturante }
+// moteur. { id, trames, samples, finAudioMs, envoiMs, cloturante }
+//
+// `samples` sert a dater les mots : Whisper rend l'instant de chaque mot en
+// secondes DEPUIS LE DEBUT DE L'EXTRAIT ENVOYE. Pour en faire une heure, il faut
+// savoir quand cet extrait commencait -- soit `finAudioMs - samples / TAUX`.
 let passeEnVol = null;
 let prochainePasseId = 1;
 
@@ -806,10 +822,29 @@ let clotureAvantParole = null;
 // C'est l'algorithme LocalAgreement-2 de whisper-streaming.
 
 // Tout le texte devenu stable. Ne recule jamais.
-let ruban = "";
+//
+// ⚠️ C'EST UNE LISTE DE MOTS, PLUS UNE CHAINE, et c'est le changement central de
+// l'etape 1 : chaque entree vaut { mot, instant }, ou `instant` est l'heure
+// ABSOLUE (echelle Date.now) a laquelle ce mot a ete prononce -- ou null si la
+// passe n'a pas fourni d'horodatage exploitable.
+//
+// Pourquoi une liste et pas « la chaine d'un cote, les instants de l'autre » :
+// le ruban est tronque par le debut quand il depasse RUBAN_MAX, et une
+// troncature qui ne tomberait pas au meme endroit dans les deux structures
+// afficherait chaque mot a l'heure de son voisin -- un decalage silencieux,
+// impossible a voir en lisant le code. Ici la chaine est DERIVEE (`texteDe`),
+// elle ne peut pas diverger.
+let rubanMots = [];
 
 // La fin encore incertaine, telle que la voit la derniere passe acceptee.
-let provisoire = "";
+// Meme forme que le ruban.
+let provisoireMots = [];
+
+// La chaine, pour l'affichage et les journaux. Toujours calculee, jamais
+// stockee : voir ci-dessus.
+function texteDe(entrees) {
+  return entrees.map((e) => e.mot).join(" ");
+}
 
 // L'hypothese de la passe PRECEDENTE, pour la comparer a la suivante.
 let motsPassePrecedente = [];
@@ -826,6 +861,10 @@ const RUBAN_MAX = 300;
 let passesIgnoreesAttente = 0; // pas lancees : Whisper n'etait pas pret
 let passesIgnoreesSilence = 0; // pas lancees : fenetre quasi muette
 let textesRejetes = 0;         // textes recus mais refuses (radotage, fantome)
+// Passes ou Whisper a bien rendu des horodatages, mais ou le recollage ne
+// retombait pas sur les mots affiches : on les a ecartes. Doit rester a 0 ou
+// tres bas -- s'il grimpe, la regle de recollage a un trou.
+let motsSansInstant = 0;
 let passesFaites = 0;
 
 // ---------------------------------------------------------------------------
@@ -880,7 +919,7 @@ function viderFenetre() {
 
 // Etat texte de la fenetre courante, remis a neuf.
 function reinitialiserTexteFenetre() {
-  provisoire = "";
+  provisoireMots = [];
   motsPassePrecedente = [];
   motsConfirmes = 0;
   // Va de pair avec motsPassePrecedente : plus d'hypothese precedente, donc
@@ -893,7 +932,11 @@ function reinitialiserTexteFenetre() {
 // provisoire) Dans ce cas la fenetre ne sert que de reserve d'amorce.
 function auRepos() {
   return (
-    !enParole && !cloture && !passeEnVol && motsPassePrecedente.length === 0 && !provisoire
+    !enParole &&
+    !cloture &&
+    !passeEnVol &&
+    motsPassePrecedente.length === 0 &&
+    provisoireMots.length === 0
   );
 }
 
@@ -916,34 +959,128 @@ function prefixeCommun(a, b) {
   return i;
 }
 
-// Verse des mots dans le ruban, en le bornant a RUBAN_MAX.
-function ajouterAuRuban(mots) {
-  if (!mots.length) return;
-  ruban = ruban ? `${ruban} ${mots.join(" ")}` : mots.join(" ");
+// ---------------------------------------------------------------------------
+// Les instants : de « 2,36 s dans l'extrait » a « telle heure »
+// ---------------------------------------------------------------------------
 
-  if (ruban.length > RUBAN_MAX) {
-    // ⚠️ On coupe sur une frontiere de MOT. content.js aligne l'affichage sur
-    // les mots : un ruban tranche en plein mot lui ferait croire que tout a
-    // change, et il re-revelerait du texte deja lu.
-    ruban = ruban.slice(ruban.length - RUBAN_MAX);
-    const espace = ruban.indexOf(" ");
-    if (espace > 0) ruban = ruban.slice(espace + 1);
+// Recolle les morceaux de Whisper en mots typographiques.
+//
+// ⚠️ Un « mot » de Whisper n'en est pas un. « J'adore, » arrive en DEUX
+// morceaux : « J » puis « 'adore, ». Ce qui distingue deux morceaux du meme mot
+// de deux mots differents, c'est l'ESPACE qui precede -- verifie dans Chrome :
+//
+//   [" J", "'adore,", " j", "'aime,", " je", " n", "'aime", " pas,", ...]
+//
+// D'ou le texte transmis sans `.trim()` par le worker : trimmer effacait la
+// seule information qui permet de recoller.
+//
+// L'instant retenu pour un mot est celui de son PREMIER morceau : c'est le
+// moment ou on commence a l'entendre, donc celui ou il doit s'afficher.
+function recollerMots(morceaux) {
+  const mots = [];
+  for (const morceau of morceaux) {
+    const brut = String(morceau.mot || "");
+    if (!brut.trim()) continue; // morceau vide : rien a recoller
+    if (mots.length === 0 || /^\s/.test(brut)) {
+      mots.push({ mot: brut.trim(), debut: morceau.debut });
+    } else {
+      mots[mots.length - 1].mot += brut.trim();
+    }
+  }
+  return mots;
+}
+
+// Un instant absolu par mot affiche, ou null si on ne peut pas garantir
+// l'alignement.
+//
+// `motsAffiches` sont les mots tels que l'overlay les verra (decouperEnMots).
+// Le recollage doit redonner EXACTEMENT ceux-la.
+function instantsAbsolus(morceaux, motsAffiches, passe) {
+  if (!Array.isArray(morceaux) || morceaux.length === 0) return null;
+
+  const recolles = recollerMots(morceaux);
+
+  // ⚠️ LE GARDE-FOU QUI REND CETTE ETAPE SANS RISQUE. Si le recollage ne redonne
+  // pas mot pour mot ce qui sera affiche, on renonce aux instants POUR CETTE
+  // PASSE plutot que de les decaler d'un cran. Un mot affiche a l'heure de son
+  // voisin serait pire que pas d'heure du tout, et le decalage se propagerait
+  // sans jamais rien casser de visible. content.js sait retomber sur sa cadence
+  // quand l'instant manque : le pire cas est l'affichage d'avant, pas un bug.
+  if (recolles.length !== motsAffiches.length) return null;
+  for (let i = 0; i < recolles.length; i++) {
+    if (normaliserTexte(recolles[i].mot) !== normaliserTexte(motsAffiches[i])) return null;
+  }
+
+  const debutFenetreMs = passe.finAudioMs - (passe.samples / TAUX) * 1000;
+  const instants = [];
+  let precedent = debutFenetreMs;
+
+  for (const recolle of recolles) {
+    let t =
+      recolle.debut == null || !Number.isFinite(recolle.debut)
+        ? null
+        : debutFenetreMs + recolle.debut * 1000;
+
+    // ⚠️ Whisper complete TOUT extrait a 30 s avant de le traiter, et
+    // l'alignement place parfois les derniers mots dans ce silence de
+    // remplissage. Mesure a l'etape 0 : sur une fenetre de 11 s, 9 mots dates
+    // au-dela de la fin, dont un a +7,4 s. Un mot date dans le futur ne
+    // s'afficherait JAMAIS a l'heure -- l'ecran resterait fige a l'attendre.
+    // On le ramene donc dans la fenetre, ou il a forcement ete prononce.
+    if (t == null) t = precedent;
+    if (t < debutFenetreMs) t = debutFenetreMs;
+    if (t > passe.finAudioMs) t = passe.finAudioMs;
+
+    // Et jamais en arriere : l'affichage lit cette liste dans l'ordre, un
+    // instant qui recule bloquerait tout ce qui suit.
+    if (t < precedent) t = precedent;
+
+    instants.push(Math.round(t));
+    precedent = t;
+  }
+  return instants;
+}
+
+// ---------------------------------------------------------------------------
+
+// Verse des mots dans le ruban, en le bornant a RUBAN_MAX.
+// `entrees` : [{ mot, instant }].
+function ajouterAuRuban(entrees) {
+  if (!entrees.length) return;
+  rubanMots.push(...entrees);
+
+  // On jette les plus vieux mots par le debut, un mot entier a la fois.
+  // ⚠️ La coupure tombe donc TOUJOURS sur une frontiere de mot -- c'etait deja
+  // la regle du temps ou le ruban etait une chaine, parce que content.js aligne
+  // son affichage sur les mots : un ruban tranche en plein mot lui ferait croire
+  // que tout a change, et il re-revelerait du texte deja lu. Avec une liste,
+  // cette regle n'est plus une precaution, elle est structurelle.
+  while (rubanMots.length > 1 && texteDe(rubanMots).length > RUBAN_MAX) {
+    rubanMots.shift();
   }
 }
 
 // Applique le texte d'une passe : ce qui est confirme part au ruban, le reste
 // devient le provisoire.
-function accepterTexte(texte) {
+//
+// `instants` : un instant par mot de `texte`, dans le meme ordre, ou null si
+// cette passe n'en a pas fourni d'exploitable. LocalAgreement-2 lui-meme n'a PAS
+// change d'une ligne -- il compare toujours des mots ; l'instant voyage a cote.
+function accepterTexte(texte, instants) {
   const mots = decouperEnMots(texte);
   const commun = prefixeCommun(motsPassePrecedente, mots);
+  const entree = (i) => ({ mot: mots[i], instant: instants ? instants[i] : null });
 
   if (commun > motsConfirmes) {
     // On verse la version de la passe LA PLUS RECENTE (meilleure ponctuation).
-    ajouterAuRuban(mots.slice(motsConfirmes, commun));
+    const neufs = [];
+    for (let i = motsConfirmes; i < commun; i++) neufs.push(entree(i));
+    ajouterAuRuban(neufs);
     motsConfirmes = commun;
   }
 
-  provisoire = mots.slice(motsConfirmes).join(" ");
+  provisoireMots = [];
+  for (let i = motsConfirmes; i < mots.length; i++) provisoireMots.push(entree(i));
   motsPassePrecedente = mots;
 }
 
@@ -971,7 +1108,7 @@ function accepterTexte(texte) {
 // fige sans recouvrement), personne ne repasserait derriere pour rattraper le
 // mot -- il serait perdu.
 function figerFenetre(motif) {
-  let mots = provisoire ? decouperEnMots(provisoire) : [];
+  let mots = provisoireMots.slice();
 
   // On ne jette le dernier mot que s'il en reste au moins un : sur un provisoire
   // d'un seul mot, mieux vaut un demi-mot que rien du tout -- le recouvrement
@@ -1034,8 +1171,14 @@ function envoyerFlux(finAudio) {
   chrome.runtime
     .sendMessage({
       type: "FLUX",
-      ruban,
-      provisoire,
+      ruban: texteDe(rubanMots),
+      provisoire: texteDe(provisoireMots),
+      // Un instant par mot, dans le meme ordre que les mots de la chaine.
+      // `null` la ou la passe n'a pas fourni d'horodatage exploitable :
+      // content.js retombe alors sur sa cadence pour ce mot-la, il n'y a pas de
+      // trou a l'ecran.
+      rubanInstants: rubanMots.map((e) => e.instant),
+      provisoireInstants: provisoireMots.map((e) => e.instant),
       finAudio,
       finAudioStable: finAudioStableMs || null
     })
@@ -1109,6 +1252,7 @@ function lancerPasseSiPossible() {
   passeEnVol = {
     id,
     trames: fenetre.length, // pour retrouver ce qui est arrive PENDANT l'inference
+    samples: fenetreSamples, // pour dater les mots : voir instantsAbsolus
     finAudioMs,
     envoiMs: Date.now(),
     cloturante,
@@ -1201,7 +1345,8 @@ async function startCapture(
     passesIgnoreesAttente = 0;
     passesIgnoreesSilence = 0;
     textesRejetes = 0;
-    ruban = "";
+    motsSansInstant = 0;
+    rubanMots = [];
     reinitialiserTexteFenetre();
     viderFenetre();
     clotureAvantParole = null;
@@ -1551,7 +1696,7 @@ async function stopCapture() {
   clotureAvantParole = null;
   viderFenetre();
   reinitialiserTexteFenetre();
-  ruban = "";
+  rubanMots = [];
   // Les reperes aussi : sans ca, la prochaine capture daterait ses premiers
   // mots stables de la video precedente et calculerait un age absurde.
   finAudioMs = 0;

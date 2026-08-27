@@ -178,10 +178,47 @@ const OPTIMISATION = PARAMETRES.get("opt") || OPTIMISATION_DEFAUT;
 // Options passees telles quelles a ONNX Runtime a la creation de la session.
 const SESSION_OPTIONS = { graphOptimizationLevel: OPTIMISATION };
 
+// Horodatage par mot. Contrairement a `modele`, `dtype` et `opt`, celui-ci est
+// ACTIF EN PRODUCTION : `?horodatage=non` sert seulement aux pages de mesure,
+// qui doivent pouvoir comparer avec et sans.
+//
+// A quoi ca sert : sans lui, l'overlay ne sait pas QUAND un mot a ete prononce,
+// seulement lesquels. Il les revele donc a cadence fixe, ce qui donne des
+// rafales suivies de trous au lieu du rythme de la parole. Avec l'instant de
+// chaque mot, l'affichage peut le sortir a l'heure.
+//
+// Deux conditions, verifiees sur nos fichiers :
+//   - le modele doit avoir `alignment_heads` dans generation_config.json
+//     (tiny 6, base 8, small 10) ;
+//   - l'export ONNX doit SORTIR les attentions croisees (`cross_attentions.N`),
+//     sinon Transformers.js leve « Model outputs must contain cross attentions ».
+// Les trois modeles remplissent les deux conditions.
+//
+// CE QUE CA COUTE, mesure au banc le 2026-08-20 (test-bruit.html) :
+//   - +20 % de temps par passe sur une fenetre de 11-12 s (2,0 s -> 2,4 s) ;
+//   - rapport identique (+18 %) sur une machine trois fois plus lente, donc ce
+//     n'est pas un effet de mesure ;
+//   - PLAT sur 14 passes consecutives du meme worker : rien ne s'accumule, un
+//     worker peut vivre toute une session.
+// Le seuil qu'on s'etait donne pour renoncer etait +40 %. On est a la moitie.
+//
+// ⚠️ Ne pas se fier a un chiffre absolu pris en fin de seance de mesure : le
+// meme fragment passe de 2,1 s a 7,7 s quand la machine a deja charge une
+// vingtaine de modeles, SANS horodatage. Seul le rapport entre deux variantes
+// mesurees en alternance veut dire quelque chose.
+const HORODATAGE_DEFAUT = "word";
+const horodatageDemande = PARAMETRES.get("horodatage");
+const HORODATAGE =
+  horodatageDemande === "non" ? null : horodatageDemande || HORODATAGE_DEFAUT;
+
 // Change des que le modele, la precision ou le niveau d'optimisation change.
 // Une mesure memorisee qui ne porte pas la meme signature est jetee : elle ne
 // dit plus rien d'utile.
-const SIGNATURE = `${MODEL}|${JSON.stringify(DTYPE)}|${OPTIMISATION}`;
+// (L'horodatage en fait partie : il change le cout d'une passe, donc une mesure
+// de backend faite sans lui ne vaut pas pour une session avec.)
+const SIGNATURE = `${MODEL}|${JSON.stringify(DTYPE)}|${OPTIMISATION}${
+  HORODATAGE ? `|ts=${HORODATAGE}` : ""
+}`;
 
 // ---------------------------------------------------------------------------
 // Choix du backend : on MESURE, on ne suppose pas
@@ -546,13 +583,40 @@ self.onmessage = (event) => {
           language: langue || LANGUE_DEFAUT,
           max_new_tokens: MAX_JETONS,
           no_repeat_ngram_size: NO_REPEAT_NGRAM,
+          // Absent uniquement si une page de mesure a demande `?horodatage=non`.
+          ...(HORODATAGE ? { return_timestamps: HORODATAGE } : {}),
         });
+
+        // `chunks` n'existe que si on a demande les horodatages. Chaque entree
+        // vaut { text, timestamp: [debut, fin] }, en SECONDES depuis le debut
+        // de l'extrait envoye. On ne transmet que ce dont l'affichage aurait
+        // besoin -- le morceau et son debut -- pour ne pas faire voyager un
+        // objet enorme a chaque passe.
+        //
+        // ⚠️ LE TEXTE PART TEL QUEL, SANS `.trim()`, et ce n'est pas un oubli.
+        // Un « mot » de Whisper n'est pas un mot typographique : « J'adore, »
+        // arrive en DEUX morceaux, « J » puis « 'adore, ». Ce qui distingue
+        // « deux morceaux du meme mot » de « deux mots » est justement l'espace
+        // qui precede -- « J » puis « 'adore, » se recollent, « je » puis
+        // « deteste » non. Trimmer ici effacait la seule information qui permet
+        // de le savoir, et l'offscreen n'avait plus aucun moyen d'aligner les
+        // instants sur les mots qu'il affiche.
+        const mots =
+          HORODATAGE && Array.isArray(resultat.chunks)
+            ? resultat.chunks.map((c) => ({
+                mot: String(c.text || ""),
+                debut: Array.isArray(c.timestamp) ? c.timestamp[0] : null,
+                fin: Array.isArray(c.timestamp) ? c.timestamp[1] : null,
+              }))
+            : null;
+
         self.postMessage({
           type: "result",
           id,
           texte: resultat.text.trim(),
           ms: Math.round(performance.now() - debut),
           backend,
+          ...(mots ? { mots } : {}),
         });
       } catch (error) {
         self.postMessage({ type: "error", id, message: String(error?.message || error) });

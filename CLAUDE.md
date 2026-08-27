@@ -126,6 +126,14 @@ Mesuré au banc, 2 min 10 s de parole continue (voir « Comment tester ») :
 | écrans vides | 0 | 0 |
 | âge du son affiché | 1,9 s | 3,2 s |
 
+⚠️ **La dernière ligne date d'avant l'horloge des mots** (étape 2) : l'écran ajoute
+désormais le retard d'affichage, mesuré au banc à 4,4 s avec provisoire et 6,4 s en
+stable. Les trois premières lignes, elles, tiennent toujours. Et « mots déjà affichés qui
+changent » devrait baisser en mode provisoire — un mot qui attend son heure a le temps
+d'être corrigé avant d'apparaître : **4 → 1 sur le flux de 7 messages du banc de chaîne**.
+Le run de 2 min 10 s n'a pas été refait, donc le « 50 » du tableau n'a pas d'équivalent
+mesuré après l'étape 2.
+
 Aucun mot n'est perdu en mode stable : c'est la **clôture de fenêtre** qui le garantit —
 `figerFenetre` verse tout le provisoire dans le ruban quand la fenêtre se ferme, donc la
 fin de phrase finit toujours par s'afficher.
@@ -209,6 +217,135 @@ ruban ne recule jamais, aucun mot prononcé n'est perdu.
 la latence *et* le texte. Sous ~5 s de contexte, whisper-tiny n'écoute plus, il récite les
 phrases les plus fréquentes de son entraînement (« Thank you for watching »).
 
+## Les instants : chaque mot connaît l'heure à laquelle il a été prononcé
+**Le triangle impossible, d'abord.** Trois choses souhaitables, on ne peut en avoir que
+deux : *(1)* le texte synchrone avec le son, *(2)* le son synchrone avec l'image, *(3)* la
+transcription faite en direct depuis l'onglet. On ne peut pas transcrire un mot avant
+qu'il soit prononcé : le mot dit à l'instant T n'existe en texte qu'à T + ~2 s. YouTube
+n'a pas ce problème parce qu'il ne fait pas du direct — la vidéo est transcrite sur ses
+serveurs *avant* d'être lue. **On abandonne donc le point 1** : le texte restera derrière
+la voix. Ce qui est réparable, et complètement, c'est que ce retard soit **régulier**.
+
+**La maladie que ça soigne.** `content.js` révélait les mots à cadence fixe
+(`PAS_REVELATION`, 80 ms) parce qu'il savait *lesquels* mais pas *quand*. D'où des rafales
+suivies de trous, sans rapport avec le rythme réel de la parole, et des silences qui
+n'existaient pas à l'écran. Avec l'instant de chaque mot, l'affichage peut le sortir à
+l'heure : parole rapide → texte rapide, pause → l'écran s'arrête.
+
+### Ce que ça coûte : mesuré, pas supposé (2026-08-20, `test-bruit.html`)
+| fenêtre | mots/passe | sans | avec | surcoût |
+|---|---|---|---|---|
+| 7 s | 11 | 2 201 ms | 2 276 ms | +3 % |
+| 8 s | 13 | 1 924 ms | 2 153 ms | +12 % |
+| 10 s | 15 | 1 932 ms | 2 227 ms | +15 % |
+| 11 s | 17 | 2 013 ms | 2 409 ms | **+20 %** |
+| 12 s | 20 | 2 100 ms | 2 504 ms | **+19 %** |
+
+Le coût suit le **nombre de mots décodés**, pas la durée du son (Whisper complète tout
+extrait à 30 s). Le seuil qu'on s'était donné pour renoncer était +40 % : on est à la
+moitié. Et **rien ne s'accumule** — 14 passes consécutives du même worker sur le même
+fragment, les deux courbes restent plates.
+
+### La justesse des instants sous le bruit : intacte
+| musique | signal/bruit | mots retrouvés | écart médian | p90 | instants non croissants |
+|---|---|---|---|---|---|
+| 0.2 | 4,3 dB | 100 % | 20 ms | 160 ms | 0 |
+| 0.4 | **−1,8 dB** | 97 % | 20 ms | 180 ms | 0 |
+
+À −1,8 dB la musique est *plus forte que la voix*, et les instants ne bougent que de
+20 ms. Le bruit abîme le **mot**, pas l'**heure**.
+
+### ⚠️ Deux pièges trouvés à la mesure, tous deux traités dans le code
+- **Un mot peut être daté APRÈS la fin de la fenêtre.** Sur une fenêtre de 11 s, 9 mots
+  au-delà de la fin, dont un à **+7,4 s** : Whisper complète l'extrait à 30 s et
+  l'alignement place parfois la fin dans ce silence de remplissage. Un mot daté dans le
+  futur ne s'afficherait jamais à l'heure — l'écran resterait figé à l'attendre. D'où le
+  bornage dans `instantsAbsolus`.
+- **Un « mot » de Whisper n'est pas un mot.** « J'adore, » arrive en **deux** morceaux,
+  `" J"` puis `"'adore,"`. Ce qui distingue deux morceaux du même mot de deux mots
+  différents, c'est **l'espace qui précède** — d'où le texte transmis **sans `.trim()`**
+  par le worker. Trimmer effaçait la seule information permettant de recoller.
+
+### Le chemin, maillon par maillon
+1. `whisper.worker.js` demande `return_timestamps: "word"` **en production**
+   (`?horodatage=non` désactive, pour les pages de mesure seulement). La signature du
+   backend porte `|ts=word` : une mesure GPU/CPU faite sans horodatage ne vaut plus, elle
+   est donc automatiquement refaite.
+2. `offscreen.js` recolle les morceaux (`recollerMots`), convertit en heure absolue
+   (`instantsAbsolus` : `finAudioMs - samples/TAUX` donne le début de fenêtre), borne, et
+   garantit des instants croissants.
+3. **LocalAgreement-2 n'a pas changé d'une ligne** : il compare toujours des mots,
+   l'instant voyage à côté. `ruban` et `provisoire` sont devenus des **listes de
+   `{mot, instant}`** — la chaîne est *dérivée*, pour qu'une troncature ne puisse pas
+   désynchroniser les mots et leurs heures.
+4. `FLUX` porte `rubanInstants` et `provisoireInstants`, un instant par mot.
+
+**Garde-fou** : si le recollage ne redonne pas exactement les mots affichés, on renonce
+aux instants **pour cette passe** (compteur `motsSansInstant`) plutôt que de les décaler
+d'un cran. Un mot affiché à l'heure de son voisin serait pire que pas d'heure du tout.
+
+### ⚠️ Le relais du service worker ne doit RIEN reconstruire
+`sendFlux` prenait `(ruban, provisoire, finAudio)` et réassemblait un objet. Tout champ
+ajouté par l'offscreen était donc **jeté là, en silence**. C'est arrivé : `finAudioStable`
+— le repère du mode « stable seulement » — était produit et attendu, mais n'a jamais
+traversé ; `content.js` retombait sur `finAudioStable || finAudio`, donc rien ne plantait
+et seule la mesure d'âge du mode stable était fausse d'une cadence. **Un repli qui marche
+est exactement ce qui rend ce genre de perte invisible.** `sendFlux` relaie désormais le
+message entier.
+
+## L'horloge des mots : `content.js` n'estime plus, il lit l'heure
+`PAS_REVELATION = 80` et `RETARD_MAX_MOTS = 12` **ont disparu**, et c'est le signe que
+l'étape 2 a fait son travail : c'étaient deux rustines pour compenser l'absence
+d'horloge. Un seul réveil toutes les 50 ms, qui sort tout mot dont l'heure est venue.
+
+`RETARD_MAX_MOTS` ne peut même plus avoir de raison d'être : un vieux mot porte un vieil
+instant, son heure est passée depuis longtemps, il est visible immédiatement. Il n'y a
+plus rien à « rattraper », donc plus rien à borner.
+
+### ⚠️ Le retard d'affichage se cale sur le mot le plus ANCIEN en attente, pas le plus frais
+C'est le point qui décide de tout, et il a été tranché au banc. Les mots n'arrivent pas un
+par un : ils arrivent **par lots**, un lot couvrant une cadence de parole. Le plus ancien
+d'un lot est donc plus vieux que le plus frais d'exactement une cadence — et si le retard
+est calé sur le plus frais, tous les autres sont déjà en retard et sortent d'un bloc.
+
+Mesuré sur une piste à rythme variable (rapide 180 ms/mot, **pause de 2 s**, lent
+520 ms/mot) :
+
+| | calé sur le plus frais | calé sur le plus ancien en attente |
+|---|---|---|
+| normale, stable | 30 ms d'écart, rafales de **5** | **20 ms, rafales de 1** |
+| normale, provisoire | 180 ms, rafales de 4 | **20 ms, rafales de 1** |
+| lente, provisoire | 300 ms, **pause perdue** | **20 ms, pause conservée** |
+
+Prix assumé : **+1,5 s de retard à l'écran** (4,9 → 6,4 s en mode stable). C'est ce qu'il
+en coûte pour que les mots sortent un par un au bon rythme au lieu de gicler par paquets.
+
+Le retard n'est **pas** une constante : il est **observé** (percentile 90 des 20 derniers
+lots, un jeu par mode), parce qu'il doit couvrir la latence du moteur — 2 s ici, 6 s sur
+une machine lente, plus une cadence en mode stable. Une valeur écrite en dur serait juste
+pour une machine et fausse pour toutes les autres.
+
+**Vérifié dans Chrome, pas seulement au banc** : intervalles prononcés 200 / 1500 / 600 /
+600 / 600 ms → affichés 196 / **1504** / 597 / 603 / 598 ms. La pause est restée une pause
+à 4 ms près.
+
+### La limite, et pourquoi on la choisit
+`RETARD_MAX = 10 s`. Le retard nécessaire vaut ~2 cadences en mode provisoire et ~3 en
+mode stable. Sur une machine à 6 s par passe, ça ferait 12 à 18 s — un sous-titre qui n'a
+plus aucun rapport avec l'image. Au-delà du plafond on réaffiche donc par paquets :
+moins beau, mais lisible. Sur la machine de référence (2,2 s par passe, ~6,6 s de besoin
+en stable) le plafond ne mord pas.
+
+*Effet de bord agréable, mesuré : en mode provisoire, les mots déjà lus qui se réécrivent
+sont passés de 4 à 1 sur le même flux — un mot qui attend son heure a le temps d'être
+corrigé avant d'être affiché.*
+
+⚠️ **Conséquence pour le retard du son (étape 3)** : l'âge du texte affiché n'est plus
+celui que `offscreen.js` calibre. La calibration mesure l'âge du mot **à son arrivée** ;
+l'écran, lui, ajoute maintenant le retard d'affichage. `retardCalibreFluxParMode` sous-
+estime donc l'âge réel. À reprendre à l'étape 3 — qui prévoit de toute façon de mettre le
+retard du son à zéro par défaut.
+
 ## Contraintes techniques connues
 - ⚠️ **`chrome.storage` est indisponible dans un document offscreen.** Vérifié dans
   Chrome : `typeof chrome === "object"` mais `typeof chrome.storage === "undefined"`.
@@ -270,6 +407,16 @@ le moteur pour de vrai — dérive de latence, ruban qui recule, mots perdus, de
 figés, mots révélés un par un. Voir la mémoire `banc-essai-node-vm`. Ça ne remplace pas
 Chrome pour la latence réelle, la qualité du texte, le VAD et WebGPU.
 
+⚠️ **Une séance de mesure s'use, et le témoin le prouve.** Après une vingtaine de workers
+instanciés (147 Mo de poids chacun), le même fragment passe de **2,1 s à 7,7 s** — y
+compris pour la variante *sans* la fonctionnalité mesurée. Recharger la page ne répare
+rien : c'est la machine entière qui est descendue. C'est comme ça qu'un surcoût
+d'horodatage a été mesuré à **+71 %** puis à **+19 %** sur exactement le même audio. Donc :
+ne jamais comparer deux chiffres absolus pris à des moments différents ; faire tourner les
+deux variantes **alternées fragment par fragment** et ne conclure que sur le **rapport**.
+Si le témoin lui-même a dérivé, la séance est finie — redémarrer avant de mesurer autre
+chose.
+
 ⚠️ **Un banc Node ne prouve rien sur ce que le navigateur rend disponible.** Le bouchon
 `chrome` du banc est écrit à la main : s'il offre `chrome.storage` à `offscreen.js`, le
 banc passe au vert sur du code que Chrome refuse. C'est exactement comme ça que le bug
@@ -299,6 +446,17 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
 - ✅ **Option « texte stable seulement »** (défaut) : plus rien ne se réécrit sous les yeux,
   bascule à chaud pour comparer. Retard du son calibré par mode. Voir les deux sections
   dédiées plus haut.
+- ✅ **Étape 0 — chiffrer avant de s'engager** : coût des horodatages (+20 %, sous le seuil
+  de renoncement de 40 %), absence de dérive sur 14 passes, justesse des instants sous
+  musique (20 ms à −1,8 dB). Page `test-bruit.html`.
+- ✅ **Étape 1 — les instants voyagent** : worker → offscreen → service worker → `FLUX`.
+  Chaque mot porte l'heure à laquelle il a été prononcé. Voir « Les instants » plus haut.
+- ✅ **Étape 2 — `content.js` affiche à l'heure** : `PAS_REVELATION` et `RETARD_MAX_MOTS`
+  ont disparu, les mots sortent un par un au rythme réel, les pauses redeviennent des
+  pauses. Voir « L'horloge des mots » plus haut.
+- ⬜ **Étape 3 — retard du son à zéro par défaut** : garder les lèvres synchrones et
+  laisser le texte suivre à ~2-3 s, comme les sous-titres du direct à la télé. L'option
+  « Auto » reste pour qui préfère l'inverse.
 - ⬜ Traduction, personnalisation de l'overlay, historique/export, hors-ligne complet
   (bundler le modèle).
 - ⬜ **Qualité du texte sur son BRUITÉ** — le reproche qui reste. whisper-base a été écarté

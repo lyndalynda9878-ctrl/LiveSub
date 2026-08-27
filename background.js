@@ -289,14 +289,33 @@ async function toggleOverlay(tabId, active) {
 // Meme precaution que toggleOverlay : une page sans content script (chrome://,
 // page ouverte avant l'installation) ne doit pas faire de bruit a chaque
 // passe -- on log une fois en warn et on continue.
-async function sendFlux(ruban, provisoire, finAudio) {
+//
+// ⚠️ ON RELAIE LE MESSAGE ENTIER, on ne le reconstruit pas champ par champ.
+//
+// Ce n'est pas un raccourci d'ecriture, c'est la correction d'un defaut reel.
+// Cette fonction prenait `(ruban, provisoire, finAudio)` et reassemblait un
+// objet a partir de ces trois-la. Tout champ ajoute par l'offscreen etait donc
+// jete ICI, en silence : le destinataire ne voit pas la difference entre « le
+// champ n'a pas ete envoye » et « le champ a ete perdu en route ».
+//
+// C'est arrive : `finAudioStable` -- le repere du mode « stable seulement » --
+// etait produit par l'offscreen et attendu par content.js, mais n'a jamais
+// traverse. content.js retombait sur `finAudioStable || finAudio`, donc rien ne
+// plantait, rien ne s'affichait de travers : seule la mesure d'age du mode
+// stable etait fausse d'une cadence, dans une ligne de console. Un repli qui
+// marche est exactement ce qui rend ce genre de perte invisible.
+//
+// Les instants des mots (`rubanInstants`, `provisoireInstants`) prenaient le
+// meme chemin et auraient disparu pareil.
+async function sendFlux(flux) {
   const { active, tabId } = await readState();
   if (!active || !tabId) return; // capture arretee entre-temps
 
   try {
-    // finAudio voyage jusqu'a content.js, qui mesure l'AGE du mot le plus
-    // recent au moment ou il l'affiche vraiment.
-    await chrome.tabs.sendMessage(tabId, { type: "FLUX", ruban, provisoire, finAudio });
+    // Tel quel : `ruban`, `provisoire`, les instants de chaque mot, et les deux
+    // reperes temporels. content.js mesure l'AGE du mot le plus recent au
+    // moment ou il l'affiche vraiment, et affichera chaque mot a son heure.
+    await chrome.tabs.sendMessage(tabId, flux);
   } catch (err) {
     console.warn("⚠️ Flux non affiche (content.js injoignable) :", err.message);
   }
@@ -501,7 +520,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Flux de texte de l'offscreen -> overlay de l'onglet capture.
   if (request.type === "FLUX") {
-    sendFlux(request.ruban, request.provisoire, request.finAudio);
+    sendFlux(request);
     return; // pas de reponse attendue
   }
 
