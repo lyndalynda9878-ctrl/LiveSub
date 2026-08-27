@@ -1742,3 +1742,649 @@ function analyseVolume(analyser) {
 
   updateLevel();
 }
+
+
+// ===========================================================================
+// MODE « PREPARER D'ABORD » — etape A : constituer le stock, en silence
+// ===========================================================================
+//
+// Un mode a COTE du direct, pas une variante du direct. Rien de ce qui suit ne
+// touche a une seule variable du moteur en flux : ni `fenetre`, ni `rubanMots`,
+// ni `audioContext`, ni `whisperWorker`. Tout ce qui appartient a la
+// preparation porte le prefixe `prep`, y compris son propre worker Whisper et
+// son propre AudioContext. Les deux modes ne tournent jamais ensemble (le
+// service worker refuse de demarrer l'un si l'autre est actif), mais s'ils se
+// croisaient, ils ne se marcheraient pas dessus.
+//
+// ⚠️ CE FICHIER NE TOUCHE JAMAIS chrome.storage. Regle de CLAUDE.md, verifiee
+// dans Chrome : `chrome.storage` est INDEFINI dans un document offscreen, et la
+// ligne qui l'appelle tue tout le fichier au chargement -- sans erreur visible,
+// le bouton Demarrer cesse simplement de repondre. Langue, backend et position
+// de depart arrivent donc par message, comme tout le reste.
+//
+// Ce qu'on fait ici, et rien de plus : capter le son de l'onglet qui defile en
+// accelere, le ramener a sa vitesse normale, le decouper en blocs de 30 s de
+// CONTENU, les transcrire, et garder les { mot, instant } en memoire.
+// L'affichage pendant la lecture, c'est l'etape B.
+
+// Vitesse de defilement. Mesuree le 2026-08-27 : a x2 le texte reste identique
+// a 98,6 % (EN) et 94,9 % (FR) de celui obtenu a x1, et le signal restitue
+// correle a r = 1,00 avec l'original.
+const PREP_VITESSE = 2;
+
+// Taille d'un bloc, en secondes de CONTENU (pas de temps d'horloge).
+//
+// ⚠️ 15 ET PAS 30, ET C'EST UN RENONCEMENT SUBI, PAS UN CHOIX.
+//
+// Cote VITESSE, 30 s est nettement meilleur : Whisper complete tout extrait a
+// 30 s avant de le traiter, donc un bloc de 15 s paie du silence de
+// remplissage. Mesure du 2026-08-27, memes fragments, worker unique, tailles
+// alternees :
+//   15 s -> 6,15 s par bloc, soit 2,44x le temps reel
+//   30 s -> 7,15 s par bloc, soit 4,20x le temps reel  (+16 % de temps pour 2x
+//                                                       plus de contenu)
+//
+// Sauf que whisper.worker.js impose `max_new_tokens: MAX_JETONS` avec
+// MAX_JETONS = 60 -- une valeur dimensionnee pour les segments de 7 s de
+// l'ancien decoupage (« ~20 a 25 mots », dit son commentaire). Un bloc de 30 s
+// de parole continue depasse ce quota et le texte est COUPE EN PLEIN MILIEU.
+//
+// Mesure directe du meme jour, extrait de parole continue, worker de production :
+//   bloc de 15 s -> dernier mot a 14,86 s, soit 99 % du bloc couvert
+//   bloc de 30 s -> dernier mot a 25,82 s, soit 86 % -- 14 % de perdus
+// Et le premier run complet le confirme : 46,9 mots par bloc de 30 s, soit
+// exactement le plafond de 60 jetons.
+//
+// Lever ce plafond demanderait de modifier whisper.worker.js, ce que la tache
+// interdit. On reste donc a 15 s, ou rien n'est perdu. Le prix est la vitesse :
+// 2,44x le temps reel au lieu de 4,20x. A x2 il faut tenir au-dessus de 2x,
+// donc ca passe -- mais sans marge, et la preparation peut finir un peu apres
+// la video sur une machine lente (rien n'est perdu pour autant : la file est
+// videe a l'arret).
+const PREP_BLOC_CONTENU = 15;
+
+// Ce que Whisper attend.
+const PREP_TAUX = 16000;
+
+// En dessous de ca, un reste de fin n'est pas transcrit : sur moins d'une
+// seconde whisper-tiny n'ecoute plus, il recite (voir CLAUDE.md).
+const PREP_RESTE_MIN_CONTENU = 1.0;
+
+let prepActif = false;
+let prepContext = null;
+let prepStream = null;
+let prepSource = null;
+let prepNoeud = null;
+let prepTauxCapture = 48000;
+
+let prepWorker = null;
+let prepWorkerPret = false;
+let prepAttentes = new Map();
+let prepProchainId = 1;
+
+let prepLangue = "french";
+
+// Position de la video au moment ou elle a commence a defiler, en secondes.
+// Elle arrive APRES le demarrage de la capture (le service worker ne la connait
+// qu'une fois content.js reellement lance) -- d'ou le drapeau ci-dessous.
+let prepPositionDepart = 0;
+let prepDepartConfirme = false;
+
+// Le son capte, en attente de decoupage. Au taux de la CAPTURE (48 kHz), pas
+// encore ramene a la vitesse normale.
+let prepBlocs = [];
+let prepEnAttente = 0;   // echantillons dans prepBlocs
+let prepConsommes = 0;   // echantillons deja partis vers Whisper
+let prepArretDemande = false;
+let prepPompeEnCours = null;
+
+// Le stock. C'est TOUT ce qu'on garde : un mot, et la seconde de la video ou il
+// a ete prononce. Rien sur le disque (regle de l'enonce).
+let prepMots = [];
+
+// Temoin de seance : le temps de chaque bloc. Si le dernier a derive de plus de
+// 15 % du premier, la machine s'est fatiguee pendant la mesure et les chiffres
+// ne valent plus rien (memoire `mesures-whisper-seance-usee`).
+let prepTemoins = [];
+
+// Combien de blocs ont probablement ete coupes par le quota de jetons.
+let prepBlocsTronques = 0;
+
+function prepStatut(texte) {
+  console.log("💬 Preparation :", texte);
+  chrome.runtime.sendMessage({ type: "PREPARATION_STATUT", texte }).catch(() => {});
+}
+
+function prepReinitialiser() {
+  prepBlocs = [];
+  prepEnAttente = 0;
+  prepConsommes = 0;
+  prepMots = [];
+  prepTemoins = [];
+  prepBlocsTronques = 0;
+  prepArretDemande = false;
+  prepDepartConfirme = false;
+  prepPositionDepart = 0;
+  prepAttentes.clear();
+}
+
+// Combien d'echantillons de capture font un bloc.
+// A x2, 30 s de contenu tiennent dans 15 s d'horloge : c'est bien la vitesse
+// qui divise, pas qui multiplie.
+function prepEchantillonsParBloc() {
+  return Math.round((PREP_BLOC_CONTENU * prepTauxCapture) / PREP_VITESSE);
+}
+
+function prepSecondesContenu(echantillons) {
+  return (echantillons / prepTauxCapture) * PREP_VITESSE;
+}
+
+// ---------------------------------------------------------------------------
+// Le worker Whisper de la preparation (le sien, pas celui du direct)
+// ---------------------------------------------------------------------------
+
+function prepDemarrerWhisper(memo) {
+  if (prepWorker) return;
+  console.log("⏳ Preparation : chargement du modele...");
+  prepWorker = new Worker(chrome.runtime.getURL("whisper.worker.js"), { type: "module" });
+
+  prepWorker.onmessage = (evenement) => {
+    const m = evenement.data;
+    switch (m.type) {
+      case "ready":
+        prepWorkerPret = true;
+        console.log(`✅ Preparation : Whisper pret sur ${m.backend}`);
+        // Meme chemin que le direct : c'est le service worker qui range le
+        // verdict, l'offscreen n'a pas acces a chrome.storage.
+        chrome.runtime
+          .sendMessage({ type: "WHISPER_BACKEND", backend: m.backend, signature: m.signature })
+          .catch(() => {});
+        prepLancerPompe();
+        break;
+      case "progress":
+        prepStatut(`⬇️ Téléchargement du modèle : ${Math.round(m.pourcent)} %`);
+        break;
+      case "info":
+        console.log("ℹ️  Preparation :", m.message);
+        break;
+      case "result": {
+        const a = prepAttentes.get(m.id);
+        prepAttentes.delete(m.id);
+        if (a) a.resolve(m);
+        break;
+      }
+      case "error": {
+        const cle = m.id == null ? "init" : m.id;
+        const a = prepAttentes.get(cle);
+        prepAttentes.delete(cle);
+        if (a) a.reject(new Error(m.message));
+        else console.error("❌ Preparation, Whisper :", m.message);
+        break;
+      }
+    }
+  };
+
+  prepWorker.onerror = (evenement) => {
+    const err = new Error(evenement.message || "erreur inconnue dans le worker");
+    for (const a of prepAttentes.values()) a.reject(err);
+    prepAttentes.clear();
+    console.error("❌ Preparation, worker :", err.message);
+  };
+
+  prepWorker.postMessage({ type: "init", memo: memo ?? null });
+}
+
+function prepTranscrire(audio) {
+  const id = prepProchainId++;
+  const promesse = new Promise((resolve, reject) => {
+    prepAttentes.set(id, { resolve, reject });
+  });
+  prepWorker.postMessage({ type: "transcribe", id, audio, langue: prepLangue }, [audio.buffer]);
+  return promesse;
+}
+
+// ---------------------------------------------------------------------------
+// Ramener le son a sa vitesse normale
+// ---------------------------------------------------------------------------
+//
+// ⚠️ LE PIEGE, ET IL SE TROMPE DANS LE BON SENS SI ON N'Y PREND PAS GARDE.
+// Le reflexe « x2 -> doubler le taux » (declarer 96 kHz) ACCELERE encore au
+// lieu de ralentir. Verifie au test a blanc du 2026-08-27 : 6 s de contenu
+// revenaient a 1,71 s.
+//
+// Un buffer declare a un taux PLUS BAS est interprete comme durant plus
+// longtemps, donc joue plus lentement. Pour defaire un x2, on declare donc la
+// MOITIE du taux de capture : 48 000 / 2 = 24 000 Hz.
+//
+// Le reechantillonnage lui-meme est confie a OfflineAudioContext, c'est-a-dire
+// au resampler de Chrome : on ne veut pas mesurer la qualite d'une
+// interpolation ecrite a la main.
+async function prepReechantillonner(brut) {
+  const tauxDeclare = prepTauxCapture / PREP_VITESSE; // 24 000, PAS 96 000
+  const longueur = Math.max(1, Math.floor((brut.length * PREP_TAUX) / tauxDeclare));
+  const hors = new OfflineAudioContext(1, longueur, PREP_TAUX);
+  const tampon = new AudioBuffer({
+    length: brut.length,
+    sampleRate: tauxDeclare,
+    numberOfChannels: 1,
+  });
+  tampon.copyToChannel(brut, 0);
+  const source = hors.createBufferSource();
+  source.buffer = tampon;
+  source.connect(hors.destination);
+  source.start();
+  const rendu = await hors.startRendering();
+  return new Float32Array(rendu.getChannelData(0));
+}
+
+// ---------------------------------------------------------------------------
+// La pompe : un bloc plein -> une inference, une a la fois
+// ---------------------------------------------------------------------------
+
+function prepPrendre(taille) {
+  const sortie = new Float32Array(taille);
+  let ecrit = 0;
+  while (ecrit < taille && prepBlocs.length) {
+    const tete = prepBlocs[0];
+    const reste = taille - ecrit;
+    if (tete.length <= reste) {
+      sortie.set(tete, ecrit);
+      ecrit += tete.length;
+      prepBlocs.shift();
+    } else {
+      sortie.set(tete.subarray(0, reste), ecrit);
+      prepBlocs[0] = tete.subarray(reste);
+      ecrit += reste;
+    }
+  }
+  prepEnAttente -= ecrit;
+  return ecrit === taille ? sortie : sortie.subarray(0, ecrit);
+}
+
+// Les { mot, instant } d'un bloc, en secondes de VIDEO.
+//
+// `debut` sort de Whisper en secondes depuis le debut du bloc. On y ajoute la
+// position de depart de la video et tout le contenu deja consomme.
+function prepMotsDuBloc(morceaux, offsetContenu, dureeBloc) {
+  // recollerMots() est la fonction du moteur en flux, reutilisee telle quelle :
+  // un « mot » de Whisper n'est pas un mot typographique (« J'adore, » arrive
+  // en deux morceaux, « J » puis « 'adore, »), et c'est l'espace qui precede
+  // qui distingue les deux cas.
+  const recolles = recollerMots(morceaux || []);
+  const sortie = [];
+  let precedent = 0;
+
+  for (const recolle of recolles) {
+    let t = recolle.debut;
+    if (t == null || !Number.isFinite(t)) t = precedent;
+
+    // ⚠️ Whisper complete tout extrait a 30 s : sur un bloc plus court, ou en
+    // fin de video, l'alignement place parfois des mots DANS le silence de
+    // remplissage -- mesure a +7,4 s au-dela de la fin. Un mot date apres la
+    // fin du bloc serait attribue au bloc suivant et desynchroniserait tout.
+    if (t < 0) t = 0;
+    if (t > dureeBloc) t = dureeBloc;
+    if (t < precedent) t = precedent; // jamais en arriere
+    precedent = t;
+
+    sortie.push({
+      mot: recolle.mot,
+      instant: Number((prepPositionDepart + offsetContenu + t).toFixed(3)),
+    });
+  }
+  return sortie;
+}
+
+async function prepTraiterBloc(taille) {
+  const brut = prepPrendre(taille);
+  if (!brut.length) return;
+
+  // L'offset se calcule AVANT d'incrementer : c'est la position, dans le
+  // contenu, du premier echantillon de ce bloc.
+  const offsetContenu = prepSecondesContenu(prepConsommes);
+  prepConsommes += brut.length;
+  const dureeBloc = prepSecondesContenu(brut.length);
+
+  const audio = await prepReechantillonner(brut);
+
+  const debut = performance.now();
+  const resultat = await prepTranscrire(audio);
+  const ms = Math.round(performance.now() - debut);
+  prepTemoins.push(ms);
+
+  const nouveaux = prepMotsDuBloc(resultat.mots, offsetContenu, dureeBloc);
+  prepMots.push(...nouveaux);
+
+  // ⚠️ DETECTEUR DE TRONCATURE — pour qu'une perte de texte ne soit JAMAIS muette.
+  //
+  // `max_new_tokens` coupe la sortie de Whisper sans rien signaler : le bloc
+  // rend un texte parfaitement credible, simplement plus court que l'audio.
+  // Rien dans le resultat ne dit « j'ai ete coupe ». Le seul indice est que le
+  // dernier mot date d'AVANT la fin du bloc alors qu'on parlait encore.
+  //
+  // Un bloc qui se termine par du silence declenche le meme signal, d'ou la
+  // condition sur le nombre de morceaux : peu de mots = vrai silence, beaucoup
+  // de mots = quota atteint.
+  const morceaux = Array.isArray(resultat.mots) ? resultat.mots.length : 0;
+  const dernier = nouveaux.length ? nouveaux[nouveaux.length - 1].instant - prepPositionDepart - offsetContenu : 0;
+  const couvert = dureeBloc > 0 ? dernier / dureeBloc : 1;
+  if (couvert < 0.9 && morceaux >= 30) {
+    console.warn(
+      `⚠️ Preparation : bloc ${prepTemoins.length} probablement TRONQUE — ` +
+        `${morceaux} morceaux, dernier mot a ${dernier.toFixed(1)} s sur ${dureeBloc.toFixed(1)} s ` +
+        `(${Math.round(couvert * 100)} % couvert). Plafond max_new_tokens de whisper.worker.js ?`
+    );
+    prepBlocsTronques++;
+    prepStatut(`⚠️ Texte tronqué sur ${prepBlocsTronques} bloc(s) : parole trop dense`);
+  }
+
+  console.log(
+    `📦 Preparation : bloc ${prepTemoins.length} — ` +
+      `${dureeBloc.toFixed(1)} s de contenu a partir de ${(prepPositionDepart + offsetContenu).toFixed(1)} s, ` +
+      `${nouveaux.length} mots, ${ms} ms ` +
+      `(${(dureeBloc / (ms / 1000)).toFixed(2)}x le temps reel)`
+  );
+
+  // Aucun filtre anti-hallucination ici, et c'est deliberé : un filtre qui
+  // jette un bloc de 30 s rendrait faux le seul controle simple dont on
+  // dispose -- le nombre de mots rapporte a la duree. On garde tout, quitte a
+  // voir le probleme, plutot que de le masquer.
+}
+
+function prepPeutTraiter() {
+  if (!prepWorkerPret) return 0;
+  const besoin = prepEchantillonsParBloc();
+  if (prepEnAttente >= besoin) return besoin;
+  // A l'arret, on transcrit le reste meme s'il est incomplet.
+  if (prepArretDemande) {
+    const minimum = Math.round((PREP_RESTE_MIN_CONTENU * prepTauxCapture) / PREP_VITESSE);
+    if (prepEnAttente >= minimum) return prepEnAttente;
+  }
+  return 0;
+}
+
+// Une seule inference en vol, comme dans le moteur en flux -- mais ici on ne
+// jette RIEN : ce qui arrive pendant le calcul attend son tour. La preparation
+// tourne a 4,2x le temps reel pour un contenu qui arrive a 2x : la file se
+// vide plus vite qu'elle ne se remplit, elle ne peut pas diverger.
+function prepLancerPompe() {
+  if (prepPompeEnCours) return prepPompeEnCours;
+
+  const promesse = (async () => {
+    // ⚠️ CE PREMIER `await` N'EST PAS DECORATIF, ET SON ABSENCE A COUTE UN RUN.
+    //
+    // Le corps d'une fonction async s'execute EN SYNCHRONE jusqu'au premier
+    // await. Quand il n'y a rien a traiter, la boucle ci-dessous ne s'execute
+    // pas : sans ce `await`, tout le corps -- `finally` compris -- se deroulait
+    // avant que `prepPompeEnCours = promesse` ait eu lieu. Le `finally` remettait
+    // donc la variable a null AVANT l'affectation, et celle-ci la laissait
+    // ensuite pointer pour toujours sur une promesse DEJA RESOLUE.
+    //
+    // Consequence observee : la toute premiere sollicitation de la pompe tombe
+    // sur une file vide (l'audio n'est pas encore arrive), la pompe meurt la, et
+    // plus AUCUN bloc n'est jamais transcrit ensuite -- sans erreur, sans trace,
+    // avec une barre de progression qui avance normalement jusqu'au bout.
+    // Puis `prepViderFile` bouclait a vide et gelait le document offscreen.
+    await Promise.resolve();
+
+    try {
+      let taille;
+      while ((taille = prepPeutTraiter()) > 0) {
+        await prepTraiterBloc(taille);
+      }
+    } catch (err) {
+      console.error("❌ Preparation : bloc abandonne —", err && err.message ? err.message : err);
+      prepStatut("⚠️ Un bloc n'a pas pu être transcrit : " + (err && err.message ? err.message : err));
+    } finally {
+      prepPompeEnCours = null;
+    }
+  })();
+
+  prepPompeEnCours = promesse;
+  return promesse;
+}
+
+async function prepViderFile() {
+  // La pompe s'arrete quand il ne reste pas de quoi faire un bloc ; a l'arret
+  // le critere change, donc on relance tant qu'elle a de quoi travailler.
+  //
+  // ⚠️ ET ON VERIFIE QU'ELLE AVANCE. Une boucle `while (true)` dont le corps
+  // n'attend rien de reel ne rend jamais la main a l'evenementiel : le document
+  // offscreen cesse de repondre aux messages, donc le service worker attend sa
+  // reponse indefiniment, la popup reste figee, et le lecteur de la page reste
+  // a x2. Un blocage parfaitement muet -- exactement ce que ce projet s'interdit.
+  while (true) {
+    const restantAvant = prepEnAttente;
+    await prepLancerPompe();
+    if (prepPeutTraiter() === 0) return;
+    if (prepEnAttente >= restantAvant) {
+      console.warn(
+        `⚠️ Preparation : la file n'avance plus (${prepEnAttente} echantillons restants), on s'arrete la`
+      );
+      return;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Demarrage / arret
+// ---------------------------------------------------------------------------
+
+async function demarrerPreparation(options) {
+  if (prepActif) {
+    console.log("ℹ️ Preparation deja en cours");
+    return { success: true, deja: true };
+  }
+
+  prepReinitialiser();
+  prepLangue = options.langue || "french";
+
+  // Whisper d'abord : le modele met du temps a charger (jusqu'a une minute au
+  // tout premier lancement), autant qu'il commence pendant qu'on branche
+  // l'audio. Rien ne sera transcrit avant `ready` de toute facon.
+  prepDemarrerWhisper(options.memoBackend);
+
+  prepStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      mandatory: {
+        chromeMediaSource: "tab",
+        chromeMediaSourceId: options.streamId,
+      },
+    },
+  });
+
+  prepContext = new AudioContext();
+  if (prepContext.state === "suspended") await prepContext.resume();
+  prepTauxCapture = prepContext.sampleRate;
+  console.log("🎛️ Preparation : AudioContext a", prepTauxCapture, "Hz");
+
+  await prepContext.audioWorklet.addModule(chrome.runtime.getURL("preparation.worklet.js"));
+
+  prepSource = prepContext.createMediaStreamSource(prepStream);
+  prepNoeud = new AudioWorkletNode(prepContext, "enregistreur-preparation", {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+  });
+  prepSource.connect(prepNoeud);
+
+  // ⚠️ ET C'EST TOUT. Aucun `connect(prepContext.destination)`, aucun
+  // MediaStreamAudioDestinationNode, aucun `new Audio()`. C'est ce qui rend la
+  // preparation SILENCIEUSE : le son de l'onglet est deja coupe par
+  // tabCapture, et rien ici ne le renvoie vers les haut-parleurs.
+  //
+  // Verifie le 2026-08-27 : un AudioWorklet non relie a une destination recoit
+  // quand meme 20,01 s de son sur 20 s (rms 0,131, max 0,863), soit autant que
+  // le temoin cable sur la sortie. Le graphe est bien execute.
+
+  prepNoeud.port.onmessage = (evenement) => {
+    const m = evenement.data;
+    if (m.type !== "audio") return;
+
+    // Tant que la position de depart n'est pas connue, on JETTE : ce son-la est
+    // celui d'avant le passage en accelere (video encore a x1, ou a l'arret).
+    // Le garder decalerait tous les instants du stock.
+    if (!prepDepartConfirme) return;
+
+    prepBlocs.push(m.bloc);
+    prepEnAttente += m.bloc.length;
+    prepLancerPompe();
+  };
+
+  prepActif = true;
+  console.log("✅ Preparation : capture silencieuse demarree");
+  return { success: true };
+}
+
+async function arreterPreparation() {
+  if (!prepActif) {
+    return { success: true, ...prepResume() };
+  }
+
+  console.log("⏸️ Preparation : arret");
+  prepArretDemande = true;
+
+  // 1. Demander au worklet de rendre son tampon, puis debrancher la source :
+  //    plus rien n'arrive apres ce point.
+  try {
+    prepNoeud.port.postMessage("stop");
+  } catch (err) {
+    console.warn("Preparation : worklet deja arrete");
+  }
+  await new Promise((r) => setTimeout(r, 250));
+
+  try {
+    prepSource.disconnect();
+    prepNoeud.disconnect();
+  } catch (err) {
+    console.warn("Preparation : noeuds deja debranches");
+  }
+
+  if (prepStream) {
+    prepStream.getTracks().forEach((piste) => {
+      piste.stop();
+      piste.enabled = false;
+    });
+    prepStream = null;
+  }
+
+  // 2. Transcrire ce qui reste AVANT de fermer : la fin de la video est
+  //    justement le morceau qu'on perdrait sans ca.
+  try {
+    await prepViderFile();
+  } catch (err) {
+    console.error("❌ Preparation : fin de file en echec —", err);
+  }
+
+  // 3. Fermer.
+  if (prepContext) {
+    prepContext.close().catch(() => {});
+    prepContext = null;
+  }
+  prepSource = null;
+  prepNoeud = null;
+  prepActif = false;
+
+  const resume = prepResume();
+  console.log(
+    `✅ Preparation terminee : ${resume.nbMots} mots, ` +
+      `${resume.dureeCouverteS.toFixed(1)} s couvertes, ` +
+      `${resume.motsParSeconde.toFixed(2)} mots/s`
+  );
+  return { success: true, ...resume };
+}
+
+// Ce que le service worker et l'overlay ont besoin de savoir. Le stock lui-meme
+// (prepMots) RESTE ICI, en memoire : c'est l'etape B qui viendra le chercher.
+function prepResume() {
+  const dureeCouverteS = prepSecondesContenu(prepConsommes);
+  const premier = prepTemoins.length ? prepTemoins[0] : null;
+  const dernier = prepTemoins.length ? prepTemoins[prepTemoins.length - 1] : null;
+  const derive = premier && dernier ? Math.round(((dernier - premier) / premier) * 100) : null;
+
+  return {
+    nbMots: prepMots.length,
+    dureeCouverteS,
+    positionDepart: prepPositionDepart,
+    motsParSeconde: dureeCouverteS > 0 ? prepMots.length / dureeCouverteS : 0,
+    nbBlocs: prepTemoins.length,
+    blocsTronques: prepBlocsTronques,
+    // Contre-preuve : si la capture ne recevait rien, cette liste serait vide.
+    premiersMots: prepMots.slice(0, 30),
+    // Temoin de seance : au-dela de 15 % de derive, la mesure est a jeter.
+    temoins: { premierMs: premier, dernierMs: dernier, derivePourcent: derive, tous: prepTemoins },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Messages — un listener A PART
+// ---------------------------------------------------------------------------
+//
+// Un second addListener plutot que des branches ajoutees dans le premier : le
+// listener du mode direct n'est pas touche d'une ligne. Chrome livre le message
+// aux deux, et comme les types ne se recouvrent pas, un seul repond.
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "START_PREPARATION") {
+    demarrerPreparation(request)
+      .then(sendResponse)
+      // ⚠️ Meme regle que pour START_CAPTURE : tout `return true` doit avoir un
+      // catch qui REPOND. Sans lui, une erreur laisse le service worker en
+      // attente indefinie et le bouton ne repond plus, sans le moindre message.
+      .catch((err) => {
+        console.error("❌ demarrerPreparation a rejete :", err);
+        prepActif = false;
+        sendResponse({
+          success: false,
+          error: "La capture silencieuse a echoue : " + (err && err.message ? err.message : err),
+        });
+      });
+    return true;
+  }
+
+  // La position de depart de la video, envoyee une fois que content.js a
+  // reellement lance le defilement. Elle debloque l'enregistrement.
+  if (request.type === "PREPARATION_POSITION") {
+    prepPositionDepart = Number(request.position) || 0;
+    prepDepartConfirme = true;
+    console.log("📍 Preparation : depart a", prepPositionDepart.toFixed(2), "s");
+    sendResponse({ success: true });
+    return;
+  }
+
+  if (request.type === "STOP_PREPARATION") {
+    arreterPreparation()
+      .then(sendResponse)
+      .catch((err) => {
+        console.error("❌ arreterPreparation a rejete :", err);
+        sendResponse({ success: false, error: String((err && err.message) || err) });
+      });
+    return true;
+  }
+
+  // Lecture du stock, pour verification (et, plus tard, pour l'etape B).
+  if (request.type === "PREPARATION_RESUME") {
+    sendResponse({ success: true, ...prepResume() });
+    return;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Etape B : livrer le stock a content.js
+// ---------------------------------------------------------------------------
+//
+// `prepResume` ne rend que les 30 premiers mots -- c'est un resume, fait pour
+// tenir dans une console. L'affichage pendant la lecture a besoin de TOUT, plus
+// les bornes de la zone preparee (c'est elle, et pas l'instant du dernier mot,
+// qui dit jusqu'ou l'affichage peut promettre quelque chose : une fin de video
+// silencieuse est preparee sans porter un seul mot).
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "PREPARATION_STOCK_OFFSCREEN") {
+    sendResponse({
+      success: true,
+      mots: prepMots,
+      positionDepart: prepPositionDepart,
+      dureeCouverteS: prepSecondesContenu(prepConsommes),
+    });
+    return;
+  }
+});

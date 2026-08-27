@@ -290,3 +290,174 @@ chargerLangue();
 // La case doit etre lue AVANT le retard : afficherInfoRetard s'en sert pour
 // choisir laquelle des deux valeurs calibrees elle annonce.
 chargerProvisoire().then(chargerRetard);
+
+
+// ===========================================================================
+// MODE « PREPARER D'ABORD » — etape A
+// ===========================================================================
+//
+// Le mode direct n'est pas touche d'une ligne : son bouton, son listener et sa
+// fonction updateUI restent exactement ce qu'ils etaient. La preparation a son
+// PROPRE bouton (#prepBtn) et son propre statut (#prepStatus) ; le selecteur de
+// mode ne fait que montrer l'un ou l'autre.
+//
+// Pourquoi deux boutons plutot qu'un bouton qui change de sens : parce qu'un
+// seul bouton aurait oblige a mettre une condition dans le gestionnaire de clic
+// du direct, et donc a le modifier. Deux boutons, deux chemins, aucun risque de
+// casser ce qui marche.
+
+const CLE_MODE = "modeLiveSub";
+const MODE_DEFAUT = "direct";
+
+const modeSelect = document.getElementById("mode");
+const prepBtn = document.getElementById("prepBtn");
+const prepStatus = document.getElementById("prepStatus");
+
+// Les reglages qui n'ont aucun sens pendant une preparation : le son est coupe
+// (donc rien a retarder) et rien ne s'affiche encore mot a mot. On les cache
+// plutot que de les laisser mentir.
+const reglagesDuDirect = [
+  document.querySelector('label[for="retardAudio"]'),
+  document.getElementById("retardAudio"),
+  document.getElementById("retardInfo"),
+  document.querySelector(".option"),
+];
+
+// prepCharger() est asynchrone : sans ca, les deux boutons seraient visibles
+// pendant un instant a chaque ouverture de la popup.
+prepBtn.style.display = "none";
+prepStatus.style.display = "none";
+
+let prepActif = false;
+let prepMessage = null;
+
+function prepSetStatus(texte, couleur) {
+  prepStatus.textContent = texte;
+  prepStatus.style.color = couleur;
+  prepStatus.title = texte;
+}
+
+function prepMajUI() {
+  const enPreparation = modeSelect.value === "preparer";
+
+  toggleBtn.style.display = enPreparation ? "none" : "";
+  statusDiv.style.display = enPreparation ? "none" : "";
+  prepBtn.style.display = enPreparation ? "" : "none";
+  prepStatus.style.display = enPreparation ? "" : "none";
+  for (const el of reglagesDuDirect) {
+    if (el) el.style.display = enPreparation ? "none" : "";
+  }
+
+  // On ne change pas de mode en cours de route : les deux se disputeraient le
+  // meme onglet et la meme capture.
+  modeSelect.disabled = prepActif || isActive;
+
+  if (!enPreparation) return;
+
+  prepBtn.disabled = false;
+  prepBtn.textContent = prepActif ? "⏹️ Arreter la preparation" : "⏩ Preparer";
+  prepBtn.className = prepActif ? "stop" : "";
+
+  if (prepMessage) {
+    prepSetStatus(prepMessage.texte, prepMessage.couleur);
+  } else if (prepActif) {
+    prepSetStatus("⏳ Preparation en cours — voir la video", "#4f46e5");
+  } else {
+    prepSetStatus("⏸️ Pret a preparer", "#666");
+  }
+}
+
+// Applique la reponse du background. Comme pour le direct : c'est LUI qui dit
+// ce qui se passe vraiment, la popup n'affiche jamais une supposition.
+function prepAppliquerEtat(reponse) {
+  prepActif = Boolean(reponse && reponse.active);
+
+  if (reponse && reponse.error) {
+    prepMessage = { texte: "❌ " + reponse.error, couleur: "#dc2626" };
+  } else if (reponse && reponse.resume && typeof reponse.resume.nbMots === "number") {
+    const r = reponse.resume;
+    const minutes = Math.floor(r.dureeCouverteS / 60);
+    const secondes = Math.round(r.dureeCouverteS % 60);
+    prepMessage = {
+      texte: `✅ Pret — ${r.nbMots} mots, ${minutes} min ${String(secondes).padStart(2, "0")} s couvertes`,
+      couleur: "#0f9d63",
+    };
+  } else if (prepActif) {
+    prepMessage = null;
+  } else {
+    prepMessage = { texte: "⏹️ Preparation arretee", couleur: "#666" };
+  }
+
+  prepMajUI();
+}
+
+modeSelect.addEventListener("change", async () => {
+  prepMessage = null;
+  try {
+    await chrome.storage.local.set({ [CLE_MODE]: modeSelect.value });
+  } catch (err) {
+    console.warn("Mode non memorise :", err);
+  }
+  prepMajUI();
+});
+
+prepBtn.addEventListener("click", async () => {
+  const voulu = !prepActif;
+  prepMessage = null;
+  prepBtn.disabled = true;
+  prepSetStatus(voulu ? "⏳ Demarrage..." : "⏳ Arret...", "#666");
+
+  try {
+    prepAppliquerEtat(
+      await chrome.runtime.sendMessage({
+        type: voulu ? "PREPARATION_DEMARRER" : "PREPARATION_ARRETER",
+      })
+    );
+  } catch (err) {
+    prepMessage = { texte: "❌ Echec : " + (err.message || err), couleur: "#dc2626" };
+    prepActif = false;
+    prepMajUI();
+  }
+});
+
+async function prepCharger() {
+  try {
+    const range = await chrome.storage.local.get(CLE_MODE);
+    modeSelect.value = range[CLE_MODE] || MODE_DEFAUT;
+  } catch (err) {
+    modeSelect.value = MODE_DEFAUT;
+  }
+
+  try {
+    const etat = await chrome.runtime.sendMessage({ type: "PREPARATION_ETAT" });
+    prepActif = Boolean(etat && etat.active);
+  } catch (err) {
+    prepActif = false;
+  }
+
+  prepMajUI();
+}
+
+// La preparation se termine toute seule a la fin de la video, peut-etre pendant
+// que la popup est ouverte : on se resynchronise sans attendre un clic.
+chrome.storage.session.onChanged.addListener((changes) => {
+  // Le direct vient de demarrer ou de s'arreter : le selecteur de mode doit se
+  // verrouiller ou se deverrouiller avec lui.
+  if (changes.captureState) prepMajUI();
+
+  const change = changes.preparationState;
+  if (!change) return;
+  const etaitActif = prepActif;
+  prepActif = Boolean(change.newValue && change.newValue.active);
+  // Une preparation qui vient de se terminer : on va chercher le bilan.
+  if (etaitActif && !prepActif) {
+    chrome.runtime
+      .sendMessage({ type: "PREPARATION_STOCK" })
+      .then((resume) => prepAppliquerEtat({ active: false, resume }))
+      .catch(() => prepMajUI());
+    return;
+  }
+  prepMajUI();
+});
+
+prepCharger();

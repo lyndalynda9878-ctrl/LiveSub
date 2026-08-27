@@ -78,6 +78,15 @@
       color: #999;
       font-size: 11px;
     }
+    #prepStatus {
+      margin-top: 10px;
+      font-size: 12px;
+      text-align: center;
+      color: #666;
+      line-height: 1.35;
+      overflow-wrap: break-word;
+      min-height: 2.7em;
+    }
     #status {
       margin-top: 10px;
       font-size: 12px;
@@ -92,6 +101,20 @@
 </head>
 <body>
   <h3>🎬 LiveSub</h3>
+
+  <!-- Un vrai mode d'usage, pas un reglage technique.
+       « Direct »            : ce que fait LiveSub depuis le debut -- on capte,
+                               on transcrit, les sous-titres suivent la parole
+                               avec quelques secondes de retard.
+       « Preparer d'abord »  : la video defile en accelere ET EN SILENCE, on
+                               constitue le stock de sous-titres, puis on la
+                               regarde. Rien ne s'affiche pendant la lecture
+                               pour l'instant : c'est l'etape suivante. -->
+  <label for="mode">Mode</label>
+  <select id="mode">
+    <option value="direct">Direct (sous-titres en temps reel)</option>
+    <option value="preparer">Preparer d'abord (defilement rapide, silencieux)</option>
+  </select>
 
   <!-- La `value` est le nom de langue attendu par Transformers.js (anglais,
        minuscule) ; le texte affiche est le nom natif, plus parlant pour qui
@@ -153,6 +176,9 @@
 
   <button id="toggleBtn">▶️ Demarrer</button>
   <div id="status">⏸️ Arrete</div>
+
+  <button id="prepBtn">⏩ Preparer</button>
+  <div id="prepStatus">⏸️ Pret a preparer</div>
   <script src="popup.js"></script>
 </body>
 </html>

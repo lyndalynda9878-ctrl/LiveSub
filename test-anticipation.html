@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>LiveSub — anticipation : x2 donne-t-il le meme texte que x1 ?</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 0 auto; padding: 24px;
+           max-width: 1100px; background: #f8f9fa; color: #111; }
+    h1 { color: #4f46e5; margin-bottom: 4px; font-size: 22px; }
+    .sous-titre { color: #666; margin-top: 0; font-size: 14px; }
+    button { padding: 10px 18px; font-size: 15px; font-weight: bold; border: none;
+             border-radius: 8px; background: #4f46e5; color: white; cursor: pointer; }
+    #etat { font-family: ui-monospace, monospace; color: #4f46e5; min-height: 1.4em;
+            margin: 12px 0; font-size: 13px; }
+    #journal { font-family: ui-monospace, monospace; font-size: 12px; background: #111;
+               color: #ddd; padding: 12px; border-radius: 8px; height: 420px;
+               overflow-y: auto; white-space: pre-wrap; line-height: 1.5; }
+    .err { color: #fca5a5; } .ok { color: #86efac; } .warn { color: #fcd34d; }
+  </style>
+</head>
+<body>
+  <h1>Anticipation : le son joue a x2 donne-t-il le meme texte qu'a x1 ?</h1>
+  <p class="sous-titre">
+    Page de MESURE uniquement. Elle ne modifie rien a l'extension : elle ouvre le
+    worker de production tel quel (whisper-tiny fp32, horodatage par mot).
+  </p>
+
+  <p><button id="go">Lancer la mesure x1 / x2</button></p>
+
+  <div id="etat"></div>
+  <div id="journal"></div>
+
+  <script src="test-anticipation.js"></script>
+</body>
+</html>

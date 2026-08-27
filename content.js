@@ -672,3 +672,807 @@ try {
 
 // Par défaut, l'overlay est caché
 toggleOverlay(false);
+
+
+// ===========================================================================
+// MODE « PREPARER D'ABORD » — etape A : piloter le lecteur de la page
+// ===========================================================================
+//
+// Un mode a COTE du direct. Rien ici ne touche a `motsCible`, `nbVisibles`,
+// `dernierFlux`, `premierTexteAffiche` ni a l'horloge des mots : ces deux
+// affichages ne tournent jamais en meme temps, et s'ils se croisaient ils ne
+// se marcheraient pas dessus. Tout ce qui appartient a la preparation porte le
+// prefixe `prep`.
+//
+// Ce fichier est le seul a pouvoir toucher la <video> : ni le service worker ni
+// le document offscreen n'ont acces au DOM de la page.
+//
+// ⚠️ Le contrat le plus important est celui de la RESTAURATION : on emprunte le
+// lecteur de quelqu'un d'autre. Position, vitesse, conservation de la hauteur
+// et etat de pause sont releves AVANT, et remis APRES, quoi qu'il arrive --
+// y compris si la preparation echoue en cours de route.
+
+const PREP_PAS_TICK = 500;      // rafraichissement de la progression
+const PREP_MARGE_FIN = 0.35;    // a moins de ca de la fin, on considere fini
+const PREP_RECALAGES_MAX = 3;   // combien de fois on re-impose la vitesse
+
+let prepVideo = null;
+let prepAvant = null;      // { position, vitesse, hauteur, enPause }
+let prepVitesseCible = 2;
+let prepTick = null;
+let prepEnCours = false;
+let prepFinSignalee = false;
+let prepRecalages = 0;
+let prepPositionMax = 0;   // la progression ne recule JAMAIS
+let prepVeille = null;     // filet de securite de la restauration
+
+// Combien de temps on accepte d'attendre l'ordre de restauration avant de
+// rendre le lecteur de nous-memes.
+//
+// ⚠️ CE FILET EXISTE PARCE QUE LE CAS S'EST PRODUIT. Un blocage cote offscreen
+// a empeche le service worker d'envoyer PREPARATION_RESTAURER : la video est
+// restee a x2, sur la page de l'utilisateur, sans le moindre message. On
+// emprunte le lecteur de quelqu'un d'autre -- le rendre ne doit dependre de
+// personne d'autre que nous.
+const PREP_VEILLE_MS = 60000;
+
+// Au-dela de ca sans que la position avance alors que la lecture est censee
+// tourner, on considere le lecteur perdu.
+const PREP_ENLISEMENT_MS = 20000;
+let prepDerniereProgression = { position: -1, quand: 0 };
+
+function prepFormaterDuree(secondes) {
+  if (!Number.isFinite(secondes) || secondes < 0) return "?";
+  const total = Math.round(secondes);
+  const min = Math.floor(total / 60);
+  const sec = total % 60;
+  if (min === 0) return `${sec} s`;
+  return `${min} min ${String(sec).padStart(2, "0")} s`;
+}
+
+// L'overlay de la preparation. Il utilise la meme boite que les sous-titres
+// mais n'appelle NI afficherStatut NI afficherFlux : ces deux-la ont leurs
+// propres regles (« un statut n'ecrase jamais du vrai texte »), qui n'ont rien
+// a voir avec ce qu'on fait ici.
+function prepAfficher(texte, discret) {
+  arreterHorloge();
+  subtitleBox.style.display = "block";
+  subtitleBox.style.opacity = discret ? "0.8" : "1";
+  subtitleBox.style.fontStyle = discret ? "italic" : "normal";
+  ligne.style.transform = "";
+  ligne.textContent = texte;
+}
+
+// La <video> a piloter.
+//
+// On prend la plus GRANDE de celles qui ont une duree : une page peut contenir
+// des vignettes animees, des pubs, des lecteurs caches. La plus grande a
+// l'ecran est celle que l'utilisateur regarde.
+//
+// ⚠️ content.js ne tourne que dans le cadre principal (pas de `all_frames` dans
+// le manifeste) : une video dans une iframe est INVISIBLE d'ici. C'est une
+// limite reelle, pas un oubli -- et elle donne un message clair plutot qu'un
+// silence.
+function prepTrouverVideo() {
+  const candidates = Array.from(document.querySelectorAll("video"));
+  if (!candidates.length) return null;
+
+  const notee = candidates
+    .map((v) => {
+      const r = v.getBoundingClientRect();
+      return { v, aire: Math.max(0, r.width) * Math.max(0, r.height), duree: v.duration };
+    })
+    // Une video sans duree connue n'est pas pilotable : on ne saurait ni ou on
+    // en est ni quand s'arreter.
+    .filter((c) => Number.isFinite(c.duree) && c.duree > 0)
+    .sort((a, b) => b.aire - a.aire);
+
+  return notee.length ? notee[0].v : null;
+}
+
+// La <video> COURANTE, re-resolue a chaque fois qu'on en a besoin.
+//
+// ⚠️ POURQUOI CETTE FONCTION EXISTE. La version precedente retenait l'element
+// une bonne fois pour toutes dans `prepVideo`. Sur YouTube, ca a donne un
+// blocage silencieux complet : le lecteur reconstruit sa source media en cours
+// de route, et la reference gardee devenait un element mort -- `duration` a
+// `null`, `readyState` a 0, position bloquee a 0. La progression se figeait,
+// la fin n'etait jamais detectee, et la preparation ne s'arretait plus jamais
+// (constate : 1176 s « couvertes » sur une video qui n'en compte que 1037).
+//
+// On re-resout donc, et on signale le remplacement au lieu de le subir.
+let prepVideoRemplacements = 0;
+
+function prepVideoResolue() {
+  const memorisee = prepVideo;
+
+  // L'element memorise est-il encore dans le document ET utilisable ?
+  const utilisable =
+    memorisee &&
+    memorisee.isConnected &&
+    Number.isFinite(memorisee.duration) &&
+    memorisee.duration > 0;
+  if (utilisable) return memorisee;
+
+  const neuve = prepTrouverVideo();
+  if (neuve && neuve !== memorisee) {
+    // On ne compte un REMPLACEMENT que si on etait deja branche sur un element.
+    // Le premier accrochage (memorisee = null, notamment apres la restauration
+    // qui remet la reference a zero) n'en est pas un -- le compter fausserait
+    // la seule preuve qu'on ait que la re-resolution sert a quelque chose.
+    if (memorisee) {
+      prepVideoRemplacements++;
+      console.warn(
+        `⚠️ LiveSub : la <video> a ete remplacee (${prepVideoRemplacements}), on se rebranche dessus`
+      );
+    }
+    prepVideo = neuve;
+    return neuve;
+  }
+
+  // Meme element, momentanement inutilisable (source en cours de
+  // reconstruction). On le rend quand meme : c'est a l'appelant de decider
+  // s'il attend ou s'il abandonne.
+  return neuve || memorisee || null;
+}
+
+function prepDecrireVideo() {
+  const v = prepTrouverVideo();
+  if (!v) {
+    return {
+      success: false,
+      erreur:
+        "Aucune vidéo lisible sur cette page. " +
+        "(Une vidéo dans un cadre intégré n'est pas visible depuis ici.)",
+    };
+  }
+  return { success: true, position: v.currentTime, duree: v.duration };
+}
+
+// ---------------------------------------------------------------------------
+// Piloter
+// ---------------------------------------------------------------------------
+
+async function prepPiloter(vitesse) {
+  const v = prepTrouverVideo();
+  if (!v) return prepDecrireVideo(); // renvoie le message d'erreur clair
+
+  prepVideo = v;
+  prepVitesseCible = vitesse || 2;
+  prepRecalages = 0;
+  prepFinSignalee = false;
+  prepPositionMax = v.currentTime;
+
+  // Ce qu'on emprunte, releve AVANT d'y toucher.
+  prepAvant = {
+    position: v.currentTime,
+    vitesse: v.playbackRate,
+    hauteur: v.preservesPitch !== undefined ? v.preservesPitch : null,
+    enPause: v.paused,
+  };
+  console.log("📌 Preparation : etat du lecteur avant —", JSON.stringify(prepAvant));
+
+  try {
+    // preservesPitch = false : on veut un simple reechantillonnage, pas un
+    // etirement temporel qui garderait la hauteur de voix. C'est ce qui rend le
+    // son remontable a sa vitesse normale d'un seul coup, cote offscreen.
+    v.preservesPitch = false;
+    if ("webkitPreservesPitch" in v) v.webkitPreservesPitch = false;
+    v.playbackRate = prepVitesseCible;
+  } catch (err) {
+    prepRestaurer();
+    return {
+      success: false,
+      erreur: "Ce lecteur refuse de changer de vitesse : " + (err && err.message ? err.message : err),
+    };
+  }
+
+  // Le changement a-t-il PRIS ? Certains lecteurs ignorent l'affectation, ou la
+  // remettent a 1 aussitot. Un mode qui croit defiler a x2 alors qu'il defile a
+  // x1 produirait un stock au son deux fois trop lent -- du charabia, sans la
+  // moindre erreur.
+  if (Math.abs(v.playbackRate - prepVitesseCible) > 0.01) {
+    const obtenue = v.playbackRate;
+    prepRestaurer();
+    return {
+      success: false,
+      erreur: `Ce lecteur impose sa vitesse (x${obtenue} au lieu de x${prepVitesseCible})`,
+    };
+  }
+
+  try {
+    await v.play();
+  } catch (err) {
+    prepRestaurer();
+    return {
+      success: false,
+      erreur: "La lecture n'a pas pu démarrer : " + (err && err.message ? err.message : err),
+    };
+  }
+
+  // Une nouvelle preparation remplace la precedente : son affichage n'a plus
+  // rien a dire sur cette video-ci.
+  prepLectArreter();
+  prepLectStock = [];
+  prepLectZone = null;
+  prepLectMesures = [];
+
+  prepEnCours = true;
+  prepDerniereProgression = { position: v.currentTime, quand: Date.now() };
+  v.addEventListener("ended", prepSurFin);
+  prepTick = setInterval(prepBattre, PREP_PAS_TICK);
+  prepBattre();
+
+  console.log(`▶️ Preparation : defilement a x${prepVitesseCible} depuis ${v.currentTime.toFixed(2)} s`);
+  return { success: true, position: prepAvant.position, duree: v.duration };
+}
+
+function prepBattre() {
+  if (!prepEnCours) return;
+
+  const precedente = prepVideo;
+  const v = prepVideoResolue();
+  if (!v) {
+    prepAfficher("⚠️ La vidéo a disparu de la page. Préparation arrêtée.");
+    prepSurFin();
+    return;
+  }
+
+  // L'element a change sous nos pieds : il faut lui re-imposer le regime, sinon
+  // on capterait du son a vitesse normale en croyant capter du x2.
+  if (v !== precedente) {
+    try {
+      v.preservesPitch = false;
+      if ("webkitPreservesPitch" in v) v.webkitPreservesPitch = false;
+      v.playbackRate = prepVitesseCible;
+      v.play().catch(() => {});
+    } catch (err) {
+      console.warn("⚠️ Preparation : nouvelle <video> non pilotable —", err);
+    }
+  }
+
+  // ⚠️ DETECTEUR D'ENLISEMENT. Une video qui n'avance plus alors qu'elle n'est
+  // pas en pause, c'est le symptome exact du lecteur demonte. Sans ce garde-fou
+  // la preparation tourne indefiniment sur du silence.
+  if (!v.paused && Math.abs(v.currentTime - prepDerniereProgression.position) > 0.05) {
+    prepDerniereProgression = { position: v.currentTime, quand: Date.now() };
+  } else if (!v.paused && Date.now() - prepDerniereProgression.quand > PREP_ENLISEMENT_MS) {
+    prepAfficher("⚠️ La vidéo n'avance plus (lecteur rechargé ?). Préparation arrêtée.");
+    console.warn("⚠️ Preparation : enlisement, position figee a", v.currentTime);
+    prepSurFin();
+    return;
+  }
+
+  // Garde-fou : le lecteur a-t-il repris la main sur la vitesse ? On la
+  // re-impose, mais pas indefiniment -- au bout de PREP_RECALAGES_MAX on le
+  // DIT, au lieu de lutter en silence contre la page.
+  if (Math.abs(v.playbackRate - prepVitesseCible) > 0.01) {
+    if (prepRecalages < PREP_RECALAGES_MAX) {
+      prepRecalages++;
+      v.preservesPitch = false;
+      v.playbackRate = prepVitesseCible;
+      console.warn(`⚠️ Preparation : vitesse remise a x${prepVitesseCible} (${prepRecalages})`);
+    } else {
+      prepAfficher(
+        `⚠️ Le lecteur reprend la main sur la vitesse (x${v.playbackRate}). Préparation arrêtée.`
+      );
+      prepSurFin();
+      return;
+    }
+  }
+
+  // Progression : en temps de VIDEO, et jamais en arriere.
+  if (v.currentTime > prepPositionMax) prepPositionMax = v.currentTime;
+  const fait = prepPositionMax - prepAvant.position;
+  const total = Number.isFinite(v.duration) ? v.duration - prepAvant.position : null;
+
+  prepAfficher(
+    total
+      ? `⏳ Préparation… ${prepFormaterDuree(fait)} sur ${prepFormaterDuree(total)}`
+      : `⏳ Préparation… ${prepFormaterDuree(fait)}`,
+    true
+  );
+
+  const finie =
+    v.ended ||
+    (Number.isFinite(v.duration) && v.currentTime >= v.duration - PREP_MARGE_FIN);
+  if (finie) prepSurFin();
+}
+
+// Fin du defilement : on met le lecteur en PAUSE tout de suite (plus aucun son
+// ne part vers la capture), puis on previent le service worker. C'est lui qui
+// fera vider la file de transcription avant de nous demander de restaurer :
+// restaurer maintenant renverrait la video au debut, en x1, pendant que
+// l'offscreen enregistre encore.
+function prepSurFin() {
+  if (!prepEnCours || prepFinSignalee) return;
+  prepFinSignalee = true;
+  prepEnCours = false;
+
+  if (prepTick) {
+    clearInterval(prepTick);
+    prepTick = null;
+  }
+  try {
+    prepVideo.removeEventListener("ended", prepSurFin);
+    prepVideo.pause();
+  } catch (err) {
+    /* le lecteur a pu disparaitre entre-temps */
+  }
+
+  prepAfficher("⏳ Préparation… derniers mots en cours de transcription", true);
+  chrome.runtime.sendMessage({ type: "PREPARATION_FIN" }).catch(() => {});
+
+  // Si l'ordre de restauration n'arrive pas, on rend le lecteur quand meme.
+  if (prepVeille) clearTimeout(prepVeille);
+  prepVeille = setTimeout(async () => {
+    prepVeille = null;
+    if (!prepVideo) return; // deja restaure, tout va bien
+    console.warn("⚠️ Preparation : aucun ordre de restauration, on rend le lecteur");
+    await prepRestaurer();
+    prepAfficher("⚠️ Préparation interrompue — le lecteur a été remis en état");
+  }, PREP_VEILLE_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Restaurer — le contrat
+// ---------------------------------------------------------------------------
+
+async function prepRestaurer() {
+  if (!prepVideo || !prepAvant) return null;
+
+  // On rend l'element COURANT : si le lecteur a ete reconstruit pendant la
+  // preparation, c'est lui qu'il faut remettre en etat, pas la reference morte.
+  const v = prepVideoResolue() || prepVideo;
+  const avant = prepAvant;
+  if (!v) return null;
+
+  if (prepVeille) {
+    clearTimeout(prepVeille);
+    prepVeille = null;
+  }
+  prepEnCours = false;
+  if (prepTick) {
+    clearInterval(prepTick);
+    prepTick = null;
+  }
+  try {
+    v.removeEventListener("ended", prepSurFin);
+  } catch (err) {
+    /* deja retire */
+  }
+
+  try {
+    v.playbackRate = avant.vitesse;
+    if (avant.hauteur !== null) v.preservesPitch = avant.hauteur;
+    v.currentTime = avant.position;
+  } catch (err) {
+    console.warn("⚠️ Preparation : restauration partielle —", err);
+  }
+
+  // Attendre que le saut ait vraiment eu lieu : `currentTime` relu juste apres
+  // l'affectation rend encore l'ancienne valeur. Sans cette attente, la preuve
+  // « la video est bien revenue » serait fausse alors que le code est juste.
+  await new Promise((resoudre) => {
+    let fini = false;
+    const fin = () => {
+      if (fini) return;
+      fini = true;
+      v.removeEventListener("seeked", fin);
+      resoudre();
+    };
+    v.addEventListener("seeked", fin);
+    setTimeout(fin, 1500); // un flux peut ne jamais confirmer le saut
+  });
+
+  try {
+    if (avant.enPause) v.pause();
+    else v.play().catch(() => {});
+  } catch (err) {
+    /* rien de plus a faire */
+  }
+
+  const apres = {
+    position: v.currentTime,
+    vitesse: v.playbackRate,
+    hauteur: v.preservesPitch !== undefined ? v.preservesPitch : null,
+    enPause: v.paused,
+  };
+  console.log("📌 Preparation : etat du lecteur apres —", JSON.stringify(apres));
+
+  prepVideo = null;
+  prepAvant = null;
+  return { avant, apres };
+}
+
+// ---------------------------------------------------------------------------
+// Messages — un listener A PART
+// ---------------------------------------------------------------------------
+//
+// Un second addListener plutot que des branches ajoutees dans le premier : le
+// listener du mode direct n'est pas touche d'une ligne.
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "PREPARATION_VERIFIER") {
+    sendResponse(prepDecrireVideo());
+    return;
+  }
+
+  if (request.type === "PREPARATION_PILOTER") {
+    prepPiloter(request.vitesse)
+      .then(sendResponse)
+      .catch((err) =>
+        sendResponse({ success: false, erreur: String((err && err.message) || err) })
+      );
+    return true;
+  }
+
+  if (request.type === "PREPARATION_STATUT") {
+    // Un statut ne doit jamais recouvrir la progression, qui est plus utile.
+    if (!prepEnCours) prepAfficher(request.texte, true);
+    return;
+  }
+
+  if (request.type === "PREPARATION_RESTAURER") {
+    prepRestaurer()
+      .then((etats) => {
+        const r = request.resume;
+        if (request.erreur) {
+          prepAfficher("❌ " + request.erreur);
+        } else if (r && typeof r.nbMots === "number") {
+          prepAfficher(
+            `✅ Prêt — ${r.nbMots} mots préparés, ${prepFormaterDuree(r.dureeCouverteS)} couvertes`
+          );
+          // Le stock est complet et la video est revenue a sa place : on passe
+          // a l'affichage. Rien ne bouge tant que l'utilisateur ne lance pas la
+          // lecture -- c'est `currentTime` qui commande, pas une minuterie.
+          if (r.nbMots > 0) prepLectCharger(r);
+        } else {
+          prepAfficher("⏹️ Préparation arrêtée");
+        }
+        sendResponse({ success: true, etats });
+      })
+      .catch((err) =>
+        sendResponse({ success: false, erreur: String((err && err.message) || err) })
+      );
+    return true;
+  }
+});
+
+
+// ===========================================================================
+// MODE « PREPARER D'ABORD » — etape B : afficher le stock pendant la lecture
+// ===========================================================================
+//
+// Ici, et c'est TOUTE la difference avec le mode direct : on connait deja
+// l'heure exacte de chaque mot, et on connait a chaque instant ou en est la
+// video. Il n'y a donc plus rien a estimer.
+//
+// Le mode direct doit inventer un retard parce qu'il court apres la parole : il
+// observe le percentile 90 des vingt derniers lots, ajoute une marge, et se
+// borne a RETARD_MAX. Tout cet appareillage n'a qu'un but -- compenser le fait
+// qu'on ne sait pas quand un mot a ete prononce.
+//
+// Ici on le sait. La regle tient donc en une ligne :
+//
+//     un mot est affiche des que video.currentTime atteint son instant.
+//
+// Pas de p90, pas de plafond, pas de file a etaler, pas de PAS_REVELATION. Et
+// comme le repere est la position de la VIDEO et non l'horloge murale, tout ce
+// que fait l'utilisateur est gere sans un cas particulier : mettre en pause
+// arrete currentTime donc arrete le texte, sauter en avant fait bondir
+// currentTime donc fait bondir le texte, revenir en arriere le fait reculer.
+
+// Combien de mots on garde dans le ruban. La boite ne montre que deux lignes ;
+// au-dela on paierait un `scrollHeight` sur des milliers de mots a chaque
+// image, pour afficher exactement la meme chose.
+const PREP_LECT_FENETRE = 40;
+
+// UNE seule ligne pendant la lecture, et pas deux.
+//
+// Le mode direct en montre deux, et il a ses raisons : il ne sait pas quand un
+// mot a ete prononce, donc il lache des paquets de mots, et la ligne du dessus
+// laisse le temps de finir de lire ce qui vient de passer.
+//
+// Ici, rien de tout ca : chaque mot sort a son heure, au rythme de la parole.
+// La ligne du dessus ne montre plus que la phrase deja entendue -- elle occupe
+// l'ecran sans rien apporter. On garde donc le ruban qui coule, mais sur une
+// seule ligne.
+//
+// ⚠️ `zone` est PARTAGEE avec le mode direct : on modifie sa hauteur a chaud, et
+// il est donc obligatoire de la remettre a deux lignes en s'arretant. Sans ca,
+// le direct se retrouverait avec un affichage sur une ligne sans qu'une seule
+// de ses lignes de code ait change -- le genre de regression qu'on ne relie
+// jamais a sa cause.
+const PREP_LECT_LIGNES = 1;
+
+// Les messages d'etat (« au-dela de la preparation », « Pret — N mots… ») sont
+// plus longs qu'un bout de phrase : sur une seule ligne ils seraient coupes.
+// La boite reprend donc ses deux lignes le temps de les afficher.
+let prepLectHauteurCourante = null;
+
+function prepLectHauteur(lignes) {
+  if (prepLectHauteurCourante === lignes) return;
+  prepLectHauteurCourante = lignes;
+  zone.style.height = `${lignes * HAUTEUR_LIGNE}em`;
+}
+
+// Tolerance autour de la zone preparee, en secondes.
+const PREP_LECT_MARGE_ZONE = 1.0;
+
+// Au-dela de cet ecart entre la position attendue et la position reelle, c'est
+// que l'utilisateur a saute. Les mots reveles a ce moment-la ne sont pas des
+// revelations « a l'heure » : les compter fausserait la mesure.
+const PREP_LECT_SAUT_S = 0.35;
+
+let prepLectStock = [];           // [{ mot, instant }], instants croissants
+let prepLectZone = null;          // { debut, fin } en secondes de video
+let prepLectResume = "";          // le texte « Pret — N mots… »
+let prepLectActif = false;
+let prepLectRaf = null;
+let prepLectMinuterie = null;
+
+// Pas de la minuterie de secours, en ms. Voir prepLectDemarrer : c'est elle qui
+// empeche l'affichage de se figer quand les images de la page s'arretent.
+const PREP_LECT_PAS_MS = 20;
+let prepLectVisibles = -1;        // dernier nombre de mots dus (pour ne rendre que si ca change)
+let prepLectEtatAffiche = "";     // pour ne pas reecrire le meme message a 60 Hz
+
+// Suivi de la position, pour distinguer une lecture continue d'un saut.
+let prepLectDernierTick = 0;
+let prepLectDernierePosition = 0;
+
+// --- Mesure (criteres 1 et 2) ----------------------------------------------
+//
+// Pour chaque mot revele en lecture CONTINUE, on note l'ecart entre la position
+// de la video au moment ou il apparait et l'instant ou il a ete prononce.
+// C'est exactement « un mot prononce a T apparait a quel instant ».
+let prepLectMesures = [];
+let prepLectMesuresMax = 400;
+
+// ⚠️ DECALAGE DE TEST, ET RIEN D'AUTRE. Il sert a la contre-preuve : si on
+// decale tous les instants de +3 s et que l'ecart mesure ne monte pas de 3 s,
+// c'est que la mesure ne mesure rien. Il vaut toujours 0 en usage normal, il
+// n'est expose par aucun reglage, et il ne s'active que par un message envoye
+// a la main depuis la console.
+let prepLectDecalageTestMs = 0;
+
+function prepLectInstantAffichage(i) {
+  return prepLectStock[i].instant + prepLectDecalageTestMs / 1000;
+}
+
+// Combien de mots ont atteint leur heure a la position `t` ?
+// Les instants sont croissants, donc les mots dus forment un prefixe : une
+// recherche dichotomique suffit, et elle reste gratuite sur 2500 mots a 60 Hz.
+function prepLectCombien(t) {
+  let bas = 0;
+  let haut = prepLectStock.length;
+  while (bas < haut) {
+    const milieu = (bas + haut) >> 1;
+    if (prepLectInstantAffichage(milieu) <= t) bas = milieu + 1;
+    else haut = milieu;
+  }
+  return bas;
+}
+
+// Le ruban, avec les mots reellement en vigueur.
+//
+// On reutilise `rendre()` du mode direct sans y toucher une ligne : elle lit
+// `motsCible` et `nbVisibles`, et c'est elle qui fait couler le texte quand il
+// depasse les deux lignes. Meme boite, memes lignes, meme style.
+function prepLectRendre(n) {
+  const debut = Math.max(0, n - PREP_LECT_FENETRE);
+  motsCible = prepLectStock.slice(debut, n).map((m) => ({ mot: m.mot }));
+  nbVisibles = n - debut;
+  prepLectHauteur(PREP_LECT_LIGNES);
+  subtitleBox.style.display = "block";
+  subtitleBox.style.opacity = "1";
+  subtitleBox.style.fontStyle = "normal";
+  rendre();
+  prepLectEtatAffiche = "ruban";
+}
+
+function prepLectMessage(cle, texte) {
+  if (prepLectEtatAffiche === cle) return;
+  prepLectEtatAffiche = cle;
+  prepLectHauteur(LIGNES_VISIBLES); // un message entier, pas un message coupe
+  prepAfficher(texte, true);
+}
+
+// Le battement. Il est appele par DEUX horloges independantes (voir
+// prepLectDemarrer) : il doit donc etre idempotent, et il l'est -- il ne fait
+// rien tant que le nombre de mots dus n'a pas change.
+function prepLectBattre() {
+  if (!prepLectActif) return;
+
+  const v = prepVideoResolue();
+  if (!v) {
+    prepLectMessage("sansvideo", "⚠️ Vidéo introuvable sur cette page");
+    return;
+  }
+
+  const t = v.currentTime;
+  const maintenant = performance.now();
+
+  // Lecture continue, ou saut ? On compare la position attendue a la position
+  // reelle. Un saut n'invalide pas l'affichage -- il invalide la MESURE.
+  const dt = (maintenant - prepLectDernierTick) / 1000;
+  const attendue = v.paused
+    ? prepLectDernierePosition
+    : prepLectDernierePosition + dt * v.playbackRate;
+  const continu =
+    prepLectDernierTick > 0 && !v.paused && Math.abs(t - attendue) <= PREP_LECT_SAUT_S;
+  prepLectDernierTick = maintenant;
+  prepLectDernierePosition = t;
+
+  // Hors de la zone preparee : on le DIT. Un ruban qui reste fige sur ses
+  // derniers mots pendant qu'on parle a l'ecran serait le pire des affichages,
+  // parce qu'il a l'air de fonctionner.
+  if (prepLectZone) {
+    if (t > prepLectZone.fin + PREP_LECT_MARGE_ZONE) {
+      prepLectMessage("apres", "⏭️ Au-delà de la préparation — aucun sous-titre ici");
+      return;
+    }
+    if (t < prepLectZone.debut - PREP_LECT_MARGE_ZONE) {
+      prepLectMessage("avant", "⏮️ Avant la zone préparée — aucun sous-titre ici");
+      return;
+    }
+  }
+
+  const n = prepLectCombien(t);
+
+  if (n === 0) {
+    prepLectMessage("attente", prepLectResume || "✅ Prêt — lance la lecture");
+    prepLectVisibles = 0;
+    return;
+  }
+
+  if (n !== prepLectVisibles || prepLectEtatAffiche !== "ruban") {
+    // Mesure : uniquement les mots reveles en lecture continue.
+    if (continu && n > prepLectVisibles && prepLectVisibles >= 0) {
+      for (let i = prepLectVisibles; i < n; i++) {
+        if (prepLectMesures.length >= prepLectMesuresMax) break;
+        // ⚠️ On compare a l'instant D'ORIGINE, jamais a l'instant decale : c'est
+        // ce qui fait que la contre-preuve a +3 s se voit dans le chiffre.
+        prepLectMesures.push(Math.round((t - prepLectStock[i].instant) * 1000));
+      }
+    }
+    prepLectVisibles = n;
+    prepLectRendre(n);
+  }
+}
+
+// DEUX horloges, et c'est le correctif du figement.
+//
+// ⚠️ requestAnimationFrame S'ARRETE des que la page cesse d'etre rendue : autre
+// fenetre par-dessus, onglet mis de cote, plein ecran d'une autre application.
+// L'affichage se fige alors, puis lache d'un coup tous les mots devenus dus des
+// que le rendu reprend -- c'est exactement le « ca fige puis ca rattrape », et
+// c'est aussi ce qui fait apparaitre des mots loin de leur heure pendant le
+// rattrapage. Mesure du 2026-08-27, meme code, meme video :
+//
+//     fenetre au premier plan        ->  mediane   8 ms, max   44 ms
+//     fenetre pas au premier plan    ->  mediane 479 ms, max 1002 ms
+//
+// Le 1002 ms n'est pas un hasard : c'est rAF ramene a une image par seconde.
+//
+// La minuterie, elle, continue de tourner : Chrome ne bride serieusement les
+// timers que dans un onglet d'ARRIERE-PLAN, et un onglet qui joue du son y
+// echappe largement. On garde donc les deux -- rAF pour la finesse quand la
+// page est rendue, la minuterie comme plancher quand elle ne l'est plus.
+// Le battement etant idempotent, les faire tourner ensemble ne coute rien.
+function prepLectBoucleRaf() {
+  if (!prepLectActif) return;
+  prepLectRaf = requestAnimationFrame(prepLectBoucleRaf);
+  prepLectBattre();
+}
+
+function prepLectDemarrer() {
+  if (prepLectActif || !prepLectStock.length) return;
+  prepLectActif = true;
+  prepLectVisibles = -1;
+  prepLectEtatAffiche = "";
+  prepLectDernierTick = 0;
+  prepLectDernierePosition = 0;
+  prepLectRaf = requestAnimationFrame(prepLectBoucleRaf);
+  prepLectMinuterie = setInterval(prepLectBattre, PREP_LECT_PAS_MS);
+  console.log(
+    `▶️ LiveSub : affichage du stock — ${prepLectStock.length} mots, ` +
+      `zone ${prepLectZone.debut.toFixed(1)} s → ${prepLectZone.fin.toFixed(1)} s`
+  );
+}
+
+function prepLectArreter() {
+  prepLectActif = false;
+  if (prepLectRaf) {
+    cancelAnimationFrame(prepLectRaf);
+    prepLectRaf = null;
+  }
+  if (prepLectMinuterie) {
+    clearInterval(prepLectMinuterie);
+    prepLectMinuterie = null;
+  }
+  // ⚠️ OBLIGATOIRE : `zone` est partagee avec le mode direct, qui compte sur ses
+  // deux lignes. La laisser a une ligne le casserait a distance.
+  prepLectHauteur(LIGNES_VISIBLES);
+}
+
+// Va chercher le stock aupres du service worker, qui le demande a l'offscreen.
+async function prepLectCharger(resume) {
+  try {
+    const reponse = await chrome.runtime.sendMessage({ type: "PREPARATION_STOCK_COMPLET" });
+    if (!reponse || !reponse.success || !Array.isArray(reponse.mots) || !reponse.mots.length) {
+      prepAfficher("⚠️ Aucun texte préparé à afficher");
+      return;
+    }
+
+    prepLectStock = reponse.mots;
+    prepLectZone = {
+      debut: Number(reponse.positionDepart) || 0,
+      fin: (Number(reponse.positionDepart) || 0) + (Number(reponse.dureeCouverteS) || 0),
+    };
+    if (resume && typeof resume.nbMots === "number") {
+      prepLectResume =
+        `✅ Prêt — ${resume.nbMots} mots préparés, ` +
+        `${prepFormaterDuree(resume.dureeCouverteS)} couvertes`;
+    }
+    prepLectDemarrer();
+  } catch (err) {
+    prepAfficher("⚠️ Stock illisible : " + (err && err.message ? err.message : err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Messages — mesure uniquement
+// ---------------------------------------------------------------------------
+//
+// Ces deux-la ne sont branches sur aucun reglage et ne servent qu'a prouver que
+// l'affichage fait ce qu'il pretend. Sans eux la mesure serait impossible : un
+// content script vit dans un monde isole, la console de la page ne peut pas
+// lire ses variables.
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // Le mode direct prend la main : il reinitialise `motsCible` et `nbVisibles`
+  // dans son propre toggleOverlay. Si la boucle de lecture continuait, les deux
+  // ecriraient dans le meme ruban a 60 Hz. On s'efface -- sans repondre, pour
+  // laisser le listener du mode direct repondre comme avant.
+  if (request.type === "TOGGLE_SUBTITLES") {
+    prepLectArreter();
+    return;
+  }
+
+  if (request.type === "PREPARATION_MESURES") {
+    const v = prepLectMesures.slice().sort((a, b) => a - b);
+    const mediane = v.length
+      ? v.length % 2
+        ? v[(v.length - 1) / 2]
+        : Math.round((v[v.length / 2 - 1] + v[v.length / 2]) / 2)
+      : null;
+    sendResponse({
+      success: true,
+      n: v.length,
+      medianeMs: mediane,
+      maxMs: v.length ? v[v.length - 1] : null,
+      minMs: v.length ? v[0] : null,
+      decalageTestMs: prepLectDecalageTestMs,
+      motsAffiches: prepLectVisibles,
+      remplacementsVideo: prepVideoRemplacements,
+      etat: prepLectEtatAffiche,
+    });
+    return;
+  }
+
+  if (request.type === "PREPARATION_TEST_DECALAGE") {
+    prepLectDecalageTestMs = Number(request.ms) || 0;
+    prepLectMesures = [];
+    prepLectVisibles = -1;
+    prepLectEtatAffiche = "";
+    console.warn(`🧪 LiveSub : décalage de test = ${prepLectDecalageTestMs} ms`);
+    sendResponse({ success: true, decalageTestMs: prepLectDecalageTestMs });
+    return;
+  }
+
+  if (request.type === "PREPARATION_MESURES_RAZ") {
+    prepLectMesures = [];
+    sendResponse({ success: true });
+    return;
+  }
+});

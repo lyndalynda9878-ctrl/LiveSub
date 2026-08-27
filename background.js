@@ -629,3 +629,299 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; // reponse asynchrone
   }
 });
+
+
+// ===========================================================================
+// MODE « PREPARER D'ABORD » — etape A : l'orchestration
+// ===========================================================================
+//
+// Un mode a COTE du direct. Ni `captureState`, ni `doStartAudioCapture`, ni
+// `sendFlux`, ni le listener de messages existant ne sont touches : ce qui suit
+// s'ajoute, avec son propre etat, ses propres messages et son propre listener.
+//
+// Le service worker meurt au bout de ~30 s d'inactivite, et une preparation
+// dure des minutes. Tout l'etat vit donc dans chrome.storage.session, comme
+// pour le direct -- une variable memoire aurait disparu en plein milieu.
+// (L'offscreen et content.js, eux, survivent : ce sont eux qui tiennent le
+// travail en cours, le service worker ne fait que les mettre en relation.)
+
+const PREP_STATE_KEY = "preparationState";
+const PREP_ETAT_VIDE = { active: false, tabId: null };
+
+// x2 : la vitesse mesuree le 2026-08-27 (texte identique a 98,6 % / 94,9 %,
+// signal restitue a r = 1,00). Monter plus haut demanderait de revalider les
+// deux, et le plafond de la machine est de toute facon ~x4.
+const PREP_VITESSE = 2;
+
+async function prepLireEtat() {
+  const range = await chrome.storage.session.get(PREP_STATE_KEY);
+  return range[PREP_STATE_KEY] || PREP_ETAT_VIDE;
+}
+
+async function prepEcrireEtat(etat) {
+  await chrome.storage.session.set({ [PREP_STATE_KEY]: etat });
+  return etat;
+}
+
+// Meme garde-fou que getCaptureState : un etat qui dit « actif » alors que
+// l'offscreen a disparu est un etat qui ment.
+async function prepEtatReel() {
+  const etat = await prepLireEtat();
+  if (etat.active && !(await chrome.offscreen.hasDocument())) {
+    console.log("♻️ Preparation perimee (plus d'offscreen), remise a zero");
+    return prepEcrireEtat(PREP_ETAT_VIDE);
+  }
+  return etat;
+}
+
+// ---------------------------------------------------------------------------
+// Demarrage
+// ---------------------------------------------------------------------------
+//
+// L'ORDRE DES ETAPES N'EST PAS ARBITRAIRE :
+//   1. y a-t-il une video ? -- on demande AVANT de capturer, pour ne pas
+//      ouvrir un flux sur une page qui ne pourra rien preparer ;
+//   2. la capture silencieuse demarre -- elle jette tout ce qu'elle recoit
+//      tant qu'elle ne connait pas la position de depart ;
+//   3. le defilement commence, et content.js dit A QUELLE SECONDE ;
+//   4. cette position part vers l'offscreen, qui se met alors a enregistrer.
+//
+// Sans l'etape 4 en dernier, la seconde ou deux captees entre 2 et 3 (video
+// encore a x1, ou a l'arret) seraient traitees comme du x2 et decaleraient
+// tous les instants du stock.
+async function doPreparationDemarrer() {
+  const direct = await getCaptureState();
+  if (direct.active) {
+    return { active: false, error: "Le mode direct capture deja cet onglet : arrete-le d'abord" };
+  }
+
+  const deja = await prepEtatReel();
+  if (deja.active) {
+    console.log("ℹ️ Preparation deja en cours sur l'onglet", deja.tabId);
+    return deja;
+  }
+
+  let tabId = null;
+  try {
+    console.log("🎬 Preparation : demarrage...");
+    await createOffscreen();
+
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) throw new Error("Aucun onglet actif");
+    tabId = tab.id;
+
+    // 1. Une video pilotable sur cette page ?
+    let verification;
+    try {
+      verification = await chrome.tabs.sendMessage(tabId, { type: "PREPARATION_VERIFIER" });
+    } catch (err) {
+      throw new Error("LiveSub n'est pas charge sur cette page : recharge-la (F5) puis reessaie");
+    }
+    if (!verification || !verification.success) {
+      throw new Error((verification && verification.erreur) || "Aucune video pilotable sur cette page");
+    }
+    console.log(
+      `📼 Video trouvee : ${verification.duree.toFixed(1)} s, position ${verification.position.toFixed(1)} s`
+    );
+
+    // 2. Capture silencieuse.
+    const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+    const reponse = await chrome.runtime.sendMessage({
+      type: "START_PREPARATION",
+      streamId,
+      // L'offscreen n'a pas acces a chrome.storage : tout arrive par message.
+      langue: await readLangue(),
+      memoBackend: await readWhisperBackend(),
+    });
+    if (!reponse || !reponse.success) {
+      throw new Error((reponse && reponse.error) || "Le module audio n'a pas confirme la capture");
+    }
+
+    // 3. Defilement accelere.
+    const pilote = await chrome.tabs.sendMessage(tabId, {
+      type: "PREPARATION_PILOTER",
+      vitesse: PREP_VITESSE,
+    });
+    if (!pilote || !pilote.success) {
+      throw new Error((pilote && pilote.erreur) || "Le lecteur de la page n'a pas demarre");
+    }
+
+    // 4. La position de depart debloque l'enregistrement.
+    await chrome.runtime
+      .sendMessage({ type: "PREPARATION_POSITION", position: pilote.position })
+      .catch(() => {});
+
+    console.log(`✅ Preparation lancee sur l'onglet ${tabId} a x${PREP_VITESSE}`);
+    return prepEcrireEtat({
+      active: true,
+      tabId,
+      depart: pilote.position,
+      duree: pilote.duree,
+    });
+  } catch (error) {
+    console.error("❌ Preparation :", error);
+
+    // Tout defaire, dans les deux sens : le flux capte ET le lecteur emprunte.
+    // Un lecteur laisse a x2 sur la page de quelqu'un serait le pire des
+    // echecs -- celui qu'on ne comprend pas.
+    try {
+      await chrome.runtime.sendMessage({ type: "STOP_PREPARATION" });
+    } catch (err) {
+      /* pas (ou plus) d'offscreen : normal */
+    }
+    if (tabId) {
+      try {
+        await chrome.tabs.sendMessage(tabId, {
+          type: "PREPARATION_RESTAURER",
+          erreur: describeError(error),
+        });
+      } catch (err) {
+        /* page sans content script */
+      }
+    }
+
+    await prepEcrireEtat(PREP_ETAT_VIDE);
+    return { active: false, error: describeError(error) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Arret (volontaire, ou fin de la video)
+// ---------------------------------------------------------------------------
+//
+// L'ORDRE COMPTE ICI AUSSI : on fait d'abord vider la file de transcription
+// (STOP_PREPARATION attend que les derniers blocs soient passes), et SEULEMENT
+// ensuite on rend le lecteur. Restaurer d'abord renverrait la video a sa
+// position d'origine, en x1, pendant que l'offscreen enregistre encore.
+async function doPreparationArreter() {
+  const etat = await prepLireEtat();
+  const tabId = etat.tabId;
+  console.log("⏸️ Preparation : arret demande");
+
+  let resume = null;
+  try {
+    resume = await chrome.runtime.sendMessage({ type: "STOP_PREPARATION" });
+  } catch (err) {
+    console.warn("Preparation : offscreen injoignable (deja ferme ?)");
+  }
+
+  if (tabId) {
+    try {
+      const restauration = await chrome.tabs.sendMessage(tabId, {
+        type: "PREPARATION_RESTAURER",
+        resume,
+      });
+      if (restauration && restauration.etats) {
+        console.log("📌 Lecteur restaure :", JSON.stringify(restauration.etats));
+      }
+    } catch (err) {
+      console.warn("⚠️ Preparation : onglet injoignable, lecteur non restaure :", err.message);
+    }
+  }
+
+  await prepEcrireEtat(PREP_ETAT_VIDE);
+  if (resume) {
+    console.log(
+      `✅ Preparation terminee : ${resume.nbMots} mots sur ${resume.dureeCouverteS?.toFixed(1)} s ` +
+        `(${resume.motsParSeconde?.toFixed(2)} mots/s, ${resume.nbBlocs} blocs)`
+    );
+  }
+  return { active: false, resume: resume || null };
+}
+
+// Les deux operations passent par la MEME file que le direct : c'est ce qui
+// garantit qu'un demarrage direct et un demarrage de preparation ne peuvent pas
+// se croiser et ouvrir deux captures sur le meme onglet.
+function preparationDemarrer() {
+  return serializeCapture(doPreparationDemarrer);
+}
+
+function preparationArreter() {
+  return serializeCapture(doPreparationArreter);
+}
+
+// L'onglet prepare est ferme : le flux meurt avec lui, et il n'y a plus de
+// lecteur a rendre. On nettoie pour que la popup ne reste pas sur « Actif ».
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const etat = await prepLireEtat();
+  if (etat.active && etat.tabId === tabId) {
+    console.log("🗑️ Onglet prepare ferme, arret de la preparation");
+    await preparationArreter();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Messages — un listener A PART
+// ---------------------------------------------------------------------------
+//
+// Un second addListener plutot que des branches ajoutees dans le premier : le
+// listener existant n'est pas touche d'une ligne. Chrome livre le message aux
+// deux ; les types ne se recouvrent pas, donc un seul repond.
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "PREPARATION_DEMARRER") {
+    preparationDemarrer().then(sendResponse);
+    return true;
+  }
+
+  if (request.type === "PREPARATION_ARRETER") {
+    preparationArreter().then(sendResponse);
+    return true;
+  }
+
+  if (request.type === "PREPARATION_ETAT") {
+    prepEtatReel().then(sendResponse);
+    return true;
+  }
+
+  // content.js a vu la fin de la video. Meme chemin que l'arret volontaire.
+  if (request.type === "PREPARATION_FIN") {
+    console.log("🏁 Preparation : fin de la video signalee par la page");
+    preparationArreter();
+    return; // pas de reponse attendue
+  }
+
+  // Message d'etat de l'offscreen -> overlay de l'onglet prepare.
+  // On ne passe PAS par sendStatut : celui-la n'ecrit que si `captureState`
+  // est actif, ce qui n'est jamais le cas en preparation.
+  if (request.type === "PREPARATION_STATUT") {
+    prepLireEtat().then(({ active, tabId }) => {
+      if (!active || !tabId) return;
+      chrome.tabs
+        .sendMessage(tabId, { type: "PREPARATION_STATUT", texte: request.texte })
+        .catch(() => {});
+    });
+    return; // pas de reponse attendue
+  }
+
+  // Lecture du stock prepare (verification maintenant, etape B plus tard).
+  if (request.type === "PREPARATION_STOCK") {
+    chrome.runtime
+      .sendMessage({ type: "PREPARATION_RESUME" })
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: String(err.message || err) }));
+    return true;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Etape B : le pont entre le stock (offscreen) et l'affichage (content.js)
+// ---------------------------------------------------------------------------
+//
+// content.js ne peut pas parler a l'offscreen : il n'y a pas de canal direct
+// entre un content script et un document offscreen. On relaie, exactement comme
+// FLUX le fait dans l'autre sens pour le mode direct.
+//
+// Deux types distincts et non un seul, volontairement : celui qui arrive et
+// celui qui repart ne doivent pas pouvoir etre confondus si un jour un autre
+// contexte ecoute.
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "PREPARATION_STOCK_COMPLET") {
+    chrome.runtime
+      .sendMessage({ type: "PREPARATION_STOCK_OFFSCREEN" })
+      .then(sendResponse)
+      .catch((err) =>
+        sendResponse({ success: false, error: "Stock illisible : " + (err.message || err) })
+      );
+    return true; // reponse asynchrone
+  }
+});
