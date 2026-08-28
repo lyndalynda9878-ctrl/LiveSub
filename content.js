@@ -1,5 +1,30 @@
 console.log("LiveSub charge sur cette page !");
 
+// ===========================================================================
+// INTERRUPTEUR DE COMPARAISON — mode « preparer d'abord » UNIQUEMENT
+// ===========================================================================
+//
+// Deux facons d'afficher un stock DEJA prepare, et une seule sera gardee :
+//
+//   "blocs" — des PHRASES ENTIERES qui se remplacent l'une l'autre, comme les
+//             sous-titres d'un film. Un bloc apparait a l'instant de son
+//             PREMIER mot et reste jusqu'a l'arrivee du suivant. On lit donc la
+//             fin de la phrase un peu AVANT de l'entendre : c'est voulu, c'est
+//             ce qui laisse le temps de lire.
+//
+//   "mots"  — l'ancien : chaque mot sort a l'instant exact ou il a ete
+//             prononce. Parfaitement synchrone, mais fatigant a lire, et le
+//             moindre a-coup se voit.
+//
+// ⚠️ Volontairement PAS un reglage de la popup. Une option est souvent une
+// decision qu'on n'a pas prise : on compare a l'oeil, on tranche, et on
+// supprime le perdant.
+//
+// ⚠️ Le mode DIRECT n'est pas concerne, et ne peut pas l'etre : grouper en
+// phrases suppose de connaitre l'heure du mot qui SUIT, donc d'avoir le texte
+// d'avance. Le direct court apres la parole, il ne l'a jamais.
+const PREP_LECT_STYLE = "blocs"; // "blocs" | "mots"
+
 // ---------------------------------------------------------------------------
 // L'overlay : un RUBAN qui coule, pas un sous-titre qui saute
 // ---------------------------------------------------------------------------
@@ -41,6 +66,17 @@ subtitleBox.style.zIndex = "999999";
 subtitleBox.style.boxShadow = "0 8px 30px rgba(0,0,0,0.6)";
 subtitleBox.style.border = "2px solid #4f46e5";
 subtitleBox.style.display = "none"; // Caché au départ
+// La boîte apparaît et disparaît en FONDU, jamais d'un coup.
+//
+// ⚠️ Ce n'est pas de la décoration. Le mode « préparer d'abord » efface la boîte
+// dès qu'un sous-titre a fait son temps sans que le suivant soit là (voir
+// BLOC_APRES_PAROLE) : sans fondu, cette absence se lit comme un plantage —
+// « l'overlay disparaît soudainement et réapparaît soudainement ». Avec un
+// fondu de 220 ms, elle se lit pour ce qu'elle est : il n'y a rien à dire ici.
+subtitleBox.style.transition = "opacity 220ms ease";
+// Une boîte fixée par-dessus la page ne doit jamais intercepter un clic destiné
+// au lecteur qui est dessous.
+subtitleBox.style.pointerEvents = "none";
 
 // Hauteur d'une ligne, ecrite noir sur blanc : c'est elle qui fixe la hauteur
 // de la boite. Sans valeur explicite on heriterait du line-height de la PAGE,
@@ -904,7 +940,19 @@ async function prepPiloter(vitesse) {
   prepBattre();
 
   console.log(`▶️ Preparation : defilement a x${prepVitesseCible} depuis ${v.currentTime.toFixed(2)} s`);
-  return { success: true, position: prepAvant.position, duree: v.duration };
+  // ⚠️ DEUX positions, et elles ne servent pas a la meme chose.
+  //   `position`       — celle d'AVANT qu'on touche au lecteur. C'est elle
+  //                      qu'on rendra a l'utilisateur en restaurant.
+  //   `positionDepart` — celle d'APRES `play()`, donc celle du premier son
+  //                      reellement capte. C'est elle qui date le stock.
+  // Les confondre datait tout le stock trop tot de ce que la video avance
+  // pendant le demarrage du lecteur.
+  return {
+    success: true,
+    position: prepAvant.position,
+    positionDepart: v.currentTime,
+    duree: v.duration,
+  };
 }
 
 function prepBattre() {
@@ -960,6 +1008,18 @@ function prepBattre() {
       return;
     }
   }
+
+  // ⚠️ LA POSITION PART A CHAQUE BATTEMENT, ET C'EST CE QUI DATE LES MOTS.
+  //
+  // `offscreen.js` ne voit que du son : sans ce message il en deduit l'heure de
+  // chaque mot en supposant que la video avance d'exactement deux secondes par
+  // seconde d'horloge. Un rechargement de tampon, une publicite, un lecteur qui
+  // reprend une seconde la main sur la vitesse, et l'ecart s'ajoute pour de bon
+  // a tout ce qui suit. Ici on lui donne la seule chose qu'il ne peut pas
+  // deviner : ou en est REELLEMENT la video (voir prepAncres).
+  chrome.runtime
+    .sendMessage({ type: "PREPARATION_POSITION", position: v.currentTime })
+    .catch(() => {});
 
   // Progression : en temps de VIDEO, et jamais en arriere.
   if (v.currentTime > prepPositionMax) prepPositionMax = v.currentTime;
@@ -1167,7 +1227,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // image, pour afficher exactement la meme chose.
 const PREP_LECT_FENETRE = 40;
 
-// UNE seule ligne pendant la lecture, et pas deux.
+// UNE seule ligne pendant la lecture -- en mode « mots » UNIQUEMENT.
+//
+// ⚠️ Le mode « blocs » garde les DEUX lignes (LIGNES_VISIBLES) et n'y touche
+// jamais : un bloc n'est pas un ruban qui coule, c'est une phrase entiere, et il
+// lui faut la place de tenir. Comme les messages d'etat sont eux aussi sur deux
+// lignes, la boite ne change alors PLUS JAMAIS de hauteur, du debut a la fin.
 //
 // Le mode direct en montre deux, et il a ses raisons : il ne sait pas quand un
 // mot a ete prononce, donc il lache des paquets de mots, et la ligne du dessus
@@ -1221,6 +1286,105 @@ let prepLectEtatAffiche = "";     // pour ne pas reecrire le meme message a 60 H
 let prepLectDernierTick = 0;
 let prepLectDernierePosition = 0;
 
+// --- Mode « blocs » : des phrases entieres qui se remplacent ---------------
+//
+// Le decoupage est fait UNE SEULE FOIS, au chargement du stock
+// (prepBlocsDepuisMots). Pendant la lecture il ne reste plus qu'a lire l'heure :
+// le bloc en vigueur est le dernier dont le premier mot est deja passe. Rien a
+// rattraper, rien a etaler -- chaque bloc a son heure exacte, il n'y a qu'a la
+// respecter.
+//
+// Les bornes ne sont pas des gouts, elles viennent de ce qu'on demande a l'ecran :
+//
+//   PONCT_FORTE  — une phrase finie est une unite de lecture. On coupe la.
+//   PONCT_FAIBLE — une virgule ne coupe QUE si le bloc est deja long, sinon on
+//                  hacherait « Bonjour, tout le monde » en deux miettes.
+//   MOTS / SPAN  — au-dela, le bloc ne tient plus sur deux lignes, ou il couvre
+//                  trop de parole pour rester en face de l'image.
+//   DUREE_MIN    — un bloc qui reste moins de 1,5 s a l'ecran n'est pas lisible.
+//                  On le FUSIONNE avec le suivant plutot que de le faire
+//                  clignoter. Cette regle gagne sur MOTS et SPAN.
+//   *_ABSOLU     — le seul garde-fou qui gagne sur DUREE_MIN. La boite est en
+//                  « overflow: hidden » : un bloc qui deborde n'est pas mal
+//                  affiche, il est INVISIBLE. Un texte court est moins grave
+//                  qu'un texte qu'on ne voit pas.
+//
+// ⚠️ SPAN et DUREE ne sont PAS la meme chose, et les confondre donne des bornes
+// fausses. Le « span » est la parole couverte (premier mot -> dernier mot) ;
+// la « duree » est le temps a l'ecran (premier mot -> premier mot du suivant).
+// Un silence de 8 s apres une phrase courte fait une duree de 8 s pour un span
+// de 1 s -- et c'est le bon comportement : le bloc doit rester, sinon l'ecran se
+// viderait pendant le silence.
+// ⚠️ COMBIEN DE TEMPS APRES SON DERNIER MOT UN BLOC RESTE-T-IL ?
+//
+// La regle d'origine etait « il disparait quand le suivant arrive ». Elle
+// suppose que le stock couvre toute la parole. Il ne la couvre pas : mesure du
+// 2026-08-28, decoupage de production, 37 % de la parole n'a AUCUN mot dans le
+// stock -- une fenetre de preparation sur trois s'effondre et ne rend que 8 mots
+// la ou les autres en rendent 26.
+//
+// Consequence a l'ecran : le bloc precedent restait seul pendant tout le trou.
+// Mesure : jusqu'a 13,5 s. Ca ne ressemble pas a un trou, ca ressemble a une
+// application qui s'est bloquee -- et c'est exactement ce qui a ete rapporte.
+//
+// Un sous-titre reste donc au plus BLOC_APRES_PAROLE apres son DERNIER mot,
+// puis la boite s'efface jusqu'au bloc suivant. Un ecran vide pendant qu'on
+// parle est un aveu, et c'est ce qu'on veut : il dit « il n'y a rien ici »
+// au lieu de laisser croire que la phrase affichee est celle qu'on entend.
+//
+// ⚠️ Sur du texte normal cette borne ne mord pas : un bloc couvre au plus
+// BLOC_SPAN_MAX de parole et le suivant arrive avant. Mesure sur la piste
+// propre : mediane 4,3 s a l'ecran, maximum 6,1 s. Elle ne se declenche que sur
+// les vrais trous.
+//
+// Pour revenir au comportement d'origine -- un bloc qui reste jusqu'au suivant,
+// quoi qu'il arrive -- mettre cette constante a Infinity.
+// 3,0 et plus 1,5 depuis le 2026-08-28. 1,5 s avait ete choisi contre des trous
+// de 13,5 s dans le stock -- des trous dus au plafond de jetons du worker, qui
+// coupait le francais au bout de 13 s de bloc (voir PREP_JETONS_PAR_S dans
+// offscreen.js). Ce plafond leve, les trous restants sont ceux de la vraie
+// parole : des respirations et des silences courts. Les couvrir vaut mieux que
+// de clignoter dessus. Au-dela de 3 s, la boite s'efface toujours -- en fondu.
+const BLOC_APRES_PAROLE = 3.0;
+
+const BLOC_MOTS_MAX = 10;
+const BLOC_SPAN_MAX = 5.0;        // secondes de parole couvertes
+const BLOC_DUREE_MIN = 1.5;       // secondes a l'ecran
+const BLOC_CARACTERES_MAX = 84;   // ~42 par ligne, sur deux lignes
+const BLOC_VIRGULE_MOTS = 6;
+const BLOC_VIRGULE_S = 2.5;
+const BLOC_MOTS_ABSOLU = 14;
+// 88 et pas 104 : MESURE dans Chrome le 2026-08-27, boite de 800 px, 24 px gras.
+// 58 caracteres tiennent sur UNE ligne ; 85 remplissent les deux EXACTEMENT
+// (scrollHeight 65 px pour une zone de 65 px, zero debordement). Laisser 104
+// autorisait donc une fusion qui deborde -- c'est-a-dire du texte invisible.
+// Sur une fenetre plus etroite la boite retrecit et 85 peut redevenir trop :
+// c'est prepBlocRendre qui le voit alors, le compte et le dit dans la console.
+const BLOC_CARACTERES_ABSOLU = 88;
+
+// La ponctuation, lue caractere par caractere plutot qu'en expression
+// reguliere : « il a dit "bonjour." » se termine par un guillemet, pas par un
+// point, et le point est bien la fin de phrase. On saute donc une eventuelle
+// fermeture avant de regarder le signe.
+const BLOC_FERMETURES = ['"', '»', ')', ']'];
+const BLOC_FORTE = '.!?…';
+const BLOC_FAIBLE = ',;:';
+
+function blocFinitPar(mot, signes) {
+  let i = mot.length - 1;
+  if (i >= 0 && BLOC_FERMETURES.indexOf(mot.charAt(i)) !== -1) i--;
+  return i >= 0 && signes.indexOf(mot.charAt(i)) !== -1;
+}
+
+let prepLectBlocs = [];        // [{ instant, fin, texte, nbMots }]
+let prepLectBlocCourant = -2;  // -2 = rien rendu encore, -1 = avant le premier bloc
+let prepBlocDebordements = 0;
+
+// Mesures propres au mode blocs (criteres 1 et 3).
+let prepBlocEcarts = [];       // ms entre l'instant du premier mot et l'apparition
+let prepBlocDurees = [];       // ms reellement passes a l'ecran, lecture continue
+let prepBlocApparuA = null;    // position video a laquelle le bloc courant est apparu
+
 // --- Mesure (criteres 1 et 2) ----------------------------------------------
 //
 // Pour chaque mot revele en lecture CONTINUE, on note l'ecart entre la position
@@ -1252,6 +1416,264 @@ function prepLectCombien(t) {
     else haut = milieu;
   }
   return bas;
+}
+
+// ---------------------------------------------------------------------------
+// Mode « blocs » : du stock de mots a une liste de phrases
+// ---------------------------------------------------------------------------
+//
+// Une seule passe, gloutonne. A chaque mot on se demande « est-ce que je coupe
+// ICI ? », et l'ORDRE des questions EST la regle :
+//
+//   1. le garde-fou de la boite    (un bloc invisible est le pire des cas)
+//   2. le plancher de lisibilite   (trop court : on fusionne, on ne coupe pas)
+//   3. la ponctuation forte        (une phrase finie est une unite de lecture)
+//   4. la virgule, si deja long    (respirer sans hacher)
+//   5. les bornes hautes           (mots, parole couverte, caracteres)
+//
+// Le resultat porte l'heure d'apparition (`instant`, celle du PREMIER mot) et
+// l'heure de disparition (`fin`, celle du premier mot du bloc SUIVANT). Il n'y
+// a donc ni trou ni recouvrement : a tout instant de la zone preparee il y a
+// exactement un bloc en vigueur, et un seul.
+function prepBlocsDepuisMots(mots, finZone) {
+  const blocs = [];
+  if (!Array.isArray(mots) || !mots.length) return blocs;
+
+  // La fin de la zone preparee borne le dernier bloc. Si elle tombe AVANT le
+  // dernier mot (stock plus long que la zone annoncee), on la repousse : une
+  // duree negative rendrait la mesure absurde et le dernier bloc invisible.
+  const fin = Math.max(
+    Number(finZone) || 0,
+    mots[mots.length - 1].instant + BLOC_DUREE_MIN
+  );
+  const finDe = (i) => (i + 1 < mots.length ? mots[i + 1].instant : fin);
+
+  let debut = 0;
+  let caracteres = 0;
+
+  for (let i = 0; i < mots.length; i++) {
+    const texte = String(mots[i].mot || "");
+    caracteres += (i > debut ? 1 : 0) + texte.length; // le +1 est l'espace
+
+    const nb = i - debut + 1;
+    const dureeEcran = finDe(i) - mots[debut].instant;   // temps a l'ecran
+    const span = mots[i].instant - mots[debut].instant;  // parole deja couverte
+
+    // ⚠️ La borne de parole se regarde EN AVANT, sur le mot suivant, et pas en
+    // arriere sur le mot courant. Trouve au banc : teste en arriere, elle ne
+    // reagit qu'APRES avoir avale le mot fautif, et un silence de 10 s entre
+    // deux mots faisait un bloc couvrant 11 s de parole -- on lisait la fin
+    // d'une phrase qu'on n'entendrait que dix secondes plus tard.
+    //
+    // Regardee en avant, la meme borne fait d'une pierre deux coups : elle
+    // plafonne la parole couverte ET elle coupe AVANT tout silence de plus de
+    // BLOC_SPAN_MAX. Le bloc reste alors seul a l'ecran pendant le silence, ce
+    // qui est exactement ce qu'on veut : rien de neuf a lire tant que personne
+    // ne parle, et surtout pas un ecran vide.
+    const spanAvecSuivant =
+      i + 1 < mots.length ? mots[i + 1].instant - mots[debut].instant : span;
+
+    let couper;
+    if (nb >= BLOC_MOTS_ABSOLU || caracteres >= BLOC_CARACTERES_ABSOLU) {
+      couper = true;  // la boite d'abord : un bloc coupe reste lisible, un bloc
+                      // qui deborde est purement et simplement invisible.
+    } else if (dureeEcran < BLOC_DUREE_MIN) {
+      couper = false; // trop court pour etre lu : on fusionne avec le suivant
+    } else if (blocFinitPar(texte, BLOC_FORTE)) {
+      couper = true;
+    } else if (
+      blocFinitPar(texte, BLOC_FAIBLE) &&
+      (nb >= BLOC_VIRGULE_MOTS || span >= BLOC_VIRGULE_S)
+    ) {
+      couper = true;
+    } else {
+      couper =
+        nb >= BLOC_MOTS_MAX ||
+        spanAvecSuivant > BLOC_SPAN_MAX ||
+        caracteres >= BLOC_CARACTERES_MAX;
+    }
+
+    if (couper || i === mots.length - 1) {
+      blocs.push({ premier: debut, dernier: i });
+      debut = i + 1;
+      caracteres = 0;
+    }
+  }
+
+  // FUSION EN ARRIERE, en dernier recours.
+  //
+  // La boucle ci-dessus fusionne toujours vers l'AVANT : un bloc trop court
+  // avale le suivant. Deux cas lui echappent, et tous deux se reglent ici.
+  //
+  //   1. Le DERNIER bloc n'a pas de suivant a avaler.
+  //   2. Le garde-fou de la boite a force une coupure alors que le plancher de
+  //      lisibilite l'interdisait. Mesure dans Chrome le 2026-08-27 : Whisper
+  //      part en repetition en fin de piste (« Je vous ai dit que je vous ai
+  //      dit que… ») et entasse 14 mots en 940 ms. Un bloc de 940 ms n'est pas
+  //      lisible ; recolle au precedent il fait 4,3 s et 85 caracteres.
+  //
+  // La condition est en CARACTERES et non en mots, et c'est mesure, pas suppose :
+  // dans Chrome, le bloc le plus long de la piste -- 58 caracteres -- tient sur
+  // UNE ligne d'une boite qui en fait deux. C'est la longueur du texte qui
+  // decide du debordement, la longueur seule.
+  const longueurDe = (b) => {
+    let n = 0;
+    for (let i = b.premier; i <= b.dernier; i++) n += (i > b.premier ? 1 : 0) + mots[i].mot.length;
+    return n;
+  };
+
+  for (let k = blocs.length - 1; k >= 1; k--) {
+    const q = blocs[k];
+    const suivant = k + 1 < blocs.length ? mots[blocs[k + 1].premier].instant : fin;
+    if (suivant - mots[q.premier].instant >= BLOC_DUREE_MIN) continue;
+    const p = blocs[k - 1];
+    const fusion = { premier: p.premier, dernier: q.dernier };
+    if (longueurDe(fusion) > BLOC_CARACTERES_ABSOLU) continue; // la boite d'abord
+    p.dernier = q.dernier;
+    blocs.splice(k, 1);
+  }
+
+  return blocs.map((b, k) => {
+    const debutBloc = mots[b.premier].instant;
+    const finParole = mots[b.dernier].instant;
+    const suivant = k + 1 < blocs.length ? mots[blocs[k + 1].premier].instant : fin;
+    return {
+      instant: debutBloc,
+      fin: suivant,
+      finParole,
+      // L'heure a laquelle le bloc quitte l'ecran. Trois bornes, et la plus
+      // petite gagne :
+      //   - l'arrivee du suivant (on ne se recouvre jamais) ;
+      //   - son dernier mot plus BLOC_APRES_PAROLE (on ne survit pas a ce qu'on
+      //     dit) ;
+      //   - jamais avant BLOC_DUREE_MIN, sinon un bloc court redeviendrait
+      //     illisible, ce qu'on vient justement d'interdire.
+      disparition: Math.min(
+        suivant,
+        Math.max(finParole + BLOC_APRES_PAROLE, debutBloc + BLOC_DUREE_MIN)
+      ),
+      nbMots: b.dernier - b.premier + 1,
+      texte: mots
+        .slice(b.premier, b.dernier + 1)
+        .map((m) => m.mot)
+        .join(" "),
+    };
+  });
+}
+
+// Le bloc en vigueur a la position `t` : le dernier dont le premier mot est
+// deja passe. -1 quand on est avant le tout premier.
+function prepBlocIndex(t) {
+  let bas = 0;
+  let haut = prepLectBlocs.length;
+  while (bas < haut) {
+    const milieu = (bas + haut) >> 1;
+    if (prepLectBlocs[milieu].instant + prepLectDecalageTestMs / 1000 <= t) bas = milieu + 1;
+    else haut = milieu;
+  }
+  return bas - 1;
+}
+
+// Un bloc a l'ecran.
+//
+// La boite garde ses DEUX LIGNES et sa hauteur, toujours : c'est `zone` qui est
+// haute de deux lignes, pas le texte. Un bloc d'une seule ligne se pose donc sur
+// la ligne du BAS, comme un sous-titre de film -- d'ou le decalage vers le bas,
+// plutot qu'un alignement herite de la page, qui changerait d'un site a l'autre.
+function prepBlocRendre(k) {
+  prepLectHauteur(LIGNES_VISIBLES);
+  subtitleBox.style.display = "block";
+  subtitleBox.style.opacity = "1";
+  subtitleBox.style.fontStyle = "normal";
+  ligne.style.transform = "";
+  ligne.textContent = prepLectBlocs[k].texte;
+
+  const reste = zone.clientHeight - ligne.scrollHeight;
+  if (reste < 0) {
+    // Ne devrait pas arriver : BLOC_MOTS_ABSOLU et BLOC_CARACTERES_ABSOLU sont
+    // la pour ca. Si ca arrive quand meme, on montre le DEBUT -- le ruban, lui,
+    // montre la fin, mais ici rien ne coule, la suite ne viendra jamais -- et on
+    // le DIT, plutot que de laisser du texte disparaitre en silence.
+    prepBlocDebordements++;
+    console.warn(
+      "⚠️ LiveSub : bloc trop long pour la boite (" + -reste + " px) — « " +
+        prepLectBlocs[k].texte + " »"
+    );
+  }
+  ligne.style.transform = reste > 0 ? "translateY(" + reste + "px)" : "";
+  prepLectEtatAffiche = "bloc";
+}
+
+// Le battement du mode blocs. Il ne fait rien tant que le bloc en vigueur n'a
+// pas change -- comme celui du mode mots, et pour la meme raison : il est appele
+// par deux horloges independantes, il doit donc etre idempotent.
+// Le bloc quitte l'ecran -- remplace par le suivant, ou efface parce que son
+// dernier mot est passe depuis trop longtemps. Dans les deux cas c'est ICI que
+// se mesure le temps qu'il y a reellement passe (critere 3).
+function prepBlocQuitte(t, continu) {
+  if (
+    continu &&
+    prepBlocApparuA !== null &&
+    prepBlocDurees.length < prepLectMesuresMax
+  ) {
+    prepBlocDurees.push(Math.round((t - prepBlocApparuA) * 1000));
+  }
+  prepBlocApparuA = null;
+}
+
+function prepBlocBattre(t, continu) {
+  const k = prepBlocIndex(t);
+
+  if (k < 0) {
+    prepLectMessage("attente", prepLectResume || "✅ Prêt — lance la lecture");
+    prepLectBlocCourant = -1;
+    prepBlocApparuA = null;
+    return;
+  }
+
+  // Le bloc a-t-il fait son temps ? Le decalage de test se retrouve ici aussi :
+  // il decale les instants, donc il decale l'heure de disparition avec eux.
+  const bloc = prepLectBlocs[k];
+  const expire = t >= bloc.disparition + prepLectDecalageTestMs / 1000;
+
+  if (expire) {
+    if (prepLectEtatAffiche !== "vide") {
+      prepBlocQuitte(t, continu);
+      prepLectEtatAffiche = "vide";
+      // On EFFACE la boite au lieu de la vider : un rectangle noir vide en bas
+      // de l'ecran serait plus genant qu'une absence, et il donnerait toujours
+      // l'impression qu'il se passe quelque chose.
+      //
+      // ⚠️ Par l'opacite, PAS par `display: none`. `display` ne se transitionne
+      // pas : il fait disparaitre la boite d'une image a l'autre, ce qui se lit
+      // comme une panne. L'opacite, elle, suit le fondu pose sur la boite -- et
+      // `pointer-events: none` fait que la boite invisible n'intercepte rien.
+      subtitleBox.style.opacity = "0";
+    }
+    prepLectBlocCourant = k;
+    return;
+  }
+
+  const nouveau = k !== prepLectBlocCourant;
+  if (!nouveau && prepLectEtatAffiche === "bloc") return;
+
+  if (nouveau && continu) {
+    // Critere 1 : l'ecart entre l'instant du premier mot et son apparition.
+    // ⚠️ On compare a l'instant D'ORIGINE, jamais a l'instant decale -- c'est ce
+    // qui fait que la contre-preuve a +3 s se voit dans le chiffre.
+    if (prepBlocEcarts.length < prepLectMesuresMax) {
+      prepBlocEcarts.push(Math.round((t - bloc.instant) * 1000));
+    }
+    // Le bloc precedent laisse la place. D'un bloc au suivant seulement : apres
+    // un saut, la duree ne serait plus celle d'un affichage mais celle d'un
+    // deplacement.
+    if (k === prepLectBlocCourant + 1) prepBlocQuitte(t, continu);
+    else prepBlocApparuA = null;
+  }
+
+  prepBlocApparuA = t;
+  prepLectBlocCourant = k;
+  prepBlocRendre(k);
 }
 
 // Le ruban, avec les mots reellement en vigueur.
@@ -1318,6 +1740,12 @@ function prepLectBattre() {
     }
   }
 
+  // Le mode blocs prend la main ICI, et seulement ici : tout ce qui precede --
+  // resolution de la video, detection du saut, bornes de la zone preparee -- est
+  // commun aux deux, et c'est voulu. Les deux affichages doivent voir exactement
+  // la meme lecture, sinon la comparaison entre eux ne vaudrait rien.
+  if (PREP_LECT_STYLE === "blocs") return prepBlocBattre(t, continu);
+
   const n = prepLectCombien(t);
 
   if (n === 0) {
@@ -1370,6 +1798,8 @@ function prepLectDemarrer() {
   if (prepLectActif || !prepLectStock.length) return;
   prepLectActif = true;
   prepLectVisibles = -1;
+  prepLectBlocCourant = -2;
+  prepBlocApparuA = null;
   prepLectEtatAffiche = "";
   prepLectDernierTick = 0;
   prepLectDernierePosition = 0;
@@ -1377,6 +1807,7 @@ function prepLectDemarrer() {
   prepLectMinuterie = setInterval(prepLectBattre, PREP_LECT_PAS_MS);
   console.log(
     `▶️ LiveSub : affichage du stock — ${prepLectStock.length} mots, ` +
+      (PREP_LECT_STYLE === "blocs" ? `${prepLectBlocs.length} blocs, ` : `mot par mot, `) +
       `zone ${prepLectZone.debut.toFixed(1)} s → ${prepLectZone.fin.toFixed(1)} s`
   );
 }
@@ -1410,6 +1841,13 @@ async function prepLectCharger(resume) {
       debut: Number(reponse.positionDepart) || 0,
       fin: (Number(reponse.positionDepart) || 0) + (Number(reponse.dureeCouverteS) || 0),
     };
+    // Le decoupage en phrases se fait UNE fois, ici, sur le stock complet. C'est
+    // la seule facon d'avoir la duree d'un bloc : elle depend du premier mot du
+    // bloc SUIVANT, donc de texte qui n'existe pas encore en direct.
+    prepLectBlocs =
+      PREP_LECT_STYLE === "blocs"
+        ? prepBlocsDepuisMots(prepLectStock, prepLectZone.fin)
+        : [];
     if (resume && typeof resume.nbMots === "number") {
       prepLectResume =
         `✅ Prêt — ${resume.nbMots} mots préparés, ` +
@@ -1419,6 +1857,36 @@ async function prepLectCharger(resume) {
   } catch (err) {
     prepAfficher("⚠️ Stock illisible : " + (err && err.message ? err.message : err));
   }
+}
+
+// Mediane, minimum, maximum d'une liste de mesures.
+//
+// La MEDIANE et pas la moyenne : une seule valeur aberrante -- un onglet passe
+// a l'arriere-plan une seconde, un `seek` compte a tort comme continu -- suffit
+// a deplacer une moyenne, et donnerait un chiffre plus mauvais que la realite.
+// Le MINIMUM et le MAXIMUM sont rendus tels quels, jamais arrondis : c'est la
+// ou se voient les cas qui derangent.
+function prepStats(liste) {
+  const v = liste.slice().sort((a, b) => a - b);
+  if (!v.length) return { n: 0, medianeMs: null, minMs: null, maxMs: null };
+  const mediane =
+    v.length % 2 ? v[(v.length - 1) / 2] : Math.round((v[v.length / 2 - 1] + v[v.length / 2]) / 2);
+  return { n: v.length, medianeMs: mediane, minMs: v[0], maxMs: v[v.length - 1] };
+}
+
+// Remet a zero TOUT ce qui est mesure, dans les deux modes, et force le prochain
+// battement a re-rendre. Appele par la contre-preuve : garder des mesures faites
+// avant le decalage les melangerait a celles d'apres, et le +3 s ne se verrait
+// plus que de moitie.
+function prepRazMesures() {
+  prepLectMesures = [];
+  prepLectVisibles = -1;
+  prepBlocEcarts = [];
+  prepBlocDurees = [];
+  prepBlocApparuA = null;
+  prepLectBlocCourant = -2;
+  prepBlocDebordements = 0;
+  prepLectEtatAffiche = "";
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,38 +1908,118 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === "PREPARATION_MESURES") {
-    const v = prepLectMesures.slice().sort((a, b) => a - b);
-    const mediane = v.length
-      ? v.length % 2
-        ? v[(v.length - 1) / 2]
-        : Math.round((v[v.length / 2 - 1] + v[v.length / 2]) / 2)
-      : null;
     sendResponse({
       success: true,
-      n: v.length,
-      medianeMs: mediane,
-      maxMs: v.length ? v[v.length - 1] : null,
-      minMs: v.length ? v[0] : null,
+      style: PREP_LECT_STYLE,
+      // Mode mots : un ecart par MOT revele. Inchange.
+      ...prepStats(prepLectMesures),
       decalageTestMs: prepLectDecalageTestMs,
       motsAffiches: prepLectVisibles,
       remplacementsVideo: prepVideoRemplacements,
       etat: prepLectEtatAffiche,
+      // Mode blocs : un ecart par BLOC (critere 1) et le temps reellement passe
+      // a l'ecran par chacun (critere 3).
+      blocCourant: prepLectBlocCourant,
+      ecartBlocs: prepStats(prepBlocEcarts),
+      dureeBlocs: prepStats(prepBlocDurees),
+      debordementsVus: prepBlocDebordements,
+    });
+    return;
+  }
+
+  // L'AUDIT DES BLOCS (criteres 3 et 4).
+  //
+  // La hauteur n'est pas calculee, elle est MESUREE : on ecrit reellement chaque
+  // bloc dans l'element d'affichage et on lit son `scrollHeight`. Meme element,
+  // meme police, meme largeur, meme retour a la ligne que ce que verra l'oeil --
+  // une estimation en « caracteres par ligne » se tromperait sur les mots longs
+  // et sur toute page qui change la police.
+  //
+  // C'est synchrone du premier au dernier bloc, donc le navigateur ne repeint
+  // pas entre deux : rien ne clignote, et l'affichage est remis en place avant
+  // de rendre la main.
+  if (request.type === "PREPARATION_BLOCS") {
+    const sauveTexte = ligne.textContent;
+    const sauveTransform = ligne.style.transform;
+    const hauteurZone = zone.clientHeight;
+
+    let debordent = 0;
+    let hauteurMax = 0;
+    let plusLong = null;
+
+    const durees = [];
+    const courts = [];
+    let vide = 0; // secondes ou la boite est effacee, faute de texte a montrer
+
+    for (const b of prepLectBlocs) {
+      ligne.style.transform = "";
+      ligne.textContent = b.texte;
+      const h = ligne.scrollHeight;
+      if (h > hauteurZone) debordent++;
+      if (h > hauteurMax) hauteurMax = h;
+      if (!plusLong || b.texte.length > plusLong.texte.length) {
+        plusLong = { texte: b.texte, nbMots: b.nbMots, hauteurPx: h };
+      }
+      // Le temps VISIBLE, pas la largeur du creneau : depuis l'etape du
+      // 2026-08-28 un bloc s'efface quand son dernier mot est passe depuis
+      // BLOC_APRES_PAROLE, meme si le suivant n'est pas encore la.
+      const d = Math.round((b.disparition - b.instant) * 1000);
+      durees.push(d);
+      vide += b.fin - b.disparition;
+      if (d < BLOC_DUREE_MIN * 1000) courts.push({ ms: d, texte: b.texte });
+    }
+
+    ligne.textContent = sauveTexte;
+    ligne.style.transform = sauveTransform;
+
+    sendResponse({
+      success: true,
+      style: PREP_LECT_STYLE,
+      nbBlocs: prepLectBlocs.length,
+      nbMots: prepLectStock.length,
+      dureePlan: prepStats(durees),
+      // Le temps total sans aucun sous-titre a l'ecran. C'est la mesure du
+      // probleme AMONT (des trous dans le stock), rendue visible plutot que
+      // masquee par un bloc qui trainait.
+      ecranVideS: Math.round(vide * 10) / 10,
+      nbCourts: courts.length,
+      exemplesCourts: courts.slice(0, 5),
+      motsMax: prepLectBlocs.reduce((m, b) => Math.max(m, b.nbMots), 0),
+      caracteresMax: prepLectBlocs.reduce((m, b) => Math.max(m, b.texte.length), 0),
+      hauteurZonePx: hauteurZone,
+      hauteurMaxPx: hauteurMax,
+      nbDebordent: debordent,
+      debordementsVus: prepBlocDebordements,
+      plusLong,
+      // La liste, plafonnee : elle sert a verifier DEPUIS LA PAGE que le texte
+      // reellement affiche est bien celui qu'on attendait, a l'heure qu'on
+      // attendait. Un message de diagnostic ne doit pas pouvoir devenir enorme
+      // sur une video de deux heures -- d'ou le plafond, et d'ou `tronquee`,
+      // parce qu'une liste coupee en silence ferait croire a une couverture
+      // complete.
+      blocs: prepLectBlocs.slice(0, 400).map((b) => ({
+        instant: b.instant,
+        fin: b.fin,
+        finParole: b.finParole,
+        disparition: b.disparition,
+        nbMots: b.nbMots,
+        texte: b.texte,
+      })),
+      tronquee: prepLectBlocs.length > 400,
     });
     return;
   }
 
   if (request.type === "PREPARATION_TEST_DECALAGE") {
     prepLectDecalageTestMs = Number(request.ms) || 0;
-    prepLectMesures = [];
-    prepLectVisibles = -1;
-    prepLectEtatAffiche = "";
+    prepRazMesures();
     console.warn(`🧪 LiveSub : décalage de test = ${prepLectDecalageTestMs} ms`);
     sendResponse({ success: true, decalageTestMs: prepLectDecalageTestMs });
     return;
   }
 
   if (request.type === "PREPARATION_MESURES_RAZ") {
-    prepLectMesures = [];
+    prepRazMesures();
     sendResponse({ success: true });
     return;
   }

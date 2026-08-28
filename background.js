@@ -747,8 +747,16 @@ async function doPreparationDemarrer() {
     }
 
     // 4. La position de depart debloque l'enregistrement.
+    //
+    // ⚠️ `positionDepart` (relevee APRES `play()`), pas `position` (relevee
+    // AVANT qu'on touche au lecteur). La seconde sert a rendre le lecteur tel
+    // qu'on l'a trouve ; l'utiliser ici daterait tout le stock trop tot, de ce
+    // que la video avance pendant que le lecteur demarre.
     await chrome.runtime
-      .sendMessage({ type: "PREPARATION_POSITION", position: pilote.position })
+      .sendMessage({
+        type: "PREPARATION_POSITION",
+        position: pilote.positionDepart ?? pilote.position,
+      })
       .catch(() => {});
 
     console.log(`✅ Preparation lancee sur l'onglet ${tabId} a x${PREP_VITESSE}`);

@@ -1795,12 +1795,19 @@ const PREP_VITESSE = 2;
 // Et le premier run complet le confirme : 46,9 mots par bloc de 30 s, soit
 // exactement le plafond de 60 jetons.
 //
-// Lever ce plafond demanderait de modifier whisper.worker.js, ce que la tache
-// interdit. On reste donc a 15 s, ou rien n'est perdu. Le prix est la vitesse :
-// 2,44x le temps reel au lieu de 4,20x. A x2 il faut tenir au-dessus de 2x,
-// donc ca passe -- mais sans marge, et la preparation peut finir un peu apres
-// la video sur une machine lente (rien n'est perdu pour autant : la file est
-// videe a l'arret).
+// ⚠️ MISE A JOUR DU 2026-08-28 : LE PLAFOND EST LEVE, LA CONTRAINTE NE TIENT
+// PLUS -- MAIS ON N'A PAS ENCORE MESURE LA SUITE.
+//
+// whisper.worker.js accepte desormais un plafond de jetons par requete, et la
+// preparation le dimensionne sur la duree du bloc (PREP_JETONS_PAR_S). La seule
+// raison de rester a 15 s a donc disparu, et 30 s redevient possible -- ce qui
+// ferait passer la preparation de 2,44x a 4,20x le temps reel, soit de « ca
+// passe sans marge » a « c'est fini bien avant la video ».
+//
+// On ne le fait PAS dans la meme fournee : un bloc plus long est aussi un trou
+// plus grand quand Whisper renonce sur ce bloc-la, et c'est justement ce qu'on
+// est en train de corriger. A mesurer separement, sur du son reel : couverture
+// et nombre de mots par seconde a 15 s contre 30 s.
 const PREP_BLOC_CONTENU = 15;
 
 // Ce que Whisper attend.
@@ -1809,6 +1816,56 @@ const PREP_TAUX = 16000;
 // En dessous de ca, un reste de fin n'est pas transcrit : sur moins d'une
 // seconde whisper-tiny n'ecoute plus, il recite (voir CLAUDE.md).
 const PREP_RESTE_MIN_CONTENU = 1.0;
+
+// ---------------------------------------------------------------------------
+// Combien de jetons Whisper a le droit d'ecrire pour UN bloc
+// ---------------------------------------------------------------------------
+//
+// ⚠️ LE PLAFOND PAR DEFAUT DU WORKER (60 jetons) COUPE LE FRANCAIS EN PLEIN
+// MILIEU, ET C'EST MESURE.
+//
+// Mesure du 2026-08-28, tokenizer de whisper-tiny, en local :
+//     francais  1,55 jeton par mot   (« Les chercheurs ont decouvert… » : 31
+//                                     mots -> 48 jetons)
+//     anglais   1,05 jeton par mot   (JFK : 22 mots -> 23 jetons)
+//
+// 60 jetons valent donc 39 mots francais. Un bloc de 15 s ne tient sous ce
+// plafond que si on parle a MOINS DE 2,6 MOTS PAR SECONDE -- c'est-a-dire
+// presque jamais : un documentaire tourne autour de 3 mots/s, une conversation
+// autour de 4. Au-dela, Whisper est coupe net, sans rien signaler : le bloc rend
+// un texte parfaitement credible qui s'arrete au bout de 10 a 13 s, et les
+// dernieres secondes de CHAQUE bloc n'ont aucun mot dans le stock.
+//
+// C'est exactement la maladie constatee -- des phrases entieres qui manquent, et
+// un overlay qui s'efface tout seul en plein milieu de la parole.
+//
+// Le plafond n'est pas supprime pour autant : il est ce qui empeche une boucle
+// de repetition de monopoliser le worker. Il est simplement DIMENSIONNE SUR LE
+// BLOC : 12 jetons par seconde de contenu, soit ~7,7 mots francais par seconde,
+// le double du debit le plus rapide. Une boucle de repetition reste bornee, et
+// `no_repeat_ngram_size` l'empeche de toute facon de commencer.
+const PREP_JETONS_PAR_S = 12;
+
+// ---------------------------------------------------------------------------
+// Ou couper un bloc : au silence le plus proche, jamais en plein mot
+// ---------------------------------------------------------------------------
+//
+// Une coupure a l'echantillon pres tombe ou elle tombe. La parole occupe la
+// plus grande partie du temps, donc une coupure aveugle tombe le plus souvent
+// A L'INTERIEUR d'un mot : ce mot est perdu deux fois -- ampute a la fin d'un
+// bloc, et ampute au debut du suivant, ou il donne en plus a whisper-tiny une
+// attaque qui ne ressemble a rien.
+//
+// Contrairement au moteur en flux, il n'y a ici aucun recouvrement pour
+// rattraper le mot coupe : chaque bloc est transcrit UNE fois. La coupure doit
+// donc etre bonne du premier coup.
+//
+// On recule donc d'au plus PREP_RECUL_COUPE secondes de contenu pour tomber sur
+// la tranche la moins bruyante -- entre deux mots, entre deux phrases. Le bloc
+// est alors un peu plus court, jamais plus long : rien n'est saute, le reste
+// part avec le bloc suivant.
+const PREP_RECUL_COUPE = 1.5;   // secondes de CONTENU
+const PREP_TRAME_COUPE = 0.02;  // 20 ms : la resolution de la recherche
 
 let prepActif = false;
 let prepContext = null;
@@ -1829,6 +1886,35 @@ let prepLangue = "french";
 // qu'une fois content.js reellement lance) -- d'ou le drapeau ci-dessous.
 let prepPositionDepart = 0;
 let prepDepartConfirme = false;
+
+// ---------------------------------------------------------------------------
+// L'heure des mots est LUE sur la video, pas deduite du nombre d'echantillons
+// ---------------------------------------------------------------------------
+//
+// ⚠️ CE QUI NE MARCHAIT PAS. L'instant d'un mot valait
+// `positionDepart + echantillonsConsommes / taux * VITESSE` : une regle
+// d'arithmetique qui suppose que la video avance d'exactement deux secondes par
+// seconde d'horloge, du debut a la fin. Elle ne le fait pas. Un rechargement de
+// tampon, une coupure publicitaire, un lecteur qui reprend brievement la main
+// sur la vitesse (content.js en accepte jusqu'a PREP_RECALAGES_MAX), et la
+// capture continue d'empiler du son pendant que `currentTime`, lui, n'avance
+// pas.
+//
+// L'ecart ne se rattrape jamais : il s'AJOUTE. Tout ce qui suit le premier
+// incident est date trop tard, et le decalage grandit a chaque incident
+// suivant. A l'ecran, c'est du texte juste affiche au mauvais moment -- ce qui
+// se lit exactement comme une transcription fausse.
+//
+// Donc : content.js envoie la position reelle de la video a chaque battement
+// (500 ms), et on garde le lien « autant d'echantillons captes <-> la video en
+// etait la ». L'heure d'un mot est INTERPOLEE dans cette table. Un arret de la
+// video n'avance plus la position, donc il ne decale plus rien.
+let prepAncres = [];  // [{ echantillons, position }], les deux croissants
+
+// Une ancre toutes les 500 ms : 7200 pour une heure de video. La borne existe
+// pour qu'une seance tres longue ne fasse pas enfler la memoire indefiniment ;
+// au-dela on garde une ancre sur deux, ce qui double simplement le pas.
+const PREP_ANCRES_MAX = 8000;
 
 // Le son capte, en attente de decoupage. Au taux de la CAPTURE (48 kHz), pas
 // encore ramene a la vitesse normale.
@@ -1865,7 +1951,78 @@ function prepReinitialiser() {
   prepArretDemande = false;
   prepDepartConfirme = false;
   prepPositionDepart = 0;
+  prepAncres = [];
   prepAttentes.clear();
+}
+
+// ---------------------------------------------------------------------------
+// La table « echantillons captes <-> position de la video »
+// ---------------------------------------------------------------------------
+
+// Combien d'echantillons ont ete captes en tout depuis le debut de
+// l'enregistrement -- ceux deja partis vers Whisper PLUS ceux qui attendent.
+// C'est le repere commun a tout ce qui suit.
+function prepEchantillonsTotal() {
+  return prepConsommes + prepEnAttente;
+}
+
+// Une position de video vient d'arriver : on la relie a la quantite de son
+// captee a cet instant.
+//
+// ⚠️ Strictement croissante, dans les DEUX colonnes. Un utilisateur ne peut pas
+// reculer pendant la preparation (content.js pilote le lecteur), mais un lecteur
+// qui se reconstruit peut renvoyer un `currentTime` de 0 pendant une image ou
+// deux. Une ancre qui recule ferait reculer l'interpolation avec elle, et
+// jetterait tout le stock qui suit dans le passe.
+function prepNoterPosition(position) {
+  if (!Number.isFinite(position)) return;
+  const echantillons = prepEchantillonsTotal();
+  const derniere = prepAncres.length ? prepAncres[prepAncres.length - 1] : null;
+
+  if (derniere) {
+    if (position <= derniere.position || echantillons <= derniere.echantillons) return;
+  }
+
+  prepAncres.push({ echantillons, position });
+
+  // Trop d'ancres : on garde une sur deux. Le pas double, la table reste juste.
+  if (prepAncres.length > PREP_ANCRES_MAX) {
+    prepAncres = prepAncres.filter((_, i) => i % 2 === 0 || i === prepAncres.length - 1);
+  }
+}
+
+// La position de la video quand on avait capte `echantillons` echantillons.
+//
+// Entre deux ancres : interpolation lineaire. Avant la premiere ou apres la
+// derniere : on prolonge a la vitesse nominale, faute de mieux -- c'est
+// exactement l'ancien calcul, mais il ne s'applique plus qu'aux bords.
+function prepPositionDe(echantillons) {
+  if (!prepAncres.length) {
+    return prepPositionDepart + prepSecondesContenu(echantillons);
+  }
+
+  const premiere = prepAncres[0];
+  if (echantillons <= premiere.echantillons) {
+    return premiere.position - prepSecondesContenu(premiere.echantillons - echantillons);
+  }
+
+  const derniere = prepAncres[prepAncres.length - 1];
+  if (echantillons >= derniere.echantillons) {
+    return derniere.position + prepSecondesContenu(echantillons - derniere.echantillons);
+  }
+
+  let bas = 0;
+  let haut = prepAncres.length - 1;
+  while (haut - bas > 1) {
+    const milieu = (bas + haut) >> 1;
+    if (prepAncres[milieu].echantillons <= echantillons) bas = milieu;
+    else haut = milieu;
+  }
+  const a = prepAncres[bas];
+  const b = prepAncres[haut];
+  const largeur = b.echantillons - a.echantillons;
+  if (largeur <= 0) return a.position;
+  return a.position + ((echantillons - a.echantillons) / largeur) * (b.position - a.position);
 }
 
 // Combien d'echantillons de capture font un bloc.
@@ -1934,12 +2091,23 @@ function prepDemarrerWhisper(memo) {
   prepWorker.postMessage({ type: "init", memo: memo ?? null });
 }
 
-function prepTranscrire(audio) {
+function prepTranscrire(audio, dureeContenu) {
   const id = prepProchainId++;
   const promesse = new Promise((resolve, reject) => {
     prepAttentes.set(id, { resolve, reject });
   });
-  prepWorker.postMessage({ type: "transcribe", id, audio, langue: prepLangue }, [audio.buffer]);
+  // Le plafond de jetons est dimensionne SUR LE BLOC, pas herite du direct.
+  // Voir PREP_JETONS_PAR_S : 60 jetons coupent le francais au bout de 13 s.
+  prepWorker.postMessage(
+    {
+      type: "transcribe",
+      id,
+      audio,
+      langue: prepLangue,
+      maxJetons: Math.ceil((dureeContenu || PREP_BLOC_CONTENU) * PREP_JETONS_PAR_S),
+    },
+    [audio.buffer]
+  );
   return promesse;
 }
 
@@ -2001,11 +2169,77 @@ function prepPrendre(taille) {
   return ecrit === taille ? sortie : sortie.subarray(0, ecrit);
 }
 
+// Lire dans la file SANS rien consommer. Sert uniquement a chercher ou couper :
+// on doit regarder la fin du bloc avant de decider de sa taille.
+function prepRegarder(debut, longueur) {
+  const sortie = new Float32Array(longueur);
+  let saute = 0;
+  let ecrit = 0;
+  for (const morceau of prepBlocs) {
+    if (ecrit >= longueur) break;
+    if (saute + morceau.length <= debut) {
+      saute += morceau.length;
+      continue;
+    }
+    const depuis = Math.max(0, debut - saute);
+    const prend = Math.min(morceau.length - depuis, longueur - ecrit);
+    sortie.set(morceau.subarray(depuis, depuis + prend), ecrit);
+    ecrit += prend;
+    saute += morceau.length;
+  }
+  return ecrit === longueur ? sortie : sortie.subarray(0, ecrit);
+}
+
+// Le meilleur endroit ou couper un bloc de `taille` echantillons : la tranche
+// de 20 ms la moins bruyante dans la derniere PREP_RECUL_COUPE seconde de
+// contenu. On rend la taille effective du bloc, toujours <= `taille`.
+//
+// Quand la parole est continue et qu'aucune tranche ne sort du lot, le minimum
+// tombe ou il tombe et on n'a rien perdu : c'est la coupure aveugle d'avant.
+function prepTailleJusquAuSilence(taille) {
+  const recul = Math.round((PREP_RECUL_COUPE * prepTauxCapture) / PREP_VITESSE);
+  const trame = Math.round((PREP_TRAME_COUPE * prepTauxCapture) / PREP_VITESSE);
+  if (recul <= trame * 2 || taille <= recul + trame) return taille;
+
+  const zone = prepRegarder(taille - recul, recul);
+  if (zone.length < trame * 2) return taille;
+
+  let meilleur = -1;
+  let meilleureEnergie = Infinity;
+  for (let f = 0; f + trame <= zone.length; f += trame) {
+    let energie = 0;
+    for (let i = f; i < f + trame; i++) energie += zone[i] * zone[i];
+    // `<=` et pas `<` : a energie egale on garde la tranche la PLUS TARDIVE.
+    // Sur du silence pur (ou sur un signal parfaitement plat), toutes les
+    // tranches se valent -- et le bloc doit alors garder sa taille pleine, pas
+    // se faire raccourcir de PREP_RECUL_COUPE a chaque fois pour rien.
+    if (energie <= meilleureEnergie) {
+      meilleureEnergie = energie;
+      meilleur = f;
+    }
+  }
+  if (meilleur < 0) return taille;
+
+  // On coupe au MILIEU de la tranche la plus calme : c'est le point le plus
+  // eloigne de la parole qui la precede et de celle qui la suit.
+  return taille - recul + meilleur + (trame >> 1);
+}
+
 // Les { mot, instant } d'un bloc, en secondes de VIDEO.
 //
-// `debut` sort de Whisper en secondes depuis le debut du bloc. On y ajoute la
-// position de depart de la video et tout le contenu deja consomme.
-function prepMotsDuBloc(morceaux, offsetContenu, dureeBloc) {
+// `debut` sort de Whisper en secondes depuis le debut du bloc. On le rapporte
+// aux positions de video REELLEMENT observees aux deux bouts du bloc (voir
+// prepPositionDe) plutot qu'a un compte d'echantillons.
+//
+// `echelle` vaut 1 quand tout s'est bien passe : la video a avance d'exactement
+// la duree de contenu du bloc. Elle ne s'en ecarte que si la video a cale ou
+// saute pendant ce bloc-la. On ne la suit alors que dans une fourchette etroite :
+// au-dela, l'incident n'est pas une lente derive mais un trou franc, et etirer
+// les mots dessus les mettrait tous au mauvais endroit plutot qu'un seul.
+function prepMotsDuBloc(morceaux, posDebut, posFin, dureeBloc) {
+  let echelle = dureeBloc > 0 ? (posFin - posDebut) / dureeBloc : 1;
+  if (!Number.isFinite(echelle) || echelle < 0.8 || echelle > 1.25) echelle = 1;
+
   // recollerMots() est la fonction du moteur en flux, reutilisee telle quelle :
   // un « mot » de Whisper n'est pas un mot typographique (« J'adore, » arrive
   // en deux morceaux, « J » puis « 'adore, »), et c'est l'espace qui precede
@@ -2029,30 +2263,40 @@ function prepMotsDuBloc(morceaux, offsetContenu, dureeBloc) {
 
     sortie.push({
       mot: recolle.mot,
-      instant: Number((prepPositionDepart + offsetContenu + t).toFixed(3)),
+      instant: Number((posDebut + t * echelle).toFixed(3)),
     });
   }
   return sortie;
 }
 
 async function prepTraiterBloc(taille) {
-  const brut = prepPrendre(taille);
+  // Les deux bornes du bloc, EN ECHANTILLONS CAPTES depuis le debut : c'est le
+  // repere de la table des ancres. On les releve avant de consommer.
+  const debutEchantillons = prepConsommes;
+
+  // Un bloc PLEIN se coupe au silence le plus proche ; un reste de fin part tel
+  // quel (il n'y a plus rien apres lui pour reprendre ce qu'on laisserait).
+  const complet = taille === prepEchantillonsParBloc();
+  const brut = prepPrendre(complet ? prepTailleJusquAuSilence(taille) : taille);
   if (!brut.length) return;
 
-  // L'offset se calcule AVANT d'incrementer : c'est la position, dans le
-  // contenu, du premier echantillon de ce bloc.
-  const offsetContenu = prepSecondesContenu(prepConsommes);
   prepConsommes += brut.length;
   const dureeBloc = prepSecondesContenu(brut.length);
+
+  // Les positions de video observees aux deux bouts. Elles remplacent le calcul
+  // « depart + contenu deja consomme », qui derivait a chaque fois que la video
+  // s'arretait sans que la capture s'arrete (voir prepAncres).
+  const posDebut = prepPositionDe(debutEchantillons);
+  const posFin = prepPositionDe(debutEchantillons + brut.length);
 
   const audio = await prepReechantillonner(brut);
 
   const debut = performance.now();
-  const resultat = await prepTranscrire(audio);
+  const resultat = await prepTranscrire(audio, dureeBloc);
   const ms = Math.round(performance.now() - debut);
   prepTemoins.push(ms);
 
-  const nouveaux = prepMotsDuBloc(resultat.mots, offsetContenu, dureeBloc);
+  const nouveaux = prepMotsDuBloc(resultat.mots, posDebut, posFin, dureeBloc);
   prepMots.push(...nouveaux);
 
   // ⚠️ DETECTEUR DE TRONCATURE — pour qu'une perte de texte ne soit JAMAIS muette.
@@ -2066,21 +2310,26 @@ async function prepTraiterBloc(taille) {
   // condition sur le nombre de morceaux : peu de mots = vrai silence, beaucoup
   // de mots = quota atteint.
   const morceaux = Array.isArray(resultat.mots) ? resultat.mots.length : 0;
-  const dernier = nouveaux.length ? nouveaux[nouveaux.length - 1].instant - prepPositionDepart - offsetContenu : 0;
+  const dernier = nouveaux.length ? nouveaux[nouveaux.length - 1].instant - posDebut : 0;
   const couvert = dureeBloc > 0 ? dernier / dureeBloc : 1;
-  if (couvert < 0.9 && morceaux >= 30) {
+  // ⚠️ Le seuil de morceaux a BAISSE (30 -> 12) le 2026-08-28. Il valait 30
+  // parce que le plafond de jetons etait a 60 : sous 30 morceaux, un bloc court
+  // ne pouvait etre que du silence. Le plafond suit maintenant la duree du bloc,
+  // donc un bloc de 15 s qui ne rend que 12 mots n'est plus un bloc coupe par le
+  // quota : c'est un bloc ou Whisper a renonce. C'est ca qu'on veut voir.
+  if (couvert < 0.9 && morceaux >= 12) {
     console.warn(
-      `⚠️ Preparation : bloc ${prepTemoins.length} probablement TRONQUE — ` +
+      `⚠️ Preparation : bloc ${prepTemoins.length} INCOMPLET — ` +
         `${morceaux} morceaux, dernier mot a ${dernier.toFixed(1)} s sur ${dureeBloc.toFixed(1)} s ` +
-        `(${Math.round(couvert * 100)} % couvert). Plafond max_new_tokens de whisper.worker.js ?`
+        `(${Math.round(couvert * 100)} % couvert, plafond ${Math.ceil(dureeBloc * PREP_JETONS_PAR_S)} jetons)`
     );
     prepBlocsTronques++;
-    prepStatut(`⚠️ Texte tronqué sur ${prepBlocsTronques} bloc(s) : parole trop dense`);
+    prepStatut(`⚠️ Texte incomplet sur ${prepBlocsTronques} bloc(s)`);
   }
 
   console.log(
     `📦 Preparation : bloc ${prepTemoins.length} — ` +
-      `${dureeBloc.toFixed(1)} s de contenu a partir de ${(prepPositionDepart + offsetContenu).toFixed(1)} s, ` +
+      `${dureeBloc.toFixed(1)} s de contenu a partir de ${posDebut.toFixed(1)} s (video), ` +
       `${nouveaux.length} mots, ${ms} ms ` +
       `(${(dureeBloc / (ms / 1000)).toFixed(2)}x le temps reel)`
   );
@@ -2297,7 +2546,9 @@ async function arreterPreparation() {
 // Ce que le service worker et l'overlay ont besoin de savoir. Le stock lui-meme
 // (prepMots) RESTE ICI, en memoire : c'est l'etape B qui viendra le chercher.
 function prepResume() {
-  const dureeCouverteS = prepSecondesContenu(prepConsommes);
+  // La zone preparee se lit sur la video, pas sur le compteur d'echantillons :
+  // c'est elle qui dit jusqu'ou l'affichage a le droit de promettre du texte.
+  const dureeCouverteS = Math.max(0, prepPositionDe(prepConsommes) - prepPositionDepart);
   const premier = prepTemoins.length ? prepTemoins[0] : null;
   const dernier = prepTemoins.length ? prepTemoins[prepTemoins.length - 1] : null;
   const derive = premier && dernier ? Math.round(((dernier - premier) / premier) * 100) : null;
@@ -2341,12 +2592,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // La position de depart de la video, envoyee une fois que content.js a
-  // reellement lance le defilement. Elle debloque l'enregistrement.
+  // La position de la video. Le PREMIER message debloque l'enregistrement et
+  // fixe le depart ; tous les suivants (content.js en envoie un par battement,
+  // soit toutes les 500 ms) alimentent la table des ancres.
+  //
+  // ⚠️ `prepPositionDepart` ne se remet PAS a jour a chaque message. C'est la
+  // borne basse de la zone preparee : la deplacer en cours de route ferait
+  // avancer le debut de la zone au fur et a mesure de la video, et l'affichage
+  // finirait par declarer « avant la zone preparee » tout ce qu'il vient de
+  // preparer.
   if (request.type === "PREPARATION_POSITION") {
-    prepPositionDepart = Number(request.position) || 0;
-    prepDepartConfirme = true;
-    console.log("📍 Preparation : depart a", prepPositionDepart.toFixed(2), "s");
+    const position = Number(request.position) || 0;
+    if (!prepDepartConfirme) {
+      prepPositionDepart = position;
+      prepDepartConfirme = true;
+      console.log("📍 Preparation : depart a", prepPositionDepart.toFixed(2), "s");
+    }
+    prepNoterPosition(position);
     sendResponse({ success: true });
     return;
   }
@@ -2383,7 +2645,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       success: true,
       mots: prepMots,
       positionDepart: prepPositionDepart,
-      dureeCouverteS: prepSecondesContenu(prepConsommes),
+      dureeCouverteS: Math.max(0, prepPositionDe(prepConsommes) - prepPositionDepart),
     });
     return;
   }

@@ -346,6 +346,119 @@ l'écran, lui, ajoute maintenant le retard d'affichage. `retardCalibreFluxParMod
 estime donc l'âge réel. À reprendre à l'étape 3 — qui prévoit de toute façon de mettre le
 retard du son à zéro par défaut.
 
+## Mode « préparer d'abord » : trois défauts, une seule maladie (2026-08-28)
+
+Le mode fait défiler la vidéo à x2 en silence, transcrit tout d'avance en blocs de 15 s,
+puis affiche le stock à l'heure pendant la lecture normale. Trois symptômes ont été
+rapportés — *l'overlay disparaît puis réapparaît d'un coup*, *des phrases entières
+manquent*, *le texte est parfois faux*. **Ce sont trois façons de voir le même trou dans
+le stock**, plus une désynchronisation qui s'y ajoute.
+
+### 1. `CONFIRMÉ` — 60 jetons coupent le français au bout de 13 s
+
+`whisper.worker.js` imposait `max_new_tokens = 60` à **tout le monde**. Cette valeur avait
+été dimensionnée pour les segments de 7 s du mode direct ; la préparation, elle, envoie des
+blocs de 15 s.
+
+Mesure du 2026-08-28, tokenizer de `whisper-tiny` chargé en local :
+
+| langue | mots | jetons | jetons/mot |
+|---|---|---|---|
+| français (documentaire) | 31 | 48 | **1,55** |
+| français (conversation) | 33 | 51 | **1,55** |
+| anglais (JFK) | 22 | 23 | 1,05 |
+
+60 jetons valent donc **39 mots français**. Un bloc de 15 s ne tient sous ce plafond que si
+on parle à **moins de 2,6 mots/s** — un documentaire est à ~3, une conversation à ~4. Au
+delà, Whisper est coupé net **sans rien signaler** : le bloc rend un texte crédible qui
+s'arrête au bout de 10 à 13 s, et les dernières secondes de *chaque* bloc n'ont aucun mot
+dans le stock. C'est la source principale des trous.
+
+Correctif : le plafond est un **paramètre du message `transcribe`** (`maxJetons`), borné à
+400 côté worker. Le direct garde 60 ; la préparation demande `PREP_JETONS_PAR_S = 12`
+jetons par seconde de contenu, soit 180 pour un bloc de 15 s (~7,7 mots français/s, le
+double du débit le plus rapide). La protection anti-boucle ne repose plus sur le plafond
+mais sur `no_repeat_ngram_size`, qui empêche la boucle de *commencer*.
+
+*Ce qui prouverait que c'est faux* : des blocs qui, plafond levé, s'arrêtent toujours au
+même endroit — ce serait Whisper qui renonce, pas le quota. Le détecteur de troncature de
+`prepTraiterBloc` le dit maintenant à partir de 12 morceaux (au lieu de 30, seuil qui
+n'avait de sens que sous l'ancien plafond).
+
+### 2. `CONFIRMÉ` — la coupure des blocs tombait en plein mot
+
+Contrairement au moteur en flux, **il n'y a aucun recouvrement** ici : chaque bloc est
+transcrit une fois et jamais revu. Une coupure à l'échantillon près tombe donc là où elle
+tombe — le plus souvent à l'intérieur d'un mot, qui est perdu deux fois (amputé à la fin
+d'un bloc, amputé au début du suivant, où il donne en plus à whisper-tiny une attaque qui
+ne ressemble à rien).
+
+Correctif : `prepTailleJusquAuSilence` recule d'au plus **1,5 s de contenu** pour couper au
+milieu de la tranche de 20 ms la moins bruyante. Le bloc est un peu plus court, jamais plus
+long : rien n'est sauté, le reste part avec le bloc suivant.
+
+Mesuré au banc (`banc-coupe.js`, bruit + un silence de 120 ms placé à un endroit connu) :
+
+| silence à | coupure | résultat |
+|---|---|---|
+| −0,2 s | −0,15 s | dans le silence |
+| −0,5 s | −0,45 s | dans le silence |
+| −1,0 s | −0,95 s | dans le silence |
+| −1,4 s | −1,35 s | dans le silence |
+| −3,0 s | −0,93 s | hors de portée : coupure quelconque, comme avant |
+
+⚠️ Le départage des ex æquo est `<=`, pas `<` : sur du silence pur toutes les tranches se
+valent, et avec `<` le bloc se faisait raccourcir de 1,5 s **à chaque fois, pour rien**.
+
+### 3. `CONFIRMÉ` — l'heure des mots était calculée, pas observée
+
+L'instant d'un mot valait `positionDepart + échantillonsConsommés / taux × 2`. C'est de
+l'arithmétique : elle suppose que la vidéo avance d'exactement deux secondes par seconde
+d'horloge, du début à la fin. Un rechargement de tampon, une publicité, un lecteur qui
+reprend une seconde la main sur la vitesse (`content.js` en accepte jusqu'à
+`PREP_RECALAGES_MAX`), et la capture continue d'empiler du son pendant que `currentTime`
+n'avance pas. **L'écart ne se rattrape jamais, il s'ajoute** — et du texte juste affiché au
+mauvais moment se lit exactement comme une transcription fausse.
+
+Correctif : `content.js` envoie la position réelle de la vidéo à **chaque battement**
+(500 ms) ; `offscreen.js` garde la table `prepAncres` (« autant d'échantillons captés ↔ la
+vidéo en était là ») et **interpole** l'heure de chaque mot dedans.
+
+Mesuré au banc Node/vm (`banc-ancres.js`, capture simulée de 120 s, un calage de 6 s au
+milieu — la vidéo s'arrête, la capture continue) :
+
+| | avant | après |
+|---|---|---|
+| sans incident, écart max | 0,17 s | 0,17 s |
+| calage 6 s — écart sur les **deux derniers** blocs | **12,17 s** | **0,06 s** |
+
+12 s et pas 6 : pendant 6 s d'horloge la vidéo aurait avancé de 12 s de contenu. Avec
+l'ancien calcul ce décalage restait jusqu'à la fin de la vidéo ; avec la table il a disparu
+dès le bloc suivant. (Dans le bloc qui *contient* le calage, l'écart reste grand des deux
+côtés : le silence du calage n'a de toute façon pas de mots à placer.)
+
+Au passage : la position de départ du stock est maintenant relevée **après** `play()`
+(`positionDepart`), pas avant (`position`, qui sert à rendre le lecteur tel qu'on l'a
+trouvé). Les confondre datait tout le stock trop tôt du temps de démarrage du lecteur.
+
+### 4. L'overlay qui disparaît : le symptôme, traité en symptôme
+
+`BLOC_APRES_PAROLE` efface la boîte quand un sous-titre a fait son temps sans que le
+suivant soit là. C'est **volontaire** — un sous-titre qui traîne pendant qu'on parle a l'air
+de fonctionner, ce qui est pire qu'une absence. Mais deux choses le rendaient brutal :
+
+- la valeur, **1,5 s**, avait été choisie contre des trous de 13,5 s dus au plafond de
+  jetons (défaut 1). Ce plafond levé, les trous restants sont des respirations : la tenue
+  passe à **3 s** ;
+- l'effacement se faisait par `display: none`, qui **ne se transitionne pas** — la boîte
+  disparaissait d'une image à l'autre, ce qui se lit comme une panne. Elle s'efface
+  maintenant par l'**opacité**, avec un fondu de 220 ms posé sur la boîte (et
+  `pointer-events: none`, pour qu'une boîte invisible n'intercepte pas les clics).
+
+⚠️ Si l'écran continue de se vider souvent après tout ça, **ce n'est plus l'affichage** :
+c'est qu'il reste des trous dans le stock. `PREPARATION_BLOCS` rend `ecranVideS` — le temps
+total sans aucun sous-titre — et c'est cette mesure-là qu'il faut regarder, pas l'écran.
+
 ## Contraintes techniques connues
 - ⚠️ **`chrome.storage` est indisponible dans un document offscreen.** Vérifié dans
   Chrome : `typeof chrome === "object"` mais `typeof chrome.storage === "undefined"`.
@@ -454,6 +567,11 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
 - ✅ **Étape 2 — `content.js` affiche à l'heure** : `PAS_REVELATION` et `RETARD_MAX_MOTS`
   ont disparu, les mots sortent un par un au rythme réel, les pauses redeviennent des
   pauses. Voir « L'horloge des mots » plus haut.
+- ✅ **Mode « préparer d'abord » — les trois trous bouchés** : plafond de jetons dimensionné
+  sur le bloc, coupure au silence, heure des mots lue sur la vidéo au lieu d'être calculée.
+  Voir la section dédiée plus haut. ⚠️ Validé **au banc Node/vm uniquement** — la coupure au
+  silence et le plafond de jetons demandent une vérification sur du son réel dans Chrome
+  (couverture par bloc, `ecranVideS`).
 - ⬜ **Étape 3 — retard du son à zéro par défaut** : garder les lèvres synchrones et
   laisser le texte suivre à ~2-3 s, comme les sous-titres du direct à la télé. L'option
   « Auto » reste pour qui préfère l'inverse.
@@ -467,3 +585,46 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
 - ⬜ Pistes de latence non explorées : multithread WASM (on est à `numThreads = 1` à
   cause des workers `blob:` bloqués par la CSP — 2 à 3× à gagner si on débloque). Ça se
   verrait directement : moins de temps par passe = mots révélés plus tôt.
+
+## Débogage — les trois consoles
+
+Une extension MV3 n'a pas une console mais TROIS, et elles ne se voient pas entre elles :
+
+| console          | ce qui s'y écrit                                    |
+|------------------|-----------------------------------------------------|
+| l'onglet         | `content.js` (l'overlay)                            |
+| service worker   | `background.js`                                     |
+| offscreen.html   | `offscreen.js`, le VAD, Whisper, la capture         |
+
+⚠️ **Le document offscreen n'apparaît PAS comme cible DevTools** dans une session pilotée.
+C'est pourtant là que vivent les erreurs les plus graves — celle de `chrome.storage` avait
+tout cassé en silence. Ses messages importants doivent donc remonter au service worker,
+préfixés `[OFFSCREEN]`. Côté humain, il reste inspectable à la main :
+chrome://extensions → « Inspecter les vues : offscreen.html ».
+
+**RÈGLE : ne jamais dire « aucune erreur » sans préciser sur quelle cible on était
+branché.** Une console propre ne prouve rien sur les deux autres.
+
+Et sur chrome://extensions, le bouton « Erreurs » n'apparaît que si le **mode développeur**
+est activé. Sans lui, une absence d'erreur ne prouve rien du tout.
+
+## Quand quelque chose casse — la forme de réponse attendue
+
+1. **LA CAUSE, pas le symptôme.** « Ça ne s'affiche pas » n'est pas une cause ; « le
+   message n'arrive jamais parce que le relais reconstruit l'objet et jette les champs
+   ajoutés » en est une.
+
+2. **Les solutions possibles, classées par niveau de confiance :**
+   - `CONFIRMÉ` — j'ai la preuve, la voici
+   - `PROBABLE` — cohérent avec les faits, voici lesquels
+   - `HYPOTHÈSE` — je n'ai rien pour trancher
+
+3. **Pour chacune : qu'est-ce qui prouverait qu'elle est FAUSSE ?**
+
+⛔ **Pas de pourcentage inventé.** « 80 % de chances » sans mesure est une fausse
+précision, et c'est pire que « je ne sais pas ».
+
+⚠️ **Une barre de progression n'est pas une preuve de travail.** Elle ne prouve que
+l'écoulement du temps. Vécu : la pompe de transcription se tuait elle-même (le `finally`
+d'une fonction `async` s'exécutait avant l'affectation de la promesse), plus aucun bloc
+n'était transcrit — et la barre avançait normalement jusqu'au bout.

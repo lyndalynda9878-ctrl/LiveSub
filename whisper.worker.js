@@ -86,6 +86,21 @@ const MAX_JETONS = 60;
 // identiques n'arrive quasiment jamais dans de la vraie parole.
 const NO_REPEAT_NGRAM = 6;
 
+// Plafond ABSOLU. MAX_JETONS est le defaut du direct ; l'appelant peut demander
+// plus, mais jamais au-dela de ca : c'est ce qui garantit qu'une boucle de
+// repetition ne peut pas monopoliser le worker, quel que soit le demandeur.
+//
+// 400 jetons valent ~260 mots francais (mesure du 2026-08-28 : le tokenizer de
+// whisper-tiny compte 1,55 jeton par mot en francais, contre 1,05 en anglais),
+// soit bien plus qu'aucun bloc legitime n'en produira.
+const PLAFOND_JETONS = 400;
+
+function bornerJetons(demande) {
+  const n = Number(demande);
+  if (!Number.isFinite(n) || n <= 0) return MAX_JETONS;
+  return Math.min(PLAFOND_JETONS, Math.max(16, Math.round(n)));
+}
+
 // Langue imposee a Whisper.
 //
 // Avant, on laissait la detection automatique (`language` absent). Elle se
@@ -565,7 +580,7 @@ self.onmessage = (event) => {
   }
 
   if (message.type === "transcribe") {
-    const { id, audio, langue } = message;
+    const { id, audio, langue, maxJetons } = message;
 
     enfiler(async () => {
       try {
@@ -581,7 +596,7 @@ self.onmessage = (event) => {
         // boucle de repetition de monopoliser le worker (voir MAX_JETONS).
         const resultat = await transcrire(audio, {
           language: langue || LANGUE_DEFAUT,
-          max_new_tokens: MAX_JETONS,
+          max_new_tokens: bornerJetons(maxJetons),
           no_repeat_ngram_size: NO_REPEAT_NGRAM,
           // Absent uniquement si une page de mesure a demande `?horodatage=non`.
           ...(HORODATAGE ? { return_timestamps: HORODATAGE } : {}),
