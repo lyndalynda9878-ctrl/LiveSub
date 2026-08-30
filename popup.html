@@ -102,83 +102,29 @@
 <body>
   <h3>🎬 LiveSub</h3>
 
-  <!-- Un vrai mode d'usage, pas un reglage technique.
-       « Direct »            : ce que fait LiveSub depuis le debut -- on capte,
-                               on transcrit, les sous-titres suivent la parole
-                               avec quelques secondes de retard.
-       « Preparer d'abord »  : la video defile en accelere ET EN SILENCE, on
-                               constitue le stock de sous-titres, puis on la
-                               regarde. Rien ne s'affiche pendant la lecture
-                               pour l'instant : c'est l'etape suivante. -->
-  <label for="mode">Mode</label>
-  <select id="mode">
-    <option value="direct">Direct (sous-titres en temps reel)</option>
-    <option value="preparer">Preparer d'abord (defilement rapide, silencieux)</option>
-  </select>
+  <!-- ⚠️ UN SEUL BOUTON, ET AUCUN REGLAGE. Ce n'est pas un oubli.
 
-  <!-- La `value` est le nom de langue attendu par Transformers.js (anglais,
-       minuscule) ; le texte affiche est le nom natif, plus parlant pour qui
-       cherche sa langue dans la liste. Attention : "nederlands" n'existe pas
-       cote Whisper, la valeur correcte est "dutch". -->
-  <label for="langue">Langue parlee dans la video</label>
-  <select id="langue">
-    <option value="french">Français</option>
-    <option value="english">English</option>
-    <option value="arabic">العربية</option>
-    <option value="spanish">Español</option>
-    <option value="german">Deutsch</option>
-    <option value="italian">Italiano</option>
-    <option value="portuguese">Português</option>
-    <option value="dutch">Nederlands</option>
-    <option value="russian">Русский</option>
-    <option value="chinese">中文</option>
-    <option value="japanese">日本語</option>
-    <option value="korean">한국어</option>
-    <option value="turkish">Türkçe</option>
-    <option value="polish">Polski</option>
-    <option value="hindi">हिन्दी</option>
-  </select>
+       Ont disparu a l'etape 5, avec le mode direct :
 
-  <!-- Retarder le son permet de le recaler sur les sous-titres, qui arrivent
-       toujours avec un temps de retard (le temps de transcrire). Ca ne rend
-       PAS les sous-titres plus rapides : ca ralentit le son pour qu'il les
-       rejoigne. -->
-  <label for="retardAudio">Retarder le son</label>
-  <select id="retardAudio">
-    <option value="0">Désactivé</option>
-    <option value="auto">Auto (aligné sur la voix)</option>
-    <option value="2">2 s</option>
-    <option value="5">5 s</option>
-    <option value="7">7 s</option>
-    <option value="9">9 s</option>
-    <option value="11">11 s</option>
-    <option value="13">13 s</option>
-  </select>
-  <div id="retardInfo"></div>
+       - le CHOIX DU MODE : il n'y en a plus qu'un. Le direct avait servi a
+         demontrer le triangle impossible (texte synchrone avec le son, son
+         synchrone avec l'image, transcription en direct : deux sur trois au
+         mieux). Il a prouve ce qu'il avait a prouver.
 
-  <!-- Le moteur produit deux textes : le STABLE (confirme par deux passes, il
-       ne bougera plus jamais) et la FIN PROVISOIRE (la derniere hypothese, que
-       la passe suivante a le droit de corriger).
+       - la LANGUE PARLEE : Parakeet la detecte tout seul, son vocabulaire ne
+         contient aucun jeton de langue. Whisper, lui, en avait besoin. Le menu
+         etait devenu un bouton debranche.
 
-       Decoche = on n'affiche que le stable : le texte ne fait que s'allonger,
-       plus rien ne se reecrit sous les yeux, au prix d'environ 2 s de retard
-       en plus. Coche = on montre aussi la fin provisoire : plus reactif, mais
-       les derniers mots se corrigent en direct.
+       - le RETARD DU SON : il servait a ramener le son sur des sous-titres qui
+         arrivaient en retard. En preparation, le texte est pret AVANT la
+         lecture : il n'y a plus de retard a rattraper.
 
-       Ca se juge a l'oeil : la case bascule A CHAUD, sans arreter la capture. -->
-  <div class="option">
-    <input type="checkbox" id="afficherProvisoire">
-    <label for="afficherProvisoire">
-      Afficher la fin provisoire
-      <span class="aide">Plus reactif, mais les derniers mots se corrigent</span>
-    </label>
-  </div>
+       - la case AFFICHER LA FIN PROVISOIRE : elle decrivait LocalAgreement-2
+         (texte stable confirme par deux passes / fin encore incertaine), un
+         mecanisme du moteur en flux qui n'existe plus. -->
+  <button id="prepBtn">▶️ Demarrer</button>
+  <div id="prepStatus">⏸️ Pret a demarrer</div>
 
-  <button id="toggleBtn">▶️ Demarrer</button>
-  <div id="status">⏸️ Arrete</div>
-
-  <button id="prepBtn">⏩ Preparer</button>
-  <div id="prepStatus">⏸️ Pret a preparer</div>
   <script src="popup.js"></script>
 </body>
 </html>

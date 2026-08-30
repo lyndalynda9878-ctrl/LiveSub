@@ -115,242 +115,29 @@ console.log("✅ Overlay cree sur la page");
 // recouvrirait une phrase transcrite serait pire que pas de message du tout.
 let premierTexteAffiche = false;
 
-// Le texte VISE : une liste de { mot, instant, du }.
-//   `instant` = quand le mot a ete PRONONCE (heure absolue, venue du moteur) ;
-//   `du`      = quand il DOIT apparaitre, soit `instant + retard`.
-// `nbVisibles` dit combien sont deja sortis ; l'ecart, c'est ce qui attend son
-// heure.
+// Le texte affiche : une liste de { mot }, et combien en sont deja sortis.
+// C'est la boucle de lecture de la preparation qui les remplit (voir
+// prepLectRendre) ; `rendre()` ne fait que les ecrire a l'ecran.
+//
+// ⚠️ Le champ `instant` a disparu de cette liste avec l'horloge des mots : en
+// preparation, l'heure d'un mot est lue directement dans le stock, et c'est
+// `currentTime` de la video qui decide -- pas une minuterie.
 let motsCible = [];
 let nbVisibles = 0;
-let minuterie = null;
 
-// Instant du mot le plus recent de la cible, et « son age a-t-il deja ete
-// mesure ? ». Sert a la trace de diagnostic, qui doit sortir UNE fois par lot.
-let instantDernierMot = null;
-let ageDejaMesure = false;
-
-// ---------------------------------------------------------------------------
-// Deux modes d'affichage : « stable seulement » ou « avec la fin provisoire »
-// ---------------------------------------------------------------------------
+// ⚠️ CE QUI A DISPARU ICI (etape 5, retrait du mode direct) :
 //
-// L'offscreen envoie TOUJOURS les deux textes -- `ruban` (stable, ne bougera
-// plus jamais) et `provisoire` (la fin que la passe suivante a le droit de
-// corriger). C'est ICI, a l'affichage, qu'on decide lequel on montre.
+//   - les deux modes d'affichage « stable seulement » / « avec la fin
+//     provisoire » : ils decrivaient LocalAgreement-2, qui n'existe plus ;
+//   - l'horloge des mots et le retard d'affichage OBSERVE : ils compensaient
+//     la latence du direct (un mot prononce a T n'existait en texte qu'a
+//     T + 2 a 6 s). En preparation, le texte est deja la AVANT la lecture :
+//     il n'y a rien a compenser, c'est `currentTime` qui commande ;
+//   - la reception du FLUX (ruban + provisoire), le decoupage en mots,
+//     l'alignement sur l'affiche et le remplissage des instants manquants.
 //
-// AFFICHER LE PROVISOIRE, c'est accepter que du texte deja lu SE REECRIVE sous
-// les yeux : « Je ne me » devient « Je n'aime pas, je deteste. » Ce n'est pas
-// un defaut qu'on peut corriger, c'est la definition meme du provisoire.
-//
-// NE MONTRER QUE LE STABLE supprime ce phenomene par construction : le ruban ne
-// recule jamais, donc le texte ne peut QUE s'allonger. Le prix est connu et
-// assume : un mot n'apparait qu'une fois qu'une SECONDE passe l'a confirme,
-// soit environ une cadence de retard en plus (~2 s).
-//
-// Le choix se fait a l'oeil, pas au chiffre -- d'ou une option, basculable A
-// CHAUD (voir l'ecoute de storage.onChanged plus bas) pour comparer les deux
-// modes sur la meme video sans redemarrer la capture.
-//
-// Defaut : false, donc mode stable. C'est le reproche « ca se reecrit » qu'on
-// cherche a faire disparaitre ; celui qui veut la reactivite maximale coche.
-const CLE_AFFICHER_PROVISOIRE = "afficherProvisoire";
-let afficherProvisoire = false;
-
-// Le dernier FLUX recu, garde tel quel. Sans lui, une bascule de mode devrait
-// attendre la passe suivante pour se voir : on veut qu'elle soit immediate.
-let dernierFlux = null;
-
-// ---------------------------------------------------------------------------
-// L'HORLOGE DES MOTS : chaque mot sort a l'heure ou il a ete prononce
-// ---------------------------------------------------------------------------
-//
-// AVANT : un mot toutes les 80 ms, quoi qu'il arrive. On savait LESQUELS, pas
-// QUAND -- alors on les jetait a l'ecran a cadence fixe. D'ou des rafales
-// suivies de trous, sans rapport avec le rythme reel de la parole. Et les
-// silences n'existaient pas : entre deux phrases, le texte continuait de
-// defiler comme si on parlait encore.
-//
-// MAINTENANT : chaque mot arrive avec l'heure a laquelle il a ete prononce
-// (voir « Les instants » dans CLAUDE.md). Il sort a cette heure-la, plus un
-// retard. Parole rapide -> texte rapide. Parole lente -> texte lent. Pause ->
-// l'ecran s'arrete, comme sur YouTube.
-//
-// Un seul reveil, 20 fois par seconde, qui ne fait que regarder l'heure.
-const PAS_HORLOGE = 50;
-
-// ---------------------------------------------------------------------------
-// LE RETARD D'AFFICHAGE : mesure, pas choisi
-// ---------------------------------------------------------------------------
-//
-// ⚠️ C'est le seul reglage delicat de tout l'affichage, et le figer dans le code
-// serait une erreur.
-//
-// Un mot prononce a l'instant T n'existe en texte qu'a T + la latence du
-// moteur : on ne peut pas l'afficher avant, c'est physique. Si le retard etait
-// PLUS COURT que cette latence, chaque mot arriverait deja en retard, sortirait
-// immediatement, et on retomberait trait pour trait sur les rafales qu'on
-// cherche a supprimer -- l'horloge ne servirait a rien.
-//
-// Or cette latence depend de la machine (2 s ici, 6 s sur une machine lente
-// simulee) ET du mode d'affichage : le mode stable attend une confirmation de
-// plus, soit une cadence de retard en plus. Une constante ecrite ici serait
-// juste pour une machine et fausse pour toutes les autres.
-//
-// On l'OBSERVE donc : a chaque flux on note l'age du mot le plus frais au
-// moment ou il arrive, et le retard suit un haut percentile des dernieres
-// mesures. C'est un tampon de gigue, exactement comme en lecture video.
-// ⚠️ ET ON OBSERVE LE MOT LE PLUS ANCIEN EN ATTENTE, PAS LE PLUS FRAIS.
-//
-// C'est le point qui decide de tout, et il a ete tranche au banc, pas au
-// raisonnement. Les mots n'arrivent pas un par un : ils arrivent par LOTS, un
-// lot couvrant une cadence de parole. Le mot le plus ancien d'un lot est donc
-// plus vieux que le plus frais d'exactement une cadence.
-//
-// Caler le retard sur le plus frais laisse tous les autres deja en retard : ils
-// sortent d'un bloc. Mesure sur une piste a rythme variable (rapide / pause de
-// 2 s / lent) :
-//
-//                        cale sur le plus frais    cale sur le plus ancien
-//   normale, stable      30 ms, rafales de 5       20 ms, rafales de 1
-//   normale, provisoire  180 ms, rafales de 4      20 ms, rafales de 1
-//   lente, provisoire    300 ms, PAUSE PERDUE      20 ms, pause conservee
-//
-// Le prix est reel et assume : +1,5 s de retard a l'ecran (4,9 -> 6,4 s en mode
-// stable). C'est ce qu'il en coute pour que les mots sortent un par un au bon
-// rythme au lieu de gicler par paquets.
-const MEMOIRE_AGES = 20;    // sur combien de flux on observe
-const PERCENTILE_AGE = 0.9; // on couvre 9 arrivees sur 10
-const MARGE_RETARD = 200;   // ms au-dessus de l'age observe
-const RETARD_MIN = 300;
-
-// Plafond. Au-dela, ce n'est plus de la gigue : la machine ne suit pas.
-//
-// ⚠️ Ce plafond a un effet VISIBLE, et c'est voulu.
-//
-// Le retard dont on aurait besoin vaut environ 2 cadences en mode provisoire et
-// 3 en mode stable (une confirmation de plus). Sur une machine tres lente -- 6 s
-// par passe -- ca ferait 12 a 18 s : un sous-titre a 18 s de retard n'est plus
-// lisible en face d'une video, il n'a plus rien a voir avec l'image. On prefere
-// alors reafficher par paquets. Moins beau, mais utilisable.
-//
-// La valeur, elle, se deduit de la machine de reference : 2,2 s par passe
-// mesures, donc ~6,6 s de besoin en mode stable. A 8 s le plafond mordait des
-// qu'une machine etait 25 % plus lente ; a 10 s il laisse de la marge tout en
-// restant dans ce qu'on sait lire (les sous-titres du direct a la television
-// tournent autour de 5 a 8 s).
-const RETARD_MAX = 10000;
-
-// Ecartement par defaut entre deux mots quand AUCUN instant n'est connu (passe
-// dont les horodatages ont ete ecartes). C'est le repli : on etale les mots sur
-// une cadence plausible au lieu de tout lacher d'un coup. Moins beau qu'un vrai
-// rythme -- pas de vraies pauses -- mais ca marche.
-const ESPACEMENT_DEFAUT = 280;
-
-// Les ages observes, UN JEU PAR MODE : les deux modes n'affichent pas le meme
-// dernier mot, donc pas le meme age. Les melanger ferait suivre au retard une
-// moyenne qui ne decrit ni l'un ni l'autre.
-//
-// On ne les remet PAS a zero entre deux captures : ils decrivent la machine, pas
-// la video. Les jeter obligerait a re-observer une minute a chaque demarrage.
-const agesArrivee = { stable: [], avecProvisoire: [] };
-
-function modeCourant() {
-  return afficherProvisoire ? "avecProvisoire" : "stable";
-}
-
-function noterAge(age) {
-  const ages = agesArrivee[modeCourant()];
-  ages.push(Math.max(0, age));
-  if (ages.length > MEMOIRE_AGES) ages.shift();
-}
-
-function retardCourant() {
-  const ages = agesArrivee[modeCourant()];
-  if (!ages.length) return RETARD_MIN; // rien d'observe encore
-  const tries = [...ages].sort((a, b) => a - b);
-  const rang = Math.min(tries.length - 1, Math.floor(tries.length * PERCENTILE_AGE));
-  return Math.min(RETARD_MAX, Math.max(RETARD_MIN, tries[rang] + MARGE_RETARD));
-}
-
-// ⚠️ `RETARD_MAX_MOTS` A DISPARU ICI, et c'est le signe que l'horloge fait son
-// travail. C'etait une borne sur le nombre de mots qu'on acceptait d'animer :
-// sans elle, un simple recalage (ruban rogne par la gauche, passe repartant
-// d'un texte different) faisait re-reveler la soixantaine de mots du ruban a
-// 80 ms piece -- 5 secondes a ranimer du texte deja lu, pendant lesquelles
-// l'affichage prenait un retard qu'il ne rattrapait jamais. Mesure de
-// l'epoque : l'age du mot le plus recent passait de 2,0 s a 7 puis 9,5 s, et il
-// GRANDISSAIT.
-//
-// Avec l'horloge, le probleme ne peut plus se poser : un vieux mot porte un
-// vieil instant, son heure est passee depuis longtemps, il est visible tout de
-// suite. Il n'y a plus rien a « rattraper » -- donc plus rien a borner. Idem
-// pour `PAS_REVELATION` : c'etaient deux rustines pour compenser l'absence
-// d'horloge.
-
-function decouperEnMots(texte) {
-  return String(texte || "").trim().split(/\s+/).filter(Boolean);
-}
-
-// Deux mots sont-ils LE MEME mot ?
-//
-// On compare des formes normalisees -- minuscules, sans accents ni ponctuation
-// -- et pas les chaines brutes. Sans ca, la moindre virgule ajoutee d'une passe
-// a l'autre ferait croire a un mot different.
-//
-// ⚠️ CE N'EST PAS UNE PRECAUTION THEORIQUE, c'est un defaut mesure au banc.
-// La toute premiere passe rend « bonjour. » (Whisper ponctue la fin de ce qu'il
-// entend) ; la suivante, ce mot n'est plus le dernier et devient « bonjour ».
-// En comparaison brute les deux differaient, alignerSurAffiche renvoyait 0, et
-// l'ecran SE VIDAIT ENTIEREMENT avant de re-ecrire la phrase -- exactement
-// l'effet de saut qu'on veut supprimer. Mesure : ecran vide a 1,51 s sur un run
-// de 15 s.
-//
-// C'est la meme regle que `prefixeCommun` cote offscreen, et pour la meme
-// raison : on COMPARE normalise, on AFFICHE le mot d'origine, ponctuation
-// comprise.
-function memeMot(a, b) {
-  return normaliserMot(a) === normaliserMot(b);
-}
-
-function normaliserMot(mot) {
-  return String(mot)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{M}/gu, "")            // accents
-    .replace(/[^\p{L}\p{N}]/gu, "");   // ponctuation, tirets, apostrophes...
-}
-
-// Combien de mots de la nouvelle cible sont DEJA a l'ecran ?
-//
-// ⚠️ SON ROLE A CHANGE AVEC L'HORLOGE, et il reste indispensable. Ce n'est plus
-// lui qui decide ce qu'on montre -- c'est l'heure. Il sert maintenant de
-// PLANCHER : ce qui est deja sorti ne doit jamais disparaitre, meme si la passe
-// suivante re-estime legerement l'instant d'un mot deja lu. Sans ce plancher,
-// un mot redate de 50 ms plus tard clignoterait.
-//
-// On ne peut pas simplement garder le compte, pour DEUX raisons :
-//   - le ruban est rogne par la GAUCHE quand il depasse sa longueur maximale
-//     (cote offscreen), donc les mots deja affiches glissent vers le debut ;
-//   - la FIN du texte est provisoire par nature : la passe suivante a le droit
-//     de la corriger. « Je ne me » devient « Je n'aime pas, je déteste. »
-//
-// On cherche donc le plus long PREFIXE COMMUN entre ce qui est affiche et la
-// nouvelle cible, en essayant tous les decalages a gauche. Ce prefixe est deja
-// bon a l'ecran ; seul ce qui suit doit etre revele.
-//
-// ⚠️ La version precedente exigeait que TOUT l'affiche soit un prefixe de la
-// cible. Des que le provisoire changeait d'un mot -- c'est-a-dire presque a
-// chaque passe -- elle renvoyait 0 et l'affichage repartait de zero. Mesure :
-// « 0 déjà à l'écran » sur chacun des 12 messages d'un run, soit une ligne qui
-// se ré-ecrivait entierement toutes les 2 secondes au lieu de s'allonger.
-function alignerSurAffiche(affiches, cible) {
-  let meilleur = 0;
-  for (let k = 0; k < affiches.length; k++) {
-    let i = 0;
-    while (i < affiches.length - k && i < cible.length && memeMot(affiches[k + i], cible[i])) i++;
-    if (i > meilleur) meilleur = i;
-  }
-  return Math.min(meilleur, cible.length);
-}
+// Ce qui RESTE de l'affichage est ce dont la preparation se sert vraiment :
+// la boite, `motsCible` / `nbVisibles`, `rendre()` et `afficherStatut()`.
 
 // Ecrit a l'ecran ce qui doit y etre, et fait couler le texte.
 //
@@ -364,233 +151,6 @@ function rendre() {
     .join(" ");
   const debordement = Math.max(0, ligne.scrollHeight - zone.clientHeight);
   ligne.style.transform = debordement ? `translateY(${-debordement}px)` : "";
-}
-
-// Combien de mots ont deja atteint leur heure ?
-//
-// Les instants sont croissants (garanti par l'offscreen, et re-garanti par
-// `completerInstants`), donc `du` l'est aussi : ce qui est du forme toujours un
-// PREFIXE. C'est ce qui permet de simplement compter.
-function combienDues(maintenant) {
-  let n = 0;
-  while (n < motsCible.length && motsCible[n].du <= maintenant) n++;
-  return n;
-}
-
-// Le battement : il ne « revele » rien de lui-meme, il regarde l'heure.
-function battre() {
-  const dues = combienDues(Date.now());
-  if (dues > nbVisibles) {
-    nbVisibles = dues;
-    rendre();
-  }
-
-  if (nbVisibles >= motsCible.length) {
-    // Le mot le plus recent vient de sortir : c'est MAINTENANT qu'on mesure son
-    // age reel. C'est ce chiffre qui doit rester stable dans le temps -- s'il
-    // grandit, l'affichage prend du retard sur la parole.
-    if (!ageDejaMesure && instantDernierMot) {
-      ageDejaMesure = true;
-      const age = ((Date.now() - instantDernierMot) / 1000).toFixed(1);
-      console.log(`📝 Mot le plus récent affiché ${age} s après avoir été prononcé`);
-    }
-    arreterHorloge();
-  }
-}
-
-function demarrerHorloge() {
-  if (minuterie || nbVisibles >= motsCible.length) return;
-  minuterie = setInterval(battre, PAS_HORLOGE);
-}
-
-function arreterHorloge() {
-  if (!minuterie) return;
-  clearInterval(minuterie);
-  minuterie = null;
-}
-
-// Donne un instant a CHAQUE mot, y compris a ceux qui n'en ont pas.
-//
-// Un mot sans instant, ca arrive : l'offscreen ecarte les horodatages d'une
-// passe entiere quand le recollage ne retombe pas sur les mots affiches (voir
-// `motsSansInstant`). Plutot que de lacher ces mots-la d'un coup, on les etale.
-//
-//   - trou au MILIEU  -> interpolation entre les deux instants connus qui
-//                        l'encadrent : c'est la meilleure estimation possible,
-//                        on connait le debut, la fin et le nombre de mots ;
-//   - trou au DEBUT   -> on remonte a reculons depuis le premier instant connu ;
-//   - trou a la FIN   -> on avance depuis le dernier connu, sans jamais depasser
-//                        le repere (la fin du son deja transcrit) : un mot ne
-//                        peut pas avoir ete prononce apres ;
-//   - AUCUN instant   -> on etale tout le lot a reculons depuis le repere. C'est
-//                        exactement le repli « etaler sur la cadence » : moins
-//                        beau qu'un vrai rythme, mais jamais une rafale.
-function completerInstants(nbMots, instants, repere, maintenant) {
-  const sortie = new Array(nbMots).fill(null);
-  for (let i = 0; i < nbMots; i++) {
-    const t = instants ? instants[i] : null;
-    if (typeof t === "number" && isFinite(t)) sortie[i] = t;
-  }
-
-  const fin = repere || maintenant;
-  let premier = -1;
-  for (let i = 0; i < nbMots; i++) {
-    if (sortie[i] != null) {
-      premier = i;
-      break;
-    }
-  }
-
-  if (premier === -1) {
-    for (let i = 0; i < nbMots; i++) sortie[i] = fin - (nbMots - 1 - i) * ESPACEMENT_DEFAUT;
-    return sortie;
-  }
-
-  for (let i = premier - 1; i >= 0; i--) sortie[i] = sortie[i + 1] - ESPACEMENT_DEFAUT;
-
-  let i = premier + 1;
-  while (i < nbMots) {
-    if (sortie[i] != null) {
-      i++;
-      continue;
-    }
-    let j = i;
-    while (j < nbMots && sortie[j] == null) j++;
-    if (j >= nbMots) break; // trou de fin : traite juste apres
-    const pas = (sortie[j] - sortie[i - 1]) / (j - i + 1);
-    for (let k = i; k < j; k++) sortie[k] = sortie[i - 1] + pas * (k - i + 1);
-    i = j + 1;
-  }
-
-  let dernier = nbMots - 1;
-  while (dernier >= 0 && sortie[dernier] == null) dernier--;
-  for (let k = dernier + 1; k < nbMots; k++) {
-    sortie[k] = Math.min(fin, sortie[k - 1] + ESPACEMENT_DEFAUT);
-  }
-
-  // Jamais en arriere : l'ecran lit cette liste dans l'ordre, et un instant qui
-  // recule bloquerait tout ce qui suit.
-  for (let k = 1; k < nbMots; k++) if (sortie[k] < sortie[k - 1]) sortie[k] = sortie[k - 1];
-  return sortie;
-}
-
-// Un tableau d'instants de la BONNE longueur, quoi qu'on ait recu.
-function instantsPour(nbMots, recus) {
-  const sortie = new Array(nbMots).fill(null);
-  if (!Array.isArray(recus)) return sortie;
-  for (let i = 0; i < nbMots && i < recus.length; i++) sortie[i] = recus[i];
-  return sortie;
-}
-
-// Reception du flux : ruban (stable) + provisoire (fin incertaine).
-//
-// On garde le message TEL QUEL avant de l'appliquer : c'est ce qui permet a une
-// bascule de mode de se voir tout de suite, sans attendre la passe suivante.
-function afficherFlux(message) {
-  // `recuA` : l'heure d'ARRIVEE, figee ici. C'est elle qui sert a mesurer l'age
-  // du mot le plus frais -- pas `Date.now()` au moment du calcul. Sans ca, une
-  // bascule de mode, qui re-applique le meme flux plusieurs secondes plus tard,
-  // ferait croire a une arrivee tardive et gonflerait le retard pour rien.
-  //
-  // `ageNotePour` : l'age n'est note qu'UNE fois par mode. Re-appliquer le meme
-  // flux ne doit pas empiler dix fois la meme observation.
-  dernierFlux = Object.assign({}, message, { recuA: Date.now(), ageNotePour: {} });
-  appliquerFlux();
-}
-
-// Ecrit a l'ecran le dernier flux recu, dans le mode d'affichage courant.
-//
-// Le ruban ne s'efface JAMAIS. Entre deux phrases, il n'arrive simplement plus
-// rien de nouveau et le dernier texte reste affiche.
-function appliquerFlux() {
-  if (!dernierFlux) return;
-
-  const { ruban, provisoire, rubanInstants, provisoireInstants, finAudio, finAudioStable } =
-    dernierFlux;
-
-  // LE point de bascule, et il tient en une ligne : en mode stable on ignore
-  // purement et simplement le provisoire. Tout le reste de la fonction --
-  // plancher, horloge, defilement -- ne change pas d'un iota.
-  const fin = afficherProvisoire ? provisoire : "";
-
-  // Le repere temporel doit suivre le mode, sinon la mesure d'age (et donc la
-  // calibration du retard du son) parlerait d'un texte qui n'est pas affiche :
-  //   - avec le provisoire, le dernier mot montre est le dernier de la fenetre
-  //     -> `finAudio` ;
-  //   - en stable seul, il est celui que DEUX passes ont confirme, donc plus
-  //     ancien d'environ une cadence -> `finAudioStable`.
-  // Repli sur `finAudio` si l'offscreen ne fournit pas encore le second repere
-  // (rien de stable n'a encore ete confirme).
-  const repere = afficherProvisoire ? finAudio : finAudioStable || finAudio;
-
-  const motsRuban = decouperEnMots(ruban);
-  const motsFin = decouperEnMots(fin);
-  const nouveau = motsRuban.concat(motsFin);
-
-  // Rien a montrer : on ne touche a rien. C'est le cas des toutes premieres
-  // secondes en mode stable, quand aucune passe n'a encore ete confirmee --
-  // l'ecran garde ce qu'il a (message d'etat, ou texte de la phrase d'avant)
-  // plutot que de clignoter a vide.
-  if (!nouveau.length) return;
-
-  // Les instants suivent le meme decoupage que les mots : ruban puis fin.
-  const instantsRecus = instantsPour(motsRuban.length, rubanInstants).concat(
-    afficherProvisoire ? instantsPour(motsFin.length, provisoireInstants) : []
-  );
-
-  const maintenant = Date.now();
-  const instants = completerInstants(nouveau.length, instantsRecus, repere, dernierFlux.recuA);
-  const instantFrais = instants[instants.length - 1];
-
-  // L'age du mot le plus frais A SON ARRIVEE : c'est lui qui dit de combien le
-  // retard doit couvrir la latence du moteur. Note une seule fois par mode.
-  // Ce qui est deja sorti ne doit JAMAIS disparaitre ni etre re-anime : c'est le
-  // role du plancher (voir alignerSurAffiche). L'heure decide du reste.
-  const dejaAffiches = motsCible.slice(0, nbVisibles).map((m) => m.mot);
-  const plancherProvisoire = alignerSurAffiche(dejaAffiches, nouveau);
-
-  const mode = modeCourant();
-  if (!dernierFlux.ageNotePour[mode] && premierTexteAffiche) {
-    dernierFlux.ageNotePour[mode] = true;
-    const iAttente = Math.min(plancherProvisoire, nouveau.length - 1);
-    noterAge(dernierFlux.recuA - instants[iAttente]);
-  }
-  const retard = retardCourant();
-
-  motsCible = nouveau.map((mot, i) => ({
-    mot,
-    instant: instants[i],
-    du: instants[i] + retard,
-  }));
-  instantDernierMot = instantFrais;
-  ageDejaMesure = false;
-
-  nbVisibles = Math.max(plancherProvisoire, combienDues(maintenant));
-
-  // Le tout premier texte de la capture remplace un message d'etat (« Ecoute du
-  // son en cours… »). Avec nbVisibles a 0, `rendre` ecrivait une chaine vide :
-  // la boite se vidait completement avant que le premier mot n'apparaisse.
-  // Mesure au banc : 80 ms d'ecran noir. On montre donc le premier mot tout de
-  // suite -- le message cede la place a du texte, pas a du vide.
-  if (!premierTexteAffiche && nbVisibles === 0) nbVisibles = 1;
-
-  // Trace d'arrivee, distincte de la trace d'affichage plus bas. Les deux
-  // ensemble disent OU le temps passe : entre le micro et ce message (le
-  // moteur), ou entre ce message et l'ecran (l'attente de l'heure).
-  console.log(
-    `📥 Flux [${afficherProvisoire ? "avec provisoire" : "stable seul"}] : ` +
-      `${motsCible.length} mots (${nbVisibles} à l'écran, ` +
-      `${motsCible.length - nbVisibles} en attente de leur heure), ` +
-      `son vieux de ${repere ? ((maintenant - repere) / 1000).toFixed(1) : "?"} s, ` +
-      `retard d'affichage ${(retard / 1000).toFixed(1)} s`
-  );
-
-  premierTexteAffiche = true;
-  subtitleBox.style.opacity = "1";
-  subtitleBox.style.fontStyle = "normal";
-
-  rendre();
-  demarrerHorloge();
 }
 
 // Message d'etat (chargement du modele, calibration...).
@@ -614,17 +174,13 @@ function afficherStatut(texte) {
 }
 
 // Afficher/cacher l'overlay.
+//
+// ⚠️ Il ne remet plus a zero les reperes de l'horloge des mots : ils sont
+// partis avec le mode direct a l'etape 5.
 function toggleOverlay(show) {
   if (show) {
-    // Nouvelle capture : le ruban de la precedente n'a rien a faire ici.
-    // (Les ages observes, eux, SURVIVENT : ils decrivent la machine, pas la
-    // video. Les jeter obligerait a re-observer une minute a chaque demarrage.)
-    arreterHorloge();
     motsCible = [];
     nbVisibles = 0;
-    instantDernierMot = null;
-    ageDejaMesure = false;
-    dernierFlux = null;
     premierTexteAffiche = false;
 
     subtitleBox.style.display = "block";
@@ -635,75 +191,8 @@ function toggleOverlay(show) {
     console.log("✅ Overlay AFFICHE sur la page");
   } else {
     subtitleBox.style.display = "none";
-    arreterHorloge();
     console.log("⏸️ Overlay CACHE sur la page");
   }
-}
-
-// Écouter les messages du service worker
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.type === "TOGGLE_SUBTITLES") {
-    toggleOverlay(request.active);
-    sendResponse({ success: true });
-  }
-
-  if (request.type === "FLUX") {
-    // Le message entier : il porte maintenant un instant par mot, et le relais
-    // du service worker ne reconstruit plus rien.
-    afficherFlux(request);
-    sendResponse({ success: true });
-  }
-
-  if (request.type === "STATUT") {
-    afficherStatut(request.texte);
-    sendResponse({ success: true });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// L'option d'affichage : lue au chargement, puis suivie A CHAUD
-// ---------------------------------------------------------------------------
-//
-// Un content script accede directement a chrome.storage : pas besoin de passer
-// par le service worker, et surtout pas besoin de redemarrer la capture. On
-// coche dans la popup, l'ecran change a la passe... non, tout de suite : on
-// re-applique le dernier flux recu.
-//
-// C'est ce qui rend la comparaison possible A L'OEIL, sur la meme video et la
-// meme phrase -- ce qu'aucun chiffre ne remplace.
-function appliquerMode(valeur, origine) {
-  const avant = afficherProvisoire;
-  afficherProvisoire = Boolean(valeur);
-  if (afficherProvisoire === avant && origine !== "chargement") return;
-
-  console.log(
-    `👁️ Affichage : ${afficherProvisoire ? "ruban + fin provisoire" : "texte stable seulement"}` +
-      ` (${origine})`
-  );
-
-  // Re-appliquer tout de suite. En passant en mode stable la cible RETRECIT :
-  // le plancher trouve alors que toute la cible est deja a l'ecran, donc la fin
-  // provisoire disparait d'un coup, sans re-animer un seul mot deja lu.
-  //
-  // Le retard, lui, change de jeu d'observations en meme temps que le mode --
-  // et il se re-observe des le premier flux du nouveau mode.
-  appliquerFlux();
-}
-
-try {
-  chrome.storage.local.get(CLE_AFFICHER_PROVISOIRE, (stored) => {
-    // Absent du storage = jamais coche = mode stable. C'est le defaut voulu.
-    appliquerMode(stored && stored[CLE_AFFICHER_PROVISOIRE], "chargement");
-  });
-
-  chrome.storage.onChanged.addListener((changes, zone) => {
-    if (zone !== "local" || !changes[CLE_AFFICHER_PROVISOIRE]) return;
-    appliquerMode(changes[CLE_AFFICHER_PROVISOIRE].newValue, "bascule à chaud");
-  });
-} catch (err) {
-  // Sans storage on reste sur le defaut : le texte ne se reecrit pas, c'est le
-  // comportement le plus sur des deux.
-  console.warn("Option d'affichage illisible, mode stable par defaut :", err);
 }
 
 // Par défaut, l'overlay est caché
@@ -714,8 +203,7 @@ toggleOverlay(false);
 // MODE « PREPARER D'ABORD » — etape A : piloter le lecteur de la page
 // ===========================================================================
 //
-// Un mode a COTE du direct. Rien ici ne touche a `motsCible`, `nbVisibles`,
-// `dernierFlux`, `premierTexteAffiche` ni a l'horloge des mots : ces deux
+// C'est desormais le seul mode. Ce qui suit pilote le LECTEUR de la page : ces deux
 // affichages ne tournent jamais en meme temps, et s'ils se croisaient ils ne
 // se marcheraient pas dessus. Tout ce qui appartient a la preparation porte le
 // prefixe `prep`.
@@ -767,11 +255,9 @@ function prepFormaterDuree(secondes) {
 }
 
 // L'overlay de la preparation. Il utilise la meme boite que les sous-titres
-// mais n'appelle NI afficherStatut NI afficherFlux : ces deux-la ont leurs
-// propres regles (« un statut n'ecrase jamais du vrai texte »), qui n'ont rien
-// a voir avec ce qu'on fait ici.
+// mais n'appelle PAS afficherStatut : celui-la a sa propre regle (« un statut
+// n'ecrase jamais du vrai texte »), qui n'a rien a voir avec ce qu'on fait ici.
 function prepAfficher(texte, discret) {
-  arreterHorloge();
   subtitleBox.style.display = "block";
   subtitleBox.style.opacity = discret ? "0.8" : "1";
   subtitleBox.style.fontStyle = discret ? "italic" : "normal";
@@ -869,121 +355,16 @@ function prepDecrireVideo() {
 // Piloter
 // ---------------------------------------------------------------------------
 
-// ===========================================================================
-// LE VOCABULAIRE DE LA PAGE — souffler les noms propres a Whisper
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// Piloter le lecteur, puis le remettre exactement comme on l'a trouve
+// ---------------------------------------------------------------------------
 //
-// whisper-tiny ecorche les noms propres : il ne les a pas assez vus, et un nom
-// propre n'a par definition aucun voisin phonetique plausible dans son
-// vocabulaire courant. « Emmanuel Macron » et « Algerie » ressortent en
-// n'importe quoi.
-//
-// Or la page CONTIENT ces mots : ils sont dans le titre et dans la description,
-// deja affiches sous la video. On les releve et on les passe a Whisper comme
-// amorce (voir construireAmorce dans whisper.worker.js).
-//
-// ⚠️ TOUT RESTE LOCAL. On lit le DOM d'un onglet deja ouvert -- aucune requete,
-// aucune API, rien qui sorte de la machine. C'est la meme regle que pour le son.
-//
-// ⚠️ ET CE N'EST PAS DE LA MAGIE, la mesure le dit : une amorce HORS SUJET
-// repare presque autant qu'une amorce juste (20 fautes contre 16, sur 39 sans
-// amorce). L'essentiel du gain vient de l'existence d'une amorce ; le
-// vocabulaire vaut le quart. Les deux sont bons a prendre, mais il ne faut pas
-// attendre du titre qu'il fasse des miracles.
-
-// Ce qu'on envoie au bout du compte. Au-dela, l'amorce mange la fenetre du
-// decodeur pour rien (le worker recoupe de toute facon a 100 jetons).
-const PREP_VOCAB_CARACTERES = 300;
-const PREP_VOCAB_NOMS_MAX = 24;
-
-function prepNettoyerTexte(brut) {
-  return String(brut || "")
-    .replace(/https?:\/\/\S+/g, " ")     // liens
-    .replace(/[#@]\S+/g, " ")             // hashtags, mentions
-    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, " ") // chapitrage « 01:23 »
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// Les suites de mots a majuscule : c'est ca, un nom propre, et c'est reperable
-// sans dictionnaire. On saute celles qui ouvrent une phrase quand elles sont
-// d'un seul mot -- « Aujourd'hui, » n'est pas un nom propre, il est juste en
-// debut de ligne.
-function prepNomsPropres(texte, maximum) {
-  const motif =
-    /\p{Lu}[\p{L}'’\-]+(?:\s+(?:d[eu']|des|de|du|la|le|les|van|von|el|al)?\s*\p{Lu}[\p{L}'’\-]+)*/gu;
-  const vus = new Set();
-  const sortie = [];
-  let trouve;
-  while ((trouve = motif.exec(texte)) !== null) {
-    const suite = trouve[0];
-    const avant = texte.slice(Math.max(0, trouve.index - 2), trouve.index);
-    const ouvreUnePhrase = trouve.index === 0 || /[.!?…]\s$/.test(avant);
-    if (ouvreUnePhrase && !suite.includes(" ")) continue;
-    const cle = suite.toLowerCase();
-    if (vus.has(cle)) continue;
-    vus.add(cle);
-    sortie.push(suite);
-    if (sortie.length >= maximum) break;
-  }
-  return sortie;
-}
-
-function prepTexteDe(selecteurs) {
-  for (const selecteur of selecteurs) {
-    const noeud = document.querySelector(selecteur);
-    if (!noeud) continue;
-    const texte = noeud.tagName === "META" ? noeud.getAttribute("content") : noeud.textContent;
-    if (texte && texte.trim().length > 2) return texte;
-  }
-  return "";
-}
-
-function prepReleverVocabulaire() {
-  // Le titre d'abord : c'est le plus fiable, et il est presque toujours court.
-  const titre = prepNettoyerTexte(
-    prepTexteDe([
-      "h1.ytd-watch-metadata yt-formatted-string",
-      "h1.ytd-watch-metadata",
-      "meta[property='og:title']",
-      "meta[name='title']",
-      "h1",
-    ]) || document.title.replace(/\s*[-–—|]\s*YouTube\s*$/i, "")
-  );
-
-  const chaine = prepNettoyerTexte(
-    prepTexteDe(["ytd-channel-name #text a", "ytd-channel-name #text", "meta[itemprop='author']"])
-  );
-
-  const description = prepNettoyerTexte(
-    prepTexteDe([
-      "#description-inline-expander",
-      "ytd-text-inline-expander #plain-snippet-text",
-      "#description",
-      "meta[property='og:description']",
-      "meta[name='description']",
-    ])
-  );
-
-  const morceaux = [];
-  if (titre) morceaux.push(titre);
-  if (chaine && !titre.toLowerCase().includes(chaine.toLowerCase())) morceaux.push(chaine);
-
-  const deja = morceaux.join(" ").toLowerCase();
-  for (const nom of prepNomsPropres(description, PREP_VOCAB_NOMS_MAX)) {
-    if (deja.includes(nom.toLowerCase())) continue;
-    morceaux.push(nom);
-  }
-
-  let texte = morceaux.join(", ").replace(/\s+/g, " ").trim();
-  if (texte.length > PREP_VOCAB_CARACTERES) {
-    // On coupe a la virgule, pas au milieu d'un nom.
-    texte = texte.slice(0, PREP_VOCAB_CARACTERES);
-    const virgule = texte.lastIndexOf(",");
-    if (virgule > 40) texte = texte.slice(0, virgule);
-  }
-  return texte;
-}
+// ⚠️ CE QUI A DISPARU ICI (etape 5) : le releve du VOCABULAIRE de la page.
+// On lisait le titre, le nom de la chaine et les noms propres de la
+// description pour les souffler a Whisper en amorce (decoder_input_ids) --
+// il ecorchait les noms propres. Parakeet n'a pas d'equivalent, et le message
+// PREPARATION_VOCABULAIRE n'a plus de destinataire : tout est parti, ici et
+// dans offscreen.js.
 
 async function prepPiloter(vitesse) {
   const v = prepTrouverVideo();
@@ -1054,22 +435,6 @@ async function prepPiloter(vitesse) {
   v.addEventListener("ended", prepSurFin);
   prepTick = setInterval(prepBattre, PREP_PAS_TICK);
   prepBattre();
-
-  // Le vocabulaire de la page, envoye UNE fois. Si le relevé echoue, on
-  // continue sans : l'amorce est un bonus, jamais une condition.
-  try {
-    const vocabulaire = prepReleverVocabulaire();
-    console.log(
-      vocabulaire
-        ? `📖 Preparation : vocabulaire de la page — « ${vocabulaire} »`
-        : "📖 Preparation : aucun titre ni description exploitable sur cette page"
-    );
-    chrome.runtime
-      .sendMessage({ type: "PREPARATION_VOCABULAIRE", texte: vocabulaire })
-      .catch(() => {});
-  } catch (err) {
-    console.warn("Preparation : relevé du vocabulaire impossible —", err && err.message);
-  }
 
   console.log(`▶️ Preparation : defilement a x${prepVitesseCible} depuis ${v.currentTime.toFixed(2)} s`);
   // ⚠️ DEUX positions, et elles ne servent pas a la meme chose.
@@ -1331,6 +696,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 
+
 // ===========================================================================
 // MODE « PREPARER D'ABORD » — etape B : afficher le stock pendant la lecture
 // ===========================================================================
@@ -1341,7 +707,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 //
 // Le mode direct doit inventer un retard parce qu'il court apres la parole : il
 // observe le percentile 90 des vingt derniers lots, ajoute une marge, et se
-// borne a RETARD_MAX. Tout cet appareillage n'a qu'un but -- compenser le fait
+// borne a un plafond. Tout cet appareillage n'avait qu'un but -- compenser le fait
 // qu'on ne sait pas quand un mot a ete prononce.
 //
 // Ici on le sait. La regle tient donc en une ligne :
@@ -1472,9 +838,9 @@ let prepLectDernierePosition = 0;
 // Pour revenir au comportement d'origine -- un bloc qui reste jusqu'au suivant,
 // quoi qu'il arrive -- mettre cette constante a Infinity.
 // 3,0 et plus 1,5 depuis le 2026-08-28. 1,5 s avait ete choisi contre des trous
-// de 13,5 s dans le stock -- des trous dus au plafond de jetons du worker, qui
-// coupait le francais au bout de 13 s de bloc (voir PREP_JETONS_PAR_S dans
-// offscreen.js). Ce plafond leve, les trous restants sont ceux de la vraie
+// de 13,5 s dans le stock -- des trous dus au plafond de jetons de Whisper, qui
+// coupait le francais au bout de 13 s de bloc. Ce moteur est parti a l'etape 5
+// et son plafond avec ; les trous restants sont ceux de la vraie
 // parole : des respirations et des silences courts. Les couvrir vaut mieux que
 // de clignoter dessus. Au-dela de 3 s, la boite s'efface toujours -- en fondu.
 const BLOC_APRES_PAROLE = 3.0;
@@ -2030,15 +1396,6 @@ function prepRazMesures() {
 // content script vit dans un monde isole, la console de la page ne peut pas
 // lire ses variables.
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  // Le mode direct prend la main : il reinitialise `motsCible` et `nbVisibles`
-  // dans son propre toggleOverlay. Si la boucle de lecture continuait, les deux
-  // ecriraient dans le meme ruban a 60 Hz. On s'efface -- sans repondre, pour
-  // laisser le listener du mode direct repondre comme avant.
-  if (request.type === "TOGGLE_SUBTITLES") {
-    prepLectArreter();
-    return;
-  }
-
   if (request.type === "PREPARATION_MESURES") {
     sendResponse({
       success: true,

@@ -5,8 +5,7 @@
   "main": "background.js",
   "scripts": {
     "build:assets": "node scripts/copy-assets.js",
-    "build:model": "node scripts/fetch-model.js",
-    "postinstall": "npm run build:assets && npm run build:model",
+    "postinstall": "npm run build:assets",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

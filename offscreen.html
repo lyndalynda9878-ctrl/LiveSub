@@ -4,9 +4,13 @@
   <meta charset="UTF-8">
 </head>
 <body>
-  <!-- La librairie VAD (bundle UMD) : elle definit self.vad.
-       Elle doit etre chargee AVANT offscreen.js qui l'utilise. -->
-  <script src="vendor/bundle.min.js"></script>
+  <!-- ⚠️ LE BUNDLE DU VAD A DISPARU ICI (etape 5).
+       `vendor/bundle.min.js` definissait `self.vad`, utilise par le mode
+       direct pour decouper la parole en segments. La preparation ne detecte
+       pas la parole : elle transcrit des blocs de duree fixe, et decide de
+       sauter un bloc en mesurant son niveau (prepEstSilence), pas avec un
+       modele. Charger le VAD ici ne servirait plus qu'a ralentir le
+       demarrage du document. -->
   <script src="offscreen.js"></script>
 </body>
 </html>
