@@ -1,9 +1,28 @@
 # LiveSub — Mémoire du projet
 
+> ## ⚠️ LIRE CECI D'ABORD — mise à jour du 2026-08-30 : CHANGEMENT DE MOTEUR
+>
+> **whisper-tiny a été remplacé par NVIDIA Parakeet TDT 0.6B v3, et le mode direct a
+> été supprimé.** Beaucoup de paragraphes ci-dessous décrivent Whisper ou le direct.
+> Ils sont **datés, pas effacés** : ce sont des leçons payées, chiffrées, et plusieurs
+> valent encore.
+>
+> **Comment les lire.** Un bloc qui s'ouvre sur
+> `⏳ VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ` décrit l'état d'avant. Son texte
+> d'origine est **intact**, et une flèche `→ Ce qui a changé` dit ce qui le remplace.
+>
+> ⛔ **AUCUNE RÈGLE tirée d'un bloc daté ne doit être appliquée aujourd'hui.** Les
+> mesures, elles, restent valables pour ce qu'elles mesuraient.
+
 ## Vue d'ensemble
 LiveSub est une **extension de navigateur (Chrome, Manifest V3)** qui capte le son de
-l'onglet, détecte la parole, la transcrit (Whisper), puis la traduit — et affiche des
-sous-titres en overlay sur la page.
+l'onglet, le transcrit (**Parakeet TDT 0.6B v3**, 100 % local) et affiche des
+sous-titres en overlay sur la page. La traduction reste à faire.
+
+Il n'y a **qu'un seul mode** : « préparer d'abord ». La vidéo défile en accéléré et en
+silence, tout est transcrit d'avance, puis le texte s'affiche à l'heure pendant la
+lecture normale. Le mode direct a existé, a prouvé ce qu'il avait à prouver, et a été
+retiré — voir « Le mode direct » plus bas.
 
 **Contrainte fondamentale : tout tourne 100 % en local, hors ligne, aucun envoi vers
 un serveur tiers.** C'est l'argument central du projet.
@@ -18,11 +37,29 @@ un serveur tiers.** C'est l'argument central du projet.
   changements en français simple.
 
 ## Architecture (le flux)
-onglet (son) → `background.js` (`getMediaStreamId`) → `offscreen.js` (getUserMedia sur
-l'onglet) → **VAD** alimente une **fenêtre de parole** (voir « Le flux » plus bas) →
-`whisper.worker.js` la re-transcrit en boucle (Web Worker, GPU ou CPU selon la mesure) →
-`background.js` relaie le message `FLUX` — `ruban` (stable) + `provisoire` — parce que
-l'offscreen n'a pas accès à `chrome.tabs` → `content.js` révèle les mots un par un.
+
+**Aujourd'hui — mode « préparer d'abord », le seul :**
+
+`content.js` met la vidéo à ×2 en silence → onglet (son) → `background.js`
+(`getMediaStreamId`) → `offscreen.js` (getUserMedia sur l'onglet) →
+`preparation.worklet.js` empile le son par blocs de 20 s → `parakeet.worker.js` les
+transcrit un par un (Web Worker, CPU) → les mots **avec leur instant** s'empilent dans
+le stock de `offscreen.js` → à la fin, `background.js` rend le lecteur et livre le
+stock → `content.js` affiche chaque bloc quand `video.currentTime` atteint son heure.
+
+⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — l'architecture du mode direct.**
+
+> onglet (son) → `background.js` (`getMediaStreamId`) → `offscreen.js` (getUserMedia sur
+> l'onglet) → **VAD** alimente une **fenêtre de parole** (voir « Le flux » plus bas) →
+> `whisper.worker.js` la re-transcrit en boucle (Web Worker, GPU ou CPU selon la mesure) →
+> `background.js` relaie le message `FLUX` — `ruban` (stable) + `provisoire` — parce que
+> l'offscreen n'a pas accès à `chrome.tabs` → `content.js` révèle les mots un par un.
+
+→ **Ce qui a changé** : le mode direct est supprimé, donc le VAD, la fenêtre glissante,
+le message `FLUX` et le couple ruban/provisoire avec lui. `whisper.worker.js` est
+supprimé du dépôt. **Pourquoi** : le direct ne pouvait pas tenir les trois côtés du
+triangle impossible (voir « Les instants ») ; la préparation, elle, connaît l'heure de
+chaque mot avant que la lecture commence, donc elle n'a plus rien à estimer.
 
 ## Fichiers
 - `manifest.json` — MV3 ; permissions (storage, tabCapture, activeTab, offscreen) ;
@@ -32,34 +69,271 @@ l'offscreen n'a pas accès à `chrome.tabs` → `content.js` révèle les mots u
   stocker l'état dans une simple variable mémoire.
 - `popup.html` / `popup.js` — bouton Démarrer/Arrêter ; demande l'état au background
   (`GET_STATE`), ne le devine pas.
-- `content.js` — overlay de sous-titres : boîte de **deux lignes de hauteur fixe**, les
-  mots nouveaux révélés **un par un** (`PAS_REVELATION`), le début qui sort par le haut.
-  `RETARD_MAX_MOTS` empêche l'affichage de traîner derrière la parole. C'est aussi lui
-  qui décide **ce qu'on montre** — stable seul, ou stable + provisoire (voir « Les deux
-  modes d'affichage »).
-- `offscreen.html` / `offscreen.js` — capture audio (getUserMedia sur l'onglet) + VAD
-  (Silero via `@ricky0123/vad-web` ; `getStream/pauseStream/resumeStream` pour écouter
-  l'onglet et PAS le micro ; `model: "v5"`).
-- `vendor/` — librairies locales (VAD + Transformers.js + runtime ONNX). Gitignoré,
-  régénéré par `scripts/copy-assets.js` (postinstall).
-- `whisper.worker.js` — **Web Worker** de transcription : c'est là que vivent
-  Transformers.js et Whisper, pour que le fil principal ne fige jamais. Choisit aussi
-  le backend (GPU/CPU) — voir « Choix du backend » plus bas.
-- `test-whisper.html` / `test-whisper.js` — page de test isolée : prouve que Whisper
-  transcrit (Transformers.js, `Xenova/whisper-tiny`, `dtype: "fp32"`) depuis le worker,
-  sans figer la page. C'est aussi la page qui lit/écrit le backend mémorisé.
-- `test-bench.html` / `test-bench.js` — page de **comparaison** : fait tourner plusieurs
-  variantes du modèle sur le même audio (fragments à la taille de production + extrait
-  complet, EN et FR), chronomètre, et affiche les textes côte à côte. Le worker accepte
-  `?modele=…&dtype=…&opt=…` uniquement pour elle ; en production personne ne passe de
-  paramètre.
+- `content.js` — pilote la vidéo pendant la préparation (×2, silence, restitution) et
+  affiche le stock pendant la lecture : **un bloc apparaît quand `video.currentTime`
+  atteint l'instant de son premier mot**. Boîte de deux lignes de hauteur fixe ; un
+  message d'échec, lui, fait grandir la boîte pour ne jamais être coupé
+  (`prepAfficherErreur`).
+- `offscreen.html` / `offscreen.js` — capture audio (getUserMedia sur l'onglet),
+  découpage en blocs, table des ancres, stock des mots. **Vérifie aussi les cinq
+  fichiers du modèle AVANT tout chargement** (`prepModeleManquant`).
+- `preparation.worklet.js` — AudioWorklet qui empile le son capté. Fait la **moyenne des
+  deux canaux** (voir 5 bis).
+- `parakeet.worker.js` — **Web Worker** de transcription : c'est là que vivent
+  parakeet.js et ONNX Runtime, pour que le fil principal ne fige jamais.
+- `models/parakeet-tdt-0.6b-v3/` — les 5 fichiers de poids, 640 Mo. Gitignoré,
+  téléchargé par `npm run fetch-model` (`scripts/fetch-model.js`).
+- `vendor/` — librairies locales. Gitignoré, régénéré par `scripts/copy-assets.js`
+  (postinstall).
+- `README.md` — installation, licences, attribution NVIDIA (condition CC-BY-4.0).
+- `test-parakeet.html` / `.js`, `test-parakeet-worker.html` / `.js` — pages de mesure du
+  moteur actuel.
+
+⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — les fichiers du mode direct.**
+
+> - `content.js` — overlay de sous-titres : boîte de **deux lignes de hauteur fixe**, les
+>   mots nouveaux révélés **un par un** (`PAS_REVELATION`), le début qui sort par le haut.
+>   `RETARD_MAX_MOTS` empêche l'affichage de traîner derrière la parole. C'est aussi lui
+>   qui décide **ce qu'on montre** — stable seul, ou stable + provisoire (voir « Les deux
+>   modes d'affichage »).
+> - `offscreen.html` / `offscreen.js` — capture audio (getUserMedia sur l'onglet) + VAD
+>   (Silero via `@ricky0123/vad-web` ; `getStream/pauseStream/resumeStream` pour écouter
+>   l'onglet et PAS le micro ; `model: "v5"`).
+> - `vendor/` — librairies locales (VAD + Transformers.js + runtime ONNX). Gitignoré,
+>   régénéré par `scripts/copy-assets.js` (postinstall).
+> - `whisper.worker.js` — **Web Worker** de transcription : c'est là que vivent
+>   Transformers.js et Whisper, pour que le fil principal ne fige jamais. Choisit aussi
+>   le backend (GPU/CPU) — voir « Choix du backend » plus bas.
+> - `test-whisper.html` / `test-whisper.js` — page de test isolée : prouve que Whisper
+>   transcrit (Transformers.js, `Xenova/whisper-tiny`, `dtype: "fp32"`) depuis le worker,
+>   sans figer la page. C'est aussi la page qui lit/écrit le backend mémorisé.
+> - `test-bench.html` / `test-bench.js` — page de **comparaison** : fait tourner plusieurs
+>   variantes du modèle sur le même audio (fragments à la taille de production + extrait
+>   complet, EN et FR), chronomètre, et affiche les textes côte à côte. Le worker accepte
+>   `?modele=…&dtype=…&opt=…` uniquement pour elle ; en production personne ne passe de
+>   paramètre.
+
+→ **Ce qui a changé** : `whisper.worker.js` est **supprimé du dépôt**. Le VAD n'est plus
+utilisé (la préparation découpe par blocs de durée fixe, pas par tours de parole). Les
+pages `test-whisper.*` et `test-bench.*` sont encore sur le disque mais ne mesurent plus
+le moteur de production. **Pourquoi** : voir le bandeau en tête de fichier.
 
 ## Dépendances
-- `@ricky0123/vad-web` — détection de parole (VAD).
-- `@huggingface/transformers` — Whisper (transcription).
+- `parakeet.js` (ysdede, **MIT**) — chargement et décodage de Parakeet. C'est elle qui
+  tourne en production. ⚠️ Elle a un bug d'espacement en français : voir « Le bug de
+  `parakeet.js` ».
 - `onnxruntime-web` — moteur d'exécution des modèles.
+- `@ricky0123/vad-web` — détection de parole. ⏳ **Plus utilisée en production** depuis le
+  retrait du mode direct ; la dépendance reste installée.
+- `@huggingface/transformers` — Whisper. ⏳ **Plus utilisée en production** ; ne sert plus
+  qu'aux anciennes pages de mesure.
 
-## Choix du backend : WebGPU ou CPU ? On mesure, on ne suppose pas
+⚠️ **Le modèle n'est pas une dépendance npm.** `nvidia/parakeet-tdt-0.6b-v3` est sous
+**CC-BY-4.0** : l'attribution à NVIDIA est une **condition de la licence**, pas une
+politesse. Voir `README.md`.
+
+## Le choix du modèle : ce qui bloquait n'était pas ONNX, c'était l'horodatage par mot
+
+**Aujourd'hui : NVIDIA Parakeet TDT 0.6B v3**, export ONNX int8 de `ysdede`, chargé par
+la librairie **`parakeet.js` (MIT)**. 640 Mo, sur le CPU.
+
+⚠️ **CORRECTION D'UNE ERREUR QUI A COÛTÉ DU TEMPS.** Il était écrit, et cru, qu'**« aucun
+autre modèle n'existe : en ONNX pour le navigateur, il n'y a QUE Whisper »**. **C'est
+faux.** La vraie barrière n'a jamais été ONNX ni le navigateur : c'était **l'HORODATAGE
+PAR MOT**. Sans l'heure de chaque mot, rien de ce projet ne tient — ni l'affichage à
+l'heure, ni les ancres, ni la mesure de la médiane. Beaucoup de modèles savent
+transcrire ; peu rendent des instants par mot. C'est ce critère-là qu'il fallait chercher,
+et le chercher plus tôt.
+
+**La leçon de méthode** : une conclusion négative (« ça n'existe pas ») mérite le même
+niveau de preuve qu'une conclusion positive. Formulée sur le mauvais critère, elle ferme
+la porte pour des mois.
+
+### Les langues : 25, détectées seules, aucun réglage
+
+- **25 langues européennes**, **détectées automatiquement**. Le vocabulaire de Parakeet ne
+  contient **aucun jeton de langue** : il n'y a rien à lui indiquer.
+- Il n'y a donc **plus de sélecteur de langue** dans la popup, et c'est pour ça — pas par
+  simplification. Le menu était devenu un bouton débranché.
+- ⛔ **Perdu au change, et c'est un vrai renoncement** : **plus d'arabe, de chinois, de
+  japonais ni de turc** en transcription. Whisper les faisait.
+
+⏳ **VRAI JUSQU'AU 30/08/2026 — les 15 langues du mode direct.**
+
+> « 15 langues source, mémorisées, à chaud » : le direct proposait un menu déroulant, le
+> choix était rangé dans `chrome.storage` et transmis à Whisper (`language: "french"`),
+> et il pouvait changer sans redémarrer la capture.
+
+→ **Ce qui a changé** : plus de menu, plus de clé, plus de message. **Pourquoi** : Whisper
+avait besoin qu'on lui dise la langue, Parakeet non.
+
+### ⏳ Les vitesses des Whisper — mesurées avant le 30/08/2026, conservées
+
+Relevé sur cette machine, en **% du temps réel** (plus bas = plus rapide) :
+
+| modèle | % du temps réel |
+|---|---|
+| tiny | **31 %** |
+| base q8 | 59 % |
+| base fp32 | 75 % |
+| small q8 | 211 % (disqualifié) |
+| turbo (809 M) | ~700 % |
+| large-v3 (1,55 Md) | ~1300 % |
+
+Pour tenir le défilement ×2 il fallait être **sous 50 %**.
+
+⬜ **RESTE OUVERT, et le restera** : `base` n'a jamais été mesuré sur du son **bruité**. Il
+a été écarté sur du son propre — donc sur les mauvaises données. La question ne se pose
+plus pour la production, mais l'erreur de méthode, elle, est à retenir.
+
+### Les résultats du nouveau moteur (mesurés, 30/08/2026)
+
+| | Whisper (avant) | Parakeet (après) |
+|---|---|---|
+| fautes sur **2 493 mots** | **29** | **1** |
+| médiane mot prononcé → affiché | — | **12 ms** |
+| RTF (facteur temps réel) | 0,31 (tiny) | **0,283** |
+| requêtes externes | 0 | **0** |
+
+---
+
+## WebGPU : plus lent, ET il ne rend pas le même texte
+
+**Deux reproches, et le second est bien plus grave que le premier.**
+
+1. **Il est plus lent.** ×2,2 en défaveur du GPU sur cette machine (Intel Iris Xe). C'est
+   le même verdict que pour Whisper — voir la section datée « Choix du backend » : sur un
+   GPU intégré, le décodeur enchaîne de toutes petites étapes et le coût de lancement de
+   chaque calcul dépasse le gain de parallélisme.
+2. ⛔ **IL NE REND PAS LE MÊME TEXTE.** « d'étoil » au lieu de « d'étoiles ». Ce n'est pas
+   une question de vitesse : c'est un résultat **faux**, sans le moindre message.
+
+⚠️ **Et dans un worker, il DÉTRUIT la sortie : 8 mots au lieu de 69.**
+
+**La signature à reconnaître : une confiance de 0,6234.** Quand cette valeur apparaît,
+c'est WebGPU qui calcule, quoi qu'on croie avoir configuré.
+
+### ⚠️ Ce n'est pas le bundle, c'est le PROVIDER — mais la consigne ne change pas
+
+La première explication était « le mauvais bundle charge le mauvais `.wasm` ». **La vraie
+cause est le provider d'exécution** : c'est `executionProviders` qui décide, pas le nom du
+fichier importé.
+
+**Et pourtant la consigne reste la même : importer `ort.wasm.bundle.min.mjs`.** Pour une
+bien meilleure raison qu'avant :
+
+> **ce bundle ne CONTIENT PAS le provider WebGPU.**
+
+C'est une **garantie de structure**, pas un réglage qu'on peut oublier. Un réglage se
+perd, se surcharge, se contredit ailleurs dans le code ; un provider absent du binaire ne
+peut pas s'activer par accident. ⛔ **Ne pas remplacer par `ort.bundle.min.mjs`.**
+
+---
+
+## Le bug de `parakeet.js` : l'espace avalé devant les accents
+
+⛔ **RÈGLE : toujours dériver le texte de `res.words`. JAMAIS de `res.utterance_text`.**
+
+`parakeet.js` recolle son texte avec `text.replace(/\s+(?=[^\w\s])/g, "")`. **Vérifié
+dans la librairie installée le 31/08/2026 : `node_modules/parakeet.js/src/tokenizer.js`,
+ligne 82**, commentée « Remove space before punctuation ». C'est `tokenizer.decode()` qui
+l'applique, et `utterance_text` en sort — `words`, non. En
+JavaScript, **`\w` vaut `[A-Za-z0-9_]` — de l'ASCII pur**. Les lettres accentuées n'en
+font pas partie, tombent donc dans la classe « ponctuation », et l'espace qui les précède
+est effacé :
+
+> « premieresetoiles », « desevenements », « disparaitrea »
+
+**En anglais ça ne se voit jamais. En français ça hache le texte à chaque accent.**
+
+`res.words` est juste : il est construit ailleurs, par `raw.startsWith("▁")`, un test
+direct sur le marqueur SentencePiece qui ne passe pas par cette expression régulière.
+
+⚠️ **En le corrigeant, ne pas refaire la même erreur** : le test « ce morceau commence-t-il
+par de la ponctuation ? » doit exclure lettres et chiffres **au sens Unicode**
+(`/^[^\p{L}\p{N}]/u`, drapeau `u`).
+
+---
+
+## Panne silencieuse dans un worker : le guichet doit être posé en PREMIÈRE ligne
+
+⛔ **RÈGLE : `self.onmessage` s'installe à la première ligne exécutée du worker, avant
+tout `await` de niveau module.**
+
+Un `await` au niveau du module — un `import()` dynamique, par exemple — laisse **la boucle
+d'événements du worker tourner**. Un message envoyé par la page pendant cette attente est
+distribué tout de suite ; s'il n'y a pas encore de `onmessage`, il est **jeté en silence**.
+
+**Aucune erreur. Aucun échec. Aucun délai.** La page attend une réponse qui ne viendra
+jamais. Mesuré : le worker chargeait son bundle correctement puis restait muet
+**227 secondes**, et l'onglet Réseau montrait que le `init` n'avait rien déclenché.
+
+**La parade** : installer le gestionnaire dès la première ligne, empiler les messages
+reçus dans une file, et rejouer la file une fois le moteur prêt.
+
+⚠️ C'est **exactement la même forme de panne** que le `chrome.storage` dans l'offscreen
+(voir « Contraintes techniques connues ») : ce qui la rend invisible, c'est qu'elle
+n'échoue nulle part.
+
+---
+
+## La mémoire : `performance.memory` aurait annoncé 1,2 Mo au lieu de 1 335 Mo
+
+Le worker Parakeet occupe **~1 335 Mo de mémoire WebAssembly**. C'est ce qui oblige à le
+**terminer à la fin de chaque préparation** (`prepTerminerWorker`), sur une machine qui
+plafonne à ~2 100 Mo.
+
+⛔ **`performance.memory` ne compte QUE le tas JavaScript.** Les poids du modèle vivent
+dans la **mémoire linéaire du WebAssembly**, qui n'y figure pas. Interrogé seul, il aurait
+répondu **1,2 Mo** — un chiffre rassurant et **faux d'un facteur mille**.
+
+**La parade** : garder une référence sur l'objet `WebAssembly.Memory` que le runtime crée
+(en enveloppant le constructeur **avant** de charger ONNX Runtime) et lire
+`buffer.byteLength`. Si le runtime change de façon de faire, la référence reste nulle et
+**on le dit** au lieu d'inventer un chiffre.
+
+---
+
+## ⏳ Le mode direct — RETIRÉ LE 30/08/2026, et ce qu'il a prouvé
+
+Le mode direct transcrivait au fil de la parole. Il a été **supprimé** : plus de bouton,
+plus de sélecteur de mode, plus de `whisper.worker.js`, plus de VAD, plus de `FLUX`.
+
+**Il n'a pas été un détour pour rien — il a démontré le triangle impossible** (voir « Les
+instants ») : on ne peut pas avoir à la fois le texte synchrone avec le son, le son
+synchrone avec l'image, et la transcription faite en direct. Deux sur trois au mieux. Ce
+constat est ce qui a fait choisir « préparer d'abord », et il tient toujours.
+
+Les sections datées qui le décrivent restent en place : « Les deux modes d'affichage »,
+« Le retard du son », « Le flux », « L'horloge des mots », « Choix du backend ».
+
+⚠️ **Conséquence pour l'acquis n° 8.** Le bloc « ACQUIS À NE PAS PERDRE » (dans
+`REPRISE-LIVESUB.md`) comptait un huitième point : « Le MODE DIRECT fonctionne toujours,
+sans une ligne modifiée ». **Il n'a plus d'objet : il ne reste que 7 acquis.**
+
+---
+
+## Défauts corrigés le 30/08/2026 — ne plus les compter comme ouverts
+
+| défaut | état |
+|---|---|
+| Le pourcentage de téléchargement du modèle repart en arrière | ✅ **corrigé** — le dénominateur est désormais la somme des 5 tailles exactes, connue avant la première requête ; jamais `content-length`. Vérifié : 106 valeurs relevées, **0 recul** |
+| Si `models/` manque, l'overlay reste bloqué à l'infini | ✅ **corrigé** — les 5 fichiers sont vérifiés **avant tout chargement** ; message nommant le fichier, le dossier et la commande, en **moins de 700 ms**, sans qu'aucune barre ne démarre |
+| « bloc abandonné, ArrayBuffer detached » | ✅ **corrigé** |
+| « bloc INCOMPLET — dernier mot à X s sur Y s » | ✅ **sans objet** — c'était le plafond de jetons de Whisper (voir le point 1, daté) |
+
+
+## ⏳ Choix du backend : WebGPU ou CPU ? On mesure, on ne suppose pas — MÉCANIQUE RETIRÉE LE 30/08/2026
+⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — la mesure GPU/CPU au premier lancement.**
+
+Cette mécanique appartenait à `whisper.worker.js`, supprimé. Parakeet tourne **sur le
+CPU, sans mesure préalable** : il n'y a plus de verdict à mémoriser, plus de clé
+`whisperBackend`, plus de worker neuf par backend.
+
+⛔ **Ne pas appliquer les règles de cette section.** Le texte qui suit est conservé
+intact : les mesures restent vraies pour ce qu'elles mesuraient.
+
+---
 **WebGPU n'est PAS toujours plus rapide.** Sur un GPU intégré (ex : Intel Iris Xe,
 `gen-12lp`), WebGPU est ~2× **plus lent** que le CPU sur whisper-tiny : le décodeur
 enchaîne des dizaines de toutes petites étapes, et le coût de lancement de chaque
@@ -87,7 +361,23 @@ Ordres de grandeur mesurés sur cette machine (Intel Iris Xe, extrait de ~10 s) 
 CPU ~2,3 s, GPU ~4 à 5 s. *(L'ancien chiffre de « ~12 s » n'est plus d'actualité : il
 datait de l'inférence sur le fil principal, chargement du modèle compris.)*
 
-## Les deux modes d'affichage : « ça se réécrit » n'est pas un bug
+
+→ **Ce qui a changé** : plus aucun choix de backend à l'exécution. **Pourquoi** : la
+question « GPU ou CPU ? » a été tranchée pour de bon avec Parakeet, et dans le mauvais
+sens pour le GPU — voir « WebGPU : plus lent, ET il ne rend pas le même texte ». Le
+constat de fond de cette section, lui, s'est **confirmé une deuxième fois** : sur cette
+machine le GPU intégré perd contre le CPU.
+## ⏳ Les deux modes d'affichage — RETIRÉS LE 30/08/2026 (mode direct)
+⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — l'option « Afficher la fin provisoire ».**
+
+`ruban` / `provisoire` décrivaient **LocalAgreement-2**, propre au mode direct. La case
+de la popup, la clé `afficherProvisoire` et le message `SET_PROVISOIRE` ont été retirés
+en même temps que le direct.
+
+⛔ **Ne pas appliquer les règles de cette section.** Le texte qui suit est conservé
+intact : les mesures restent vraies pour ce qu'elles mesuraient.
+
+---
 Le moteur produit **deux** textes : le `ruban` (stable — deux passes successives sont
 tombées d'accord dessus, il ne bougera plus jamais) et le `provisoire` (la dernière
 hypothèse, que la passe suivante a le droit de corriger).
@@ -138,7 +428,22 @@ Aucun mot n'est perdu en mode stable : c'est la **clôture de fenêtre** qui le 
 `figerFenetre` verse tout le provisoire dans le ruban quand la fenêtre se ferme, donc la
 fin de phrase finit toujours par s'afficher.
 
-## Le retard du son : DEUX valeurs, une par mode
+
+→ **Ce qui a changé** : plus de provisoire, donc plus rien qui se réécrive sous les yeux
+— la préparation livre du texte **définitif** avant que la lecture commence.
+**Pourquoi** : voir le bandeau en tête de fichier. Tous les chiffres ci-dessus restent
+vrais pour le moteur qu'ils mesuraient.
+## ⏳ Le retard du son : DEUX valeurs, une par mode — RETIRÉ LE 30/08/2026
+⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — la calibration du retard audio par mode.**
+
+Le retard du son servait à recaler la voix sur un texte qui arrivait **en retard**. En
+préparation, le texte est prêt AVANT la lecture : il n'y a plus de retard à rattraper.
+`retardCalibreFluxParMode` n'est plus lue ni écrite.
+
+⛔ **Ne pas appliquer les règles de cette section.** Le texte qui suit est conservé
+intact : les mesures restent vraies pour ce qu'elles mesuraient.
+
+---
 Le retard audio aligne ce qu'on **entend** sur ce qu'on **lit**. La règle est la même dans
 les deux modes — *on mesure l'âge du dernier mot réellement affiché* — mais ce mot n'est
 pas le même :
@@ -170,7 +475,24 @@ est mémorisée pour de bon elle ne serait jamais remesurée. Trois génération
 `readRetardCalibre` ne lit que le nom courant, et refuse toute valeur qui n'a pas les deux
 champs attendus. Vérifié au banc sur un storage contenant les trois clés.
 
-## Le flux : une fenêtre qu'on re-transcrit, pas des blocs qu'on oublie
+
+→ **Ce qui a changé** : plus de retard audio du tout, et plus de réglage dans la popup.
+**Pourquoi** : voir le bandeau en tête de fichier.
+
+⚠️ **La leçon de la clé qui porte sa génération, elle, reste bonne et s'applique encore** :
+une valeur mémorisée par une génération précédente est fausse pour la suivante, et comme
+elle est mémorisée pour de bon elle ne serait jamais remesurée. C'est une règle de
+méthode, pas un détail de Whisper.
+## ⏳ Le flux : une fenêtre qu'on re-transcrit — RETIRÉ LE 30/08/2026 (mode direct)
+⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — le moteur en flux (fenêtre glissante + LocalAgreement-2).**
+
+`FENETRE_MAX`, `MIN_NOUVEAU`, `RECOUVREMENT_FENETRE`, `passeEnVol` : tout cela vivait
+dans le mode direct.
+
+⛔ **Ne pas appliquer les règles de cette section.** Le texte qui suit est conservé
+intact : les mesures restent vraies pour ce qu'elles mesuraient.
+
+---
 C'est le cœur du moteur, et c'est ce qui donne l'effet « sous-titres YouTube » : les mots
 s'ajoutent au fil de la parole au lieu qu'une phrase entière saute toutes les 7 secondes.
 
@@ -217,7 +539,32 @@ ruban ne recule jamais, aucun mot prononcé n'est perdu.
 la latence *et* le texte. Sous ~5 s de contexte, whisper-tiny n'écoute plus, il récite les
 phrases les plus fréquentes de son entraînement (« Thank you for watching »).
 
+
+→ **Ce qui a changé** : la préparation découpe en **blocs de 20 s transcrits une seule
+fois**, avec 3 s de contexte audio à la jointure (voir 5 ter). **Pourquoi** : voir le
+bandeau en tête de fichier.
+
+⚠️ **ATTENTION, UNE PHRASE DE CETTE SECTION EST FAUSSE POUR PARAKEET** :
+« Whisper complète TOUT extrait à 30 s avant de le traiter » est une propriété de
+**Whisper**, et c'est elle qui rendait la re-transcription quasi gratuite. Parakeet est
+un **transducteur** : son coût suit la durée réelle du son. Ne pas réutiliser ce
+raisonnement tel quel — NON MESURÉ sur Parakeet.
 ## Les instants : chaque mot connaît l'heure à laquelle il a été prononcé
+
+⚠️ **CE QUI EST TOUJOURS VRAI, ET CE QUI NE L'EST PLUS (30/08/2026).**
+
+- ✅ **Le triangle impossible reste vrai**, et c'est la leçon la plus durable du projet.
+- ✅ **Chaque mot porte toujours son instant** : Parakeet rend des horodatages par mot,
+  comme Whisper. C'était d'ailleurs **la vraie barrière au changement de modèle** — pas
+  ONNX, pas le navigateur : l'horodatage par mot. Voir « Le choix du modèle ».
+- ⏳ **Le coût mesuré (+3 à +20 %) est celui de `return_timestamps: "word"` de Whisper.**
+  Chez Parakeet l'horodatage n'est pas une option qu'on active : le transducteur émet au
+  rythme des trames, l'instant vient avec le mot. **Surcoût : NON MESURÉ, sans objet.**
+- ⏳ **« Whisper complète tout extrait à 30 s »** ne vaut pas pour Parakeet.
+- ⏳ **Le chemin décrit plus bas (`whisper.worker.js` → `FLUX` → `rubanInstants`) est
+  celui du mode direct**, supprimé. Les instants voyagent aujourd'hui dans le stock de la
+  préparation.
+
 **Le triangle impossible, d'abord.** Trois choses souhaitables, on ne peut en avoir que
 deux : *(1)* le texte synchrone avec le son, *(2)* le son synchrone avec l'image, *(3)* la
 transcription faite en direct depuis l'onglet. On ne peut pas transcrire un mot avant
@@ -293,7 +640,17 @@ et seule la mesure d'âge du mode stable était fausse d'une cadence. **Un repli
 est exactement ce qui rend ce genre de perte invisible.** `sendFlux` relaie désormais le
 message entier.
 
-## L'horloge des mots : `content.js` n'estime plus, il lit l'heure
+## ⏳ L'horloge des mots : le retard OBSERVÉ — RETIRÉ LE 30/08/2026 (mode direct)
+⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — le retard d'affichage observé (percentile 90) et son plafond.**
+
+Tout cet appareillage n'avait qu'un but : compenser le fait qu'en direct on ne sait pas
+quand un mot a été prononcé. En préparation on le sait, et c'est `video.currentTime` qui
+commande. `RETARD_MAX` a disparu avec le reste.
+
+⛔ **Ne pas appliquer les règles de cette section.** Le texte qui suit est conservé
+intact : les mesures restent vraies pour ce qu'elles mesuraient.
+
+---
 `PAS_REVELATION = 80` et `RETARD_MAX_MOTS = 12` **ont disparu**, et c'est le signe que
 l'étape 2 a fait son travail : c'étaient deux rustines pour compenser l'absence
 d'horloge. Un seul réveil toutes les 50 ms, qui sort tout mot dont l'heure est venue.
@@ -346,7 +703,34 @@ l'écran, lui, ajoute maintenant le retard d'affichage. `retardCalibreFluxParMod
 estime donc l'âge réel. À reprendre à l'étape 3 — qui prévoit de toute façon de mettre le
 retard du son à zéro par défaut.
 
+
+→ **Ce qui a changé** : la règle tient en une ligne — un mot s'affiche quand
+`video.currentTime` atteint son instant. Plus de p90, plus de plafond, plus de file à
+étaler. **Pourquoi** : voir le bandeau en tête de fichier.
+
+✅ **Ce qui a SURVÉCU, et c'est le plus utile** : « le retard se cale sur le mot le plus
+ANCIEN en attente, pas le plus frais » reste la bonne intuition, et les mesures
+d'affichage par blocs qui en découlent tiennent toujours — mesuré le 30/08/2026 sur
+Parakeet : **médiane 12 ms** entre l'instant d'un mot et son affichage.
 ## Mode « préparer d'abord » : trois défauts, une seule maladie (2026-08-28)
+
+> ⚠️ **CETTE SECTION A ÉTÉ ÉCRITE SOUS WHISPER. Voici ce qu'il faut en garder — relu le
+> 30/08/2026.** Le mode, lui, n'a pas changé : c'est le seul qui reste.
+>
+> ✅ **TOUJOURS EN PLACE, avec Parakeet** — points **2** (coupure au silence), **3** (la
+> table des ancres : l'heure des mots lue sur la vidéo, pas calculée), **4** (l'overlay
+> qui s'efface en fondu), **5 bis** (moyenne des deux canaux), **5 ter** (3 s de contexte
+> audio avant chaque bloc), **6 bis** (blocs de 20 s) et **7**.
+>
+> ⛔ **RETIRÉ, ne pas remettre** — point **1** (le plafond de jetons `maxJetons`) et points
+> **6 ter / 6 quater** (l'amorce `decoder_input_ids` et sa passe de secours). Ce sont des
+> mécanismes de Whisper ; Parakeet n'a pas d'équivalent.
+>
+> ❓ **NON MESURÉ SUR PARAKEET** — points **5** (« sous 1,5 s le modèle invente ») et **6**
+> (« sur du silence il écrit quand même »). Les garde-fous sont gardés par prudence.
+>
+> ⏳ **« blocs de 15 s » dans le paragraphe ci-dessous est dépassé** : `PREP_BLOC_CONTENU`
+> est passé à **20 s** au point 6 bis, et n'a pas rebougé.
 
 Le mode fait défiler la vidéo à x2 en silence, transcrit tout d'avance en blocs de 15 s,
 puis affiche le stock à l'heure pendant la lecture normale. Trois symptômes ont été
@@ -354,7 +738,16 @@ rapportés — *l'overlay disparaît puis réapparaît d'un coup*, *des phrases 
 manquent*, *le texte est parfois faux*. **Ce sont trois façons de voir le même trou dans
 le stock**, plus une désynchronisation qui s'y ajoute.
 
-### 1. `CONFIRMÉ` — 60 jetons coupent le français au bout de 13 s
+### ⏳ 1. `CONFIRMÉ` — 60 jetons coupent le français au bout de 13 s — SANS OBJET DEPUIS LE 30/08/2026
+
+⛔ **`maxJetons` / `PREP_JETONS_PAR_S` ont été RETIRÉS du chemin Parakeet. Ne pas les
+remettre.** `max_new_tokens` est un réglage de Whisper, qui écrit jeton par jeton
+jusqu'à un quota. Parakeet est un **transducteur** : il émet au rythme des trames audio,
+il n'a ni quota à atteindre ni quota à dépasser. Le défaut « bloc INCOMPLET — dernier mot
+à 15,5 s sur 18,6 s » qu'il causait **a disparu avec lui**.
+
+Le comptage jetons/mot ci-dessous reste une mesure juste sur le tokenizer de Whisper.
+
 
 `whisper.worker.js` imposait `max_new_tokens = 60` à **tout le monde**. Cette valeur avait
 été dimensionnée pour les segments de 7 s du mode direct ; la préparation, elle, envoie des
@@ -455,7 +848,13 @@ de fonctionner, ce qui est pire qu'une absence. Mais deux choses le rendaient br
   maintenant par l'**opacité**, avec un fondu de 220 ms posé sur la boîte (et
   `pointer-events: none`, pour qu'une boîte invisible n'intercepte pas les clics).
 
-### 5. `CONFIRMÉ` — le dernier bloc était le seul dont personne ne choisissait la durée
+### 5. `CONFIRMÉ` (pour Whisper) — le dernier bloc était le seul dont personne ne choisissait la durée
+
+⚠️ **« SOUS ~1,5 SECONDE, LE MODÈLE INVENTE » EST UNE PROPRIÉTÉ DE WHISPER — NON MESURÉ
+SUR PARAKEET.** Le tableau ci-dessous a été relevé sur whisper-tiny fp32. Un transducteur
+n'a aucune raison mécanique de se comporter pareil, mais **personne ne l'a vérifié**.
+`PREP_RESERVE_FIN = 5` s est donc gardé par prudence, pas par mesure.
+
 
 Symptôme rapporté : *des fautes qui apparaissent quand la vidéo approche de sa fin*.
 
@@ -503,7 +902,12 @@ exactement le reste court qu'on vient d'interdire.
 journal de l'offscreen montre un dernier bloc de 5 s ou plus. Ce serait alors la
 qualité de whisper-tiny sur ce son-là, pas la durée du bloc.
 
-### 6. `CONFIRMÉ` — sur du silence, Whisper écrit quand même
+### 6. `CONFIRMÉ` (pour Whisper) — sur du silence, Whisper écrit quand même
+
+⚠️ **NON MESURÉ SUR PARAKEET.** `prepEstSilence` est gardé : il ne juge pas le texte
+rendu, il constate qu'il n'y a rien à transcrire *avant* de demander — donc il ne peut
+faire perdre aucun mot, quel que soit le modèle.
+
 
 Même séance : sur du silence numérique pur, **quelle qu'en soit la durée** (1 s,
 3 s, 10 s), whisper-tiny rend « you ». En français, c'est la phrase de générique
@@ -581,6 +985,15 @@ Un cinquième des fautes en moins pour 4 % de temps — le surcoût est faible p
 Whisper complète tout extrait à 30 s de toute façon. **Et ça ne monte pas
 indéfiniment** : à 6 s c'est déjà moins bon qu'à 3.
 
+⏳ **LE « +4 % » EST UN CHIFFRE WHISPER, ET SA RAISON N'EST PLUS VRAIE (noté le
+30/08/2026).** Le surcoût était faible *parce que* Whisper complétait tout extrait à 30 s :
+rallonger l'envoi de 3 s ne lui coûtait rien. **Parakeet est un transducteur — son coût
+suit la durée réelle du son** (voir « Le flux »), donc cette raison-là est tombée. Ce que
+coûtent réellement 3 s de contexte sur un bloc de 20 s avec Parakeet : **NON MESURÉ.**
+Ce qui est gardé, c'est le **réglage** (3 s) et le constat de forme — le contexte soigne
+les jointures, et à 6 s c'est déjà moins bon qu'à 3. Les fautes mesurées, elles, restent
+vraies pour ce qu'elles mesuraient : whisper-tiny.
+
 Sur la chaîne complète (offscreen.js réel + vrai whisper, piste de 46 s, blocs de
 15 s), le gain est plus modeste parce qu'il n'y a que deux jointures : **27 → 24
 fautes**, 0 doublon, 0 instant qui recule, aucun mot perdu. C'est logique — le
@@ -594,7 +1007,12 @@ contexte soigne les *jointures*, et un bloc de 15 s en compte peu.
   `prepOterDoublons` enlève les premiers mots neufs qui répètent la fin du stock —
   trois au plus, pour ne pas avaler une vraie répétition de la parole.
 
-### 5 quater. Ce qui a été essayé et ÉCARTÉ (mesuré, pas supposé)
+### ⏳ 5 quater. Ce qui a été essayé et ÉCARTÉ — MESURES WHISPER, conservées le 30/08/2026
+
+⚠️ `num_beams` et `no_repeat_ngram_size` sont des options du pipeline de
+**transformers.js**. Elles n'ont plus de chemin vers le moteur actuel. Les deux autres
+lignes (normalisation du niveau, préparation à ×1) restent des leçons générales.
+
 
 - `num_beams` (recherche par faisceaux) : **le pipeline de transformers.js 4.2.0
   l'ignore**. Texte rigoureusement identique à 3 et à 5 faisceaux, temps identique,
@@ -634,6 +1052,22 @@ problème**, pas deux : régler les blocs lents règle l'attente finale.
 aucun incident. Le système n'avait aucune capacité de récupération. C'est ça qu'on
 corrige, pas seulement l'incident.
 
+⏳ **CE QUI SUIT REPOSE ENTIÈREMENT SUR UNE PROPRIÉTÉ DE WHISPER (noté le 30/08/2026).**
+« L'encodeur coûte pareil pour 10 s ou 27 s » et « les 30 s sont un mur » sont vrais de
+**Whisper**, qui complète tout extrait à 30 s. **Parakeet est un transducteur : il n'a ni
+ce palier, ni ce mur.** À lire dans les deux sens :
+
+- ⛔ **NE PLUS OPPOSER LE BUDGET DES 28 S** pour refuser d'agrandir le bloc.
+  `PREP_BLOC_CONTENU + PREP_RESERVE_FIN + PREP_CONTEXTE` = 28 s n'est plus borné par un
+  plafond à 30 s, et Parakeet ne coupe pas en silence à 30 s.
+- ⬜ **Le gain de 1,20× entre 15 s et 20 s n'est pas transposable** : il venait du nombre
+  d'*encodeurs* par minute de vidéo, pas de la durée du son. **NON MESURÉ sur Parakeet**,
+  où un bloc deux fois plus gros coûte a priori deux fois plus cher à encoder.
+- ✅ **`PREP_BLOC_CONTENU = 20 s` reste en place** — mais par continuité et par prudence,
+  **pas** parce que la mesure ci-dessous le justifie encore.
+
+Le tableau qui suit reste vrai pour ce qu'il mesurait : **whisper-tiny fp32**.
+
 **Le levier : la taille du bloc.** Whisper complète tout extrait à 30 s, donc
 l'*encodeur* coûte pareil pour 10 s ou 27 s de contenu. Un bloc deux fois plus gros,
 c'est deux fois moins d'encodeurs par minute de vidéo. Mesuré (whisper-tiny fp32,
@@ -669,7 +1103,18 @@ en direct). **Si `video +X s` est nettement inférieur à la durée du bloc, c'e
 lecteur qui a calé, pas Whisper.** Et à l'arrêt, deux lignes disent en clair si
 l'attente finale vient de la dette ou du seul dernier bloc.
 
-### 6 ter. `CONFIRMÉ` — on peut souffler le vocabulaire de la page à Whisper
+### ⏳ 6 ter. `CONFIRMÉ` — on peut souffler le vocabulaire de la page à Whisper — RETIRÉ LE 30/08/2026
+
+⛔ **L'AMORCE A ÉTÉ RETIRÉE DU CHEMIN PARAKEET. Ne pas la remettre.** `decoder_input_ids`
+est un mécanisme propre à Whisper, qui accepte un « contexte précédent » avant ses jetons
+de départ. **Parakeet n'a pas d'équivalent** : son décodeur ne prend pas de préfixe
+textuel. `content.js` relève encore le vocabulaire de la page et l'envoie (`prepAmorce`) —
+il n'est simplement plus utilisé.
+
+Conséquence directe : `prepEstBoucle`, qui n'existait que parce que l'amorce provoquait
+des boucles, n'a plus de cause à traiter. Tout ce qui suit reste une mesure juste sur
+Whisper.
+
 
 Whisper accepte un « contexte précédent » : des jetons introduits par
 `<|startofprev|>`, placés avant `<|startoftranscript|>`. Le modèle devient beaucoup
@@ -724,7 +1169,15 @@ Mesuré sur de vraies sorties — boucles à 0,22 / 0,25 / 0,26, vraies phrases 
 assumée à la règle « aucun filtre anti-hallucination » : on ne l'ajoute que parce
 qu'on vient d'ajouter la cause. Sans amorce, il ne se déclenche jamais.
 
-### 6 quater. `CONFIRMÉ` — l'amorce faisait RENONCER Whisper, et c'est ça qui revidait l'overlay
+### ⏳ 6 quater. `CONFIRMÉ` — l'amorce faisait RENONCER Whisper — SANS OBJET DEPUIS LE 30/08/2026
+
+⛔ L'amorce étant retirée (voir 6 ter), la **passe de secours** qui la rattrapait
+(`PREP_COUVERTURE_SECOURS`) n'a plus d'objet non plus.
+
+✅ **MAIS LA LEÇON DE MÉTHODE, ELLE, EST LA PLUS CHÈRE DU FICHIER — ELLE S'APPLIQUE
+TOUJOURS** : un gain mesuré sur un extrait court ne dit rien de ce qui arrive sur un bloc
+long et difficile. C'est la deuxième fois que ce piège s'est refermé sur ce projet.
+
 
 ⚠️ **LE CHIFFRE DE 39 → 16 FAUTES CI-DESSUS A ÉTÉ MESURÉ SUR LA MAUVAISE CONDITION,
 ET LA SUITE LE PROUVE.** Il portait sur des extraits de 11 s d'une seule phrase.
@@ -813,9 +1266,33 @@ total sans aucun sous-titre — et c'est cette mesure-là qu'il faut regarder, p
   `return true` dans un `onMessage` doit avoir un `.catch` qui répond — sinon la moindre
   erreur devient un blocage muet.
 - CSP MV3 : `wasm-unsafe-eval` requis pour le WASM ; les workers `blob:` sont bloqués
-  → `numThreads = 1` et `proxy = false`.
-- Whisper : `dtype: "fp32"`, **sur les deux backends**. Choix mesuré, pas par défaut —
-  voir le long commentaire dans `whisper.worker.js`. En résumé :
+  → `proxy = false`.
+- ⚠️ **`numThreads = 1` N'EST PLUS UNE FATALITÉ — ET C'EST UNE QUESTION OUVERTE, PAS UN
+  ACQUIS.** Il était écrit ici que « la CSP de MV3 bloque le multithread ». **C'est faux.**
+  Mesuré le 30/08/2026 : **4 fils ont fonctionné dans une page d'extension**,
+  `SharedArrayBuffer` était disponible, et le gain était de **2,4×**.
+
+  ❓ **CE QUI N'EST PAS VÉRIFIÉ : le document offscreen.** Toute la production tourne là,
+  et une page d'extension n'est pas un document offscreen — l'isolation d'origine croisée
+  peut y différer. Tant que ce n'est pas mesuré **dans l'offscreen**, on reste à
+  `numThreads = 1` en production. Ce qui trancherait : lire `crossOriginIsolated` et
+  `typeof SharedArrayBuffer` depuis `offscreen.js`, puis chronométrer 1 fil contre 4 sur
+  le même bloc.
+- **Parakeet : les poids `int8` du dépôt `ysdede/parakeet-tdt-0.6b-v3-onnx`**, exécutés
+  sur le CPU (`executionProviders: ["wasm"]`). Pas de choix de dtype à faire : le dépôt
+  publie l'export int8 et c'est celui qu'on prend. 640 Mo pour les 5 fichiers.
+
+  ⚠️ **« 640 Mo » et « 652 Mo » ne se contredisent PAS — ce ne sont ni les mêmes fichiers
+  ni la même unité**, et le fichier ne le disait nulle part. Tailles exactes, lues dans
+  `scripts/fetch-model.js` : encodeur **652 183 999 o**, décodeur/joint **18 202 004 o**,
+  `nemo128.onnx` **137 641 o**, `vocab.txt` **102 132 o**, `config.json` **101 o** —
+  **total 670 625 877 o**. Soit **640 Mio pour les cinq** (l'unité du script, `/1024/1024`)
+  et **622 Mio pour le seul encodeur** — que les sections plus bas appellent « 652 » en
+  comptant ses octets en méga **décimaux**. Aucun des deux chiffres n'est faux ; ils ne
+  répondent pas à la même question.
+- ⏳ **VRAI JUSQU'AU 30/08/2026 — le choix de dtype de Whisper.** Whisper : `dtype: "fp32"`,
+  **sur les deux backends**. Choix mesuré, pas par défaut — voir le long commentaire dans
+  `whisper.worker.js` *(fichier supprimé)*. En résumé :
   - Si un export quantifié refuse de charger (`Missing required scale ... MatMulNBits`
     pour q8, `SimplifiedLayerNormFusion` pour fp16), **ce ne sont pas les poids** : ce
     sont des passes de fusion de niveau `extended` d'ONNX Runtime. Avec
@@ -833,19 +1310,44 @@ total sans aucun sous-titre — et c'est cette mesure-là qu'il faut regarder, p
     dégrade quand même en production).
   - Piste si le poids devient critique (modèle embarqué) : **whisper-base en q8**, 77 Mo,
     soit moins que tiny fp32, et moins sujet aux hallucinations. À mesurer.
-- WebGPU (ONNX Runtime 1.26) passe par la variante WASM `asyncify` (ou `jspi`), **pas**
-  par `jsep` comme dans les versions 1.19–1.21. Les 4 variantes sont copiées dans
-  `vendor/`, laisser comme ça.
+- ⏳ **VRAI JUSQU'AU 30/08/2026** — WebGPU (ONNX Runtime 1.26) passe par la variante WASM
+  `asyncify` (ou `jspi`), **pas** par `jsep` comme dans les versions 1.19–1.21. Les 4
+  variantes sont copiées dans `vendor/`, laisser comme ça.
+  → **Ce qui a changé** : `vendor/` ne sert plus au moteur de production. Le worker
+  Parakeet charge ONNX Runtime depuis
+  `node_modules/parakeet.js/node_modules/onnxruntime-web/dist/`, et **n'active jamais
+  WebGPU** — voir « WebGPU : plus lent, ET il ne rend pas le même texte ».
 - `chrome.*` est **indisponible dans un worker dédié** : dériver les URL de
   `self.location`, et laisser la page faire ce qui touche à `chrome.storage`.
+- ⚠️ **Une réponse `chrome-extension://` ne porte PAS de `content-length`.** Mesuré le
+  30/08/2026 sur les 5 fichiers du modèle : ses en-têtes sont `cache-control`,
+  `content-security-policy`, `content-type`, `etag`, `last-modified` — et rien d'autre. Un
+  contrôle de taille fondé sur `content-length` aurait donc trouvé **tous les fichiers
+  vides, tout le temps**.
+
+  **La parade, et elle est bon marché** : lire **un seul morceau** du corps. Sur
+  l'encodeur de **652 Mo, le premier `read()` rend 1 024 octets en 2,8 ms** — puis on
+  annule le flux, le reste n'est jamais lu. Un fichier absent ne rend pas un 404 : `fetch`
+  **rejette** (`TypeError: Failed to fetch`, ~1 ms). Un fichier vide répond `ok` et son
+  premier `read()` rend `done` immédiatement.
 - Le service worker est éphémère : toujours re-vérifier l'état réel via
   `chrome.offscreen.hasDocument()` et `chrome.storage.session`.
 
 ## Comment tester
 Recharger l'extension (`chrome://extensions` → 🔄) puis la page (F5). Console du
-service worker : « Inspecter les vues → service worker ». Console du VAD/capture :
-« Inspecter les vues → **offscreen.html** ». Test Whisper isolé : ouvrir
-`chrome-extension://<ID>/test-whisper.html`. (Voir la skill `tester-extension`.)
+service worker : « Inspecter les vues → service worker ». Console de la capture :
+« Inspecter les vues → **offscreen.html** ». Test du moteur isolé : ouvrir
+`chrome-extension://<ID>/test-parakeet-worker.html`. (Voir la skill `tester-extension`.)
+⏳ *`test-whisper.html` existe encore mais ne mesure plus le moteur de production.*
+
+⚠️ **UNE SÉANCE DE MESURE S'USE QUATRE FOIS PLUS VITE QU'AVANT.** Un worker Whisper
+pesait 147 Mo ; un worker Parakeet en pèse **652**, et occupe **~1 335 Mo** de mémoire
+WebAssembly. Là où on tenait une vingtaine de configurations dans une séance, on en tient
+**trois ou quatre**.
+
+⛔ **Conséquence pratique, à respecter** : prévoir 3 ou 4 configurations par série, pas 20,
+et **redémarrer le navigateur entre deux séries**. Recharger la page ne suffit pas — c'est
+la machine entière qui est descendue (voir le témoin ci-dessous).
 
 **Sans Chrome** : `offscreen.js` et `content.js` se chargent tels quels dans un contexte
 `vm` de Node avec des bouchons (`chrome`, `Worker`, DOM, `Date.now`), ce qui permet de
@@ -872,6 +1374,10 @@ confortable** — celui de l'offscreen n'a donc plus de `chrome.storage` du tout
 modif qui touche au démarrage se vérifie **dans Chrome, popup réel ouvert**, pas seulement
 au banc.
 
+⏳ **VRAI JUSQU'AU 30/08/2026 — le banc en deux temps.** *(Le message `FLUX` et les deux
+modes ont disparu avec le direct ; le principe « rejouer le même enregistrement dans deux
+instances pour que la comparaison soit honnête » reste, lui, la bonne méthode.)*
+
 Le banc le plus utile est celui **en deux temps** : on fait tourner le moteur une fois, on
 enregistre la suite exacte des messages `FLUX`, puis on la **rejoue dans deux instances de
 `content.js`** — une par mode. Les deux modes voient alors rigoureusement le même flux, ce
@@ -880,6 +1386,22 @@ que le tableau des deux modes plus haut a été obtenu, et c'est là qu'on injec
 bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot ni image.
 
 ## Avancement
+
+### Depuis le 30/08/2026 — changement de moteur
+- ✅ **Parakeet TDT 0.6B v3 remplace whisper-tiny.** 1 faute sur 2 493 mots contre 29,
+  RTF 0,283 contre 0,31, médiane mot prononcé → affiché **12 ms**, 0 requête externe.
+- ✅ **Mode direct supprimé**, et le sélecteur de langue avec lui (Parakeet détecte seul,
+  25 langues européennes).
+- ✅ **Installation livrable** : `npm run fetch-model` (5 fichiers, tailles exactes
+  vérifiées, progression qui ne recule jamais) et `README.md` avec l'attribution NVIDIA.
+- ✅ **Modèle manquant : message clair au lieu d'une barre infinie**, en moins de 700 ms.
+- ⬜ **Multithread WASM dans l'OFFSCREEN : question ouverte.** 4 fils ont marché dans une
+  page d'extension (×2,4), **jamais vérifié dans le document offscreen**.
+- ⬜ **Fin de vidéo courte et silence : NON MESURÉ sur Parakeet.** Les garde-fous hérités
+  de Whisper (`PREP_RESERVE_FIN`, `prepEstSilence`) sont gardés par prudence.
+- ⬜ Traduction, personnalisation de l'overlay, historique/export.
+
+### Avant le 30/08/2026 — l'ère Whisper *(conservé)*
 - ✅ Structure de l'extension (popup, overlay, messages).
 - ✅ Capture audio de l'onglet + VAD (segments de parole), avec état popup robuste.
 - ✅ Whisper dans un Web Worker (la page ne fige plus) + choix mesuré du backend
@@ -939,9 +1461,16 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
   problème se pose sur du son bruité (documentaire avec musique : « lourire » pour
   « nourrir »). Cette condition n'a jamais été mesurée : la décision a été prise sur les
   mauvaises données. À reprendre — tiny/base/small × trois niveaux de musique.
-- ⬜ Pistes de latence non explorées : multithread WASM (on est à `numThreads = 1` à
-  cause des workers `blob:` bloqués par la CSP — 2 à 3× à gagner si on débloque). Ça se
-  verrait directement : moins de temps par passe = mots révélés plus tôt.
+- ⏳ **CORRIGÉ LE 30/08/2026** — le texte d'origine disait : « Pistes de latence non
+  explorées : multithread WASM (on est à `numThreads = 1` à cause des workers `blob:`
+  bloqués par la CSP — 2 à 3× à gagner si on débloque). Ça se verrait directement : moins
+  de temps par passe = mots révélés plus tôt. »
+  → **Ce qui a changé** : **la CSP ne bloque pas le multithread.** 4 fils ont tourné dans
+  une page d'extension, `SharedArrayBuffer` disponible, **×2,4**. L'estimation « 2 à 3× »
+  était donc juste ; c'est la cause invoquée qui était fausse.
+  ❓ **Reste ouvert** : rien de tout cela n'a été vérifié **dans le document offscreen**,
+  qui est le seul endroit qui compte pour la production. Voir « Contraintes techniques
+  connues ».
 
 ## Débogage — les trois consoles
 

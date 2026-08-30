@@ -1,195 +1,290 @@
-// Telecharge le modele Whisper depuis Hugging Face vers models/.
+// Telecharge le modele Parakeet depuis Hugging Face vers models/.
 //
-// Pourquoi ? Jusqu'ici le modele n'etait pas dans l'extension : Transformers.js
-// allait le chercher sur huggingface.co a chaque demarrage. Mesure sur trois
-// captures consecutives : trois telechargements complets de ~150 Mo. Le cache
-// du navigateur ne survit pas d'une session a l'autre pour ces requetes.
+// Pourquoi ce script existe : les 640 Mo de poids ne sont PAS dans le depot
+// (voir .gitignore). Quelqu'un qui clone le projet n'a donc pas le modele, et
+// l'extension le lui dit maintenant en toutes lettres -- avec le nom de cette
+// commande. Le message de `offscreen.js` et le nom du script npm doivent rester
+// identiques au caractere pres :
 //
-// Consequence : sans internet, l'extension ne demarrait pas -- ce qui contredit
-// l'argument central du projet (« 100 % local, hors ligne »).
+//     « Lancez « npm run fetch-model » dans le dossier du projet,
+//       puis rechargez l'extension. »
+//
+// ⚠️ C'EST LE SEUL FICHIER DU PROJET QUI PARLE A INTERNET, et il ne tourne que
+// quand on le lance a la main. L'extension, elle, ne fait aucune requete
+// externe -- ni au demarrage, ni pendant une transcription. C'est l'argument
+// central du projet, et il ne tiendrait pas si le telechargement vivait dans
+// l'extension.
 //
 // Meme mecanisme que vendor/ (voir copy-assets.js) : dossier gitignore, rempli
 // par un script npm, jamais versionne. La seule difference est la source : ici
 // on telecharge, la-bas on copie depuis node_modules.
 //
-// Lance automatiquement apres `npm install` (script postinstall), ou a la main
-// avec `npm run build:model`.
-//
-// Usage avance (page de comparaison test-bench.html uniquement) :
-//   node scripts/fetch-model.js Xenova/whisper-base:fp32,q8
-// Sans argument, seul le modele de PRODUCTION est telecharge.
+// ⚠️ CE QUI A DISPARU AVEC WHISPER (etape 5) : le choix du depot en argument,
+// la table des dtypes (`SUFFIXES`), les fichiers du tokenizer de Transformers.js
+// et le sous-dossier `onnx/`. Parakeet n'a qu'un jeu de fichiers, a plat, et
+// personne n'a de variante a choisir.
 
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
 
 const ROOT = path.join(__dirname, "..");
-const MODELS = path.join(ROOT, "models");
+const DEPOT = "ysdede/parakeet-tdt-0.6b-v3-onnx";
+const DOSSIER = path.join(ROOT, "models", "parakeet-tdt-0.6b-v3");
 
-// Le modele de production. Doit rester aligne sur MODELE_DEFAUT et
-// DTYPE_DEFAUT dans whisper.worker.js : c'est ce couple-la que l'extension
-// chargera au demarrage, et avec allowRemoteModels = false il n'y a plus de
-// filet -- un fichier manquant est une erreur, pas un aller sur internet.
-const PRODUCTION = [{ repo: "Xenova/whisper-tiny", dtypes: ["fp32"] }];
-
-// Correspondance dtype -> suffixe de fichier .onnx. C'est la table de
-// Transformers.js (DEFAULT_DTYPE_SUFFIX_MAPPING), recopiee ici : si elle
-// changeait cote librairie, on telechargerait les mauvais fichiers.
-const SUFFIXES = {
-  fp32: "",
-  fp16: "_fp16",
-  q8: "_quantized",
-  int8: "_int8",
-  uint8: "_uint8",
-  q4: "_q4",
-  q4f16: "_q4f16",
-  bnb4: "_bnb4",
-};
-
-// Fichiers non-.onnx. Les cinq premiers sont ceux que Transformers.js reclame
-// vraiment (ce sont exactement ceux qu'on voyait passer dans l'onglet Reseau) ;
-// les suivants sont optionnels selon le modele, on les prend s'ils existent
-// parce qu'ils ne pesent rien et qu'un 404 en production serait un aller-retour
-// inutile.
-const FICHIERS_REQUIS = [
-  "config.json",
-  "generation_config.json",
-  "preprocessor_config.json",
-  "tokenizer.json",
-  "tokenizer_config.json",
-];
-const FICHIERS_OPTIONNELS = [
-  "added_tokens.json",
-  "special_tokens_map.json",
-  "normalizer.json",
-  "vocab.json",
+// ---------------------------------------------------------------------------
+// LES CINQ FICHIERS, AVEC LEUR TAILLE EXACTE
+// ---------------------------------------------------------------------------
+//
+// ⚠️ LA TAILLE EXACTE EST LE COEUR DE CE SCRIPT, pas une decoration. Elle sert
+// trois fois :
+//   1. decider s'il y a quelque chose a telecharger (« present » ne suffit pas :
+//      un fichier a moitie ecrit est present) ;
+//   2. refuser un telechargement incomplet AVANT qu'il ne prenne la place du
+//      vrai fichier ;
+//   3. servir de denominateur au pourcentage -- et c'est ce qui l'empeche de
+//      reculer (voir plus bas).
+//
+// Valeurs relevees sur le depot lui-meme le 2026-08-30, pas recopiees de
+// memoire. Elles doivent rester alignees sur PREP_MODELE_FICHIERS d'offscreen.js
+// (les cinq memes noms) : c'est cette liste-la que l'extension verifie au
+// demarrage d'une preparation.
+const FICHIERS = [
+  { nom: "encoder-model.int8.onnx", octets: 652183999 },
+  { nom: "decoder_joint-model.int8.onnx", octets: 18202004 },
+  { nom: "nemo128.onnx", octets: 137641 },
+  { nom: "vocab.txt", octets: 102132 },
+  { nom: "config.json", octets: 101 },
 ];
 
-function url(repo, fichier) {
-  return `https://huggingface.co/${repo}/resolve/main/${fichier}`;
+const TOTAL_ATTENDU = FICHIERS.reduce((somme, f) => somme + f.octets, 0);
+
+function url(fichier) {
+  return `https://huggingface.co/${DEPOT}/resolve/main/${fichier}`;
+}
+
+function formater(octets) {
+  if (octets >= 1024 * 1024) return `${(octets / 1024 / 1024).toFixed(1)} Mo`;
+  if (octets >= 1024) return `${Math.round(octets / 1024)} Ko`;
+  return `${octets} o`;
+}
+
+function tailleSurDisque(chemin) {
+  try {
+    return fs.statSync(chemin).size;
+  } catch (err) {
+    return -1; // absent
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LA PROGRESSION, ET POURQUOI ELLE NE PEUT PAS RECULER
+// ---------------------------------------------------------------------------
+//
+// ⚠️ « Le pourcentage de telechargement du modele repart en arriere » est un
+// defaut connu, ecrit noir sur blanc dans les notes du projet. Un pourcentage
+// qui recule est un pourcentage qui ment, et il ne se corrige pas en le
+// bridant : il se corrige en supprimant sa CAUSE.
+//
+// La cause d'un pourcentage qui recule, c'est toujours un DENOMINATEUR QUI
+// CHANGE. On ne prend donc PAS `content-length` de la reponse (qui n'arrive
+// qu'apres la redirection, differe d'un miroir a l'autre, et peut manquer) :
+// on prend les tailles exactes ecrites plus haut, connues AVANT la premiere
+// requete. Le denominateur est une constante.
+//
+// Le numerateur, lui, est `octetsAcquis` : les octets des fichiers deja valides
+// plus ceux recus pour le fichier en cours. Il ne fait que croitre dans un
+// passage -- un fichier deja compte n'est jamais retelecharge dans le meme
+// passage.
+//
+// Reste le filet : si malgre tout la valeur baissait, on ne la CACHE pas, on le
+// DIT. Une valeur bridee en silence redonnerait exactement le defaut d'origine,
+// en le rendant invisible.
+let octetsAcquis = 0;
+let dernierEntier = -1;
+let dernierePourcentage = -1;
+let reculsDetectes = 0;
+
+function progresser(nomFichier, forcer = false) {
+  const pourcentage = (octetsAcquis / TOTAL_ATTENDU) * 100;
+
+  if (pourcentage < dernierePourcentage - 1e-9) {
+    reculsDetectes++;
+    console.error(
+      `\n⚠️ ANOMALIE : la progression a recule (${dernierePourcentage.toFixed(2)} % → ` +
+        `${pourcentage.toFixed(2)} %). C'est un defaut, pas un affichage a corriger.`
+    );
+  }
+  dernierePourcentage = Math.max(dernierePourcentage, pourcentage);
+
+  const entier = Math.floor(pourcentage);
+  if (!forcer && entier === dernierEntier) return;
+  dernierEntier = entier;
+
+  const ligne =
+    `   ${String(entier).padStart(3)} %  ` +
+    `${formater(octetsAcquis)} / ${formater(TOTAL_ATTENDU)}  ${nomFichier}`;
+
+  // Sur un vrai terminal on redessine la meme ligne ; sinon (journal, CI, sortie
+  // redirigee) on ecrit une ligne par valeur, pour que la suite des valeurs
+  // reste LISIBLE et donc verifiable apres coup.
+  if (process.stdout.isTTY) process.stdout.write("\r" + ligne + "   ");
+  else console.log(ligne);
 }
 
 // GET qui suit les redirections : huggingface.co renvoie un 302 vers son CDN.
-function telecharger(adresse, destination, sauts = 0) {
+function telecharger(adresse, temporaire, fichier, sauts = 0) {
   return new Promise((resolve, reject) => {
     if (sauts > 5) return reject(new Error("trop de redirections"));
 
-    https
-      .get(adresse, { headers: { "User-Agent": "LiveSub/1.0" } }, (reponse) => {
+    const requete = https.get(
+      adresse,
+      { headers: { "User-Agent": "LiveSub/1.0" } },
+      (reponse) => {
         const code = reponse.statusCode;
 
         if (code >= 300 && code < 400 && reponse.headers.location) {
-          reponse.resume(); // il faut vider la reponse, sinon la socket reste ouverte
-          // Location peut etre RELATIF (huggingface.co le fait) : on le resout
+          reponse.resume(); // vider la reponse, sinon la socket reste ouverte
+          // `location` peut etre RELATIF (huggingface.co le fait) : on le resout
           // par rapport a l'adresse courante, sinon on obtient « Invalid URL ».
           const suivante = new URL(reponse.headers.location, adresse).href;
-          return resolve(telecharger(suivante, destination, sauts + 1));
+          return resolve(telecharger(suivante, temporaire, fichier, sauts + 1));
         }
         if (code !== 200) {
           reponse.resume();
           return reject(new Error(`HTTP ${code}`));
         }
 
-        // On ecrit dans un fichier temporaire puis on renomme : une coupure en
-        // cours de route laisserait sinon un fichier tronque que le prochain
-        // passage prendrait pour un telechargement deja fait.
-        const temporaire = destination + ".part";
-        fs.mkdirSync(path.dirname(destination), { recursive: true });
+        // ⚠️ On ecrit dans « .part » et on ne renomme QU'APRES verification de la
+        // taille. Une coupure de reseau, un Ctrl-C, une panne de courant : il
+        // reste un « .part » que personne ne prendra pour le vrai fichier, et le
+        // passage suivant le refera. Sans ca, un fichier tronque porterait le bon
+        // nom et l'extension chargerait des poids incomplets.
         const sortie = fs.createWriteStream(temporaire);
+        const depart = octetsAcquis;
 
-        reponse.pipe(sortie);
-        sortie.on("finish", () => {
-          sortie.close(() => {
-            fs.renameSync(temporaire, destination);
-            resolve(fs.statSync(destination).size);
-          });
+        // ⚠️ NOTRE PROPRE COMPTEUR, PAS `sortie.bytesWritten`. Ce dernier suit
+        // ce qui est REELLEMENT parti sur le disque, donc il retarde sur ce qui
+        // est recu et n'avance pas au meme rythme que les evenements « data ».
+        // L'utiliser ici ferait osciller le total -- c'est-a-dire reculer le
+        // pourcentage, exactement le defaut qu'on est en train de corriger.
+        // `recus` ne fait qu'additionner des longueurs de morceaux : il ne peut
+        // pas decroitre.
+        let recus = 0;
+        reponse.on("data", (morceau) => {
+          recus += morceau.length;
+          octetsAcquis = depart + recus;
+          progresser(fichier.nom);
         });
-        sortie.on("error", (err) => {
-          fs.rmSync(temporaire, { force: true });
+
+        reponse.on("error", (err) => {
+          sortie.destroy();
           reject(err);
         });
-      })
-      .on("error", reject);
+
+        sortie.on("error", (err) => reject(err));
+        sortie.on("finish", () => sortie.close(() => resolve(depart)));
+
+        reponse.pipe(sortie);
+      }
+    );
+
+    requete.on("error", reject);
+    // Un reseau qui ne repond plus doit echouer, pas suspendre le script pour
+    // toujours : sans ce delai, `npm run fetch-model` peut rester muet des
+    // heures et ressembler a un blocage du script lui-meme.
+    requete.setTimeout(60000, () => {
+      requete.destroy(new Error("aucune reponse du serveur pendant 60 s"));
+    });
   });
 }
 
-function formater(octets) {
-  return octets >= 1024 * 1024
-    ? `${(octets / 1024 / 1024).toFixed(1)} Mo`
-    : `${Math.round(octets / 1024)} Ko`;
-}
+async function recuperer(fichier) {
+  const destination = path.join(DOSSIER, fichier.nom);
+  const temporaire = destination + ".part";
+  const taille = tailleSurDisque(destination);
 
-async function recuperer(repo, fichier, { optionnel = false } = {}) {
-  const destination = path.join(MODELS, repo.replace("/", path.sep), fichier);
-
-  if (fs.existsSync(destination) && fs.statSync(destination).size > 0) {
-    console.log(`  ⏭️  deja la : ${fichier} (${formater(fs.statSync(destination).size)})`);
-    return 0;
+  // ⚠️ « DEJA LA » VEUT DIRE « DE LA BONNE TAILLE », pas « existe ». Un fichier
+  // tronque a la moitie existe, lui aussi -- et le passer serait exactement la
+  // panne qu'on veut eviter : le script jurerait que tout est en place pendant
+  // que l'extension refuserait de demarrer.
+  if (taille === fichier.octets) {
+    octetsAcquis += fichier.octets;
+    console.log(`  ⏭️  deja la  ${fichier.nom} (${formater(taille)}, taille exacte)`);
+    progresser(fichier.nom, true);
+    return false;
+  }
+  if (taille >= 0) {
+    console.log(
+      `  ♻️  a refaire ${fichier.nom} : ${formater(taille)} sur le disque, ` +
+        `${formater(fichier.octets)} attendus`
+    );
   }
 
-  process.stdout.write(`  ⬇️  ${fichier} ... `);
+  console.log(`  ⬇️  ${fichier.nom} (${formater(fichier.octets)})`);
+  fs.mkdirSync(DOSSIER, { recursive: true });
+  fs.rmSync(temporaire, { force: true });
+
+  const depart = octetsAcquis;
   try {
-    const octets = await telecharger(url(repo, fichier), destination);
-    console.log(formater(octets));
-    return octets;
+    await telecharger(url(fichier.nom), temporaire, fichier);
   } catch (err) {
-    if (optionnel) {
-      console.log(`absent chez ${repo}, ignore`);
-      return 0;
-    }
-    console.log("ECHEC");
-    throw new Error(`${repo}/${fichier} : ${err.message}`);
+    fs.rmSync(temporaire, { force: true });
+    octetsAcquis = depart;
+    throw new Error(`${fichier.nom} : ${err.message}`);
   }
-}
 
-// "Xenova/whisper-base:fp32,q8" -> { repo, dtypes }
-function analyserArgument(argument) {
-  const [repo, liste] = argument.split(":");
-  const dtypes = (liste || "fp32").split(",");
-  for (const d of dtypes) {
-    if (!(d in SUFFIXES)) {
-      throw new Error(`dtype inconnu : « ${d} ». Connus : ${Object.keys(SUFFIXES).join(", ")}`);
-    }
+  // La verification, sur le « .part », AVANT qu'il ne prenne le nom du vrai
+  // fichier. Un fichier de la mauvaise taille n'atteint jamais le disque sous
+  // son vrai nom.
+  const obtenue = tailleSurDisque(temporaire);
+  if (obtenue !== fichier.octets) {
+    fs.rmSync(temporaire, { force: true });
+    octetsAcquis = depart;
+    throw new Error(
+      `${fichier.nom} : telechargement incomplet (${obtenue} octets recus, ` +
+        `${fichier.octets} attendus). Le fichier a ete supprime.`
+    );
   }
-  return { repo, dtypes };
+
+  fs.renameSync(temporaire, destination);
+  octetsAcquis = depart + fichier.octets;
+  progresser(fichier.nom, true);
+  if (process.stdout.isTTY) process.stdout.write("\n");
+  return true;
 }
 
 (async () => {
-  const arguments_ = process.argv.slice(2);
-  const modeles = arguments_.length ? arguments_.map(analyserArgument) : PRODUCTION;
+  const debut = Date.now();
+  console.log(`📦 Modele Parakeet TDT 0.6B v3 → models/parakeet-tdt-0.6b-v3/`);
+  console.log(`   Source : huggingface.co/${DEPOT}`);
+  console.log(`   ${FICHIERS.length} fichiers, ${formater(TOTAL_ATTENDU)} au total.\n`);
 
-  console.log("📦 Telechargement des modeles Whisper vers models/ ...");
-  if (!arguments_.length) {
-    console.log("   (modele de production ; passe un argument pour en ajouter d'autres)");
+  let telecharges = 0;
+  for (const fichier of FICHIERS) {
+    if (await recuperer(fichier)) telecharges++;
   }
 
-  let total = 0;
-
-  for (const { repo, dtypes } of modeles) {
-    console.log(`\n🧠 ${repo} [${dtypes.join(", ")}]`);
-
-    for (const fichier of FICHIERS_REQUIS) total += await recuperer(repo, fichier);
-    for (const fichier of FICHIERS_OPTIONNELS) {
-      total += await recuperer(repo, fichier, { optionnel: true });
-    }
-
-    // Les .onnx vont dans un sous-dossier onnx/ : c'est la ou Transformers.js
-    // les cherche, on ne choisit pas cette structure.
-    for (const dtype of dtypes) {
-      const suffixe = SUFFIXES[dtype];
-      for (const base of ["encoder_model", "decoder_model_merged"]) {
-        total += await recuperer(repo, `onnx/${base}${suffixe}.onnx`);
-      }
-    }
-  }
-
+  const secondes = (Date.now() - debut) / 1000;
   console.log(
-    `\n✅ Modeles prets dans models/ ` +
-      (total ? `(${formater(total)} telecharges)` : "(rien a telecharger)")
+    `\n✅ Modele complet dans models/parakeet-tdt-0.6b-v3/ ` +
+      `(${telecharges === 0 ? "rien a telecharger" : `${telecharges} fichier(s) telecharge(s)`}` +
+      `, ${secondes.toFixed(1)} s).`
   );
-  console.log("   Rappel : models/ est gitignore, comme vendor/.");
+  if (reculsDetectes) {
+    console.error(`⚠️ La progression a recule ${reculsDetectes} fois : c'est un defaut a corriger.`);
+  }
+  console.log("   models/ est gitignore, comme vendor/ : le modele ne part jamais dans git.");
+  console.log("   Rechargez maintenant l'extension dans chrome://extensions (🔄).");
 })().catch((err) => {
   console.error(`\n❌ Telechargement du modele impossible : ${err.message}`);
-  console.error("   Verifie ta connexion, puis relance `npm run build:model`.");
+  console.error("");
+  console.error("   Que faire :");
+  console.error("   1. verifiez votre connexion (le script contacte huggingface.co) ;");
+  console.error("   2. relancez « npm run fetch-model » : les fichiers deja complets");
+  console.error("      sont conserves, seul ce qui manque est repris ;");
+  console.error("   3. si ca echoue encore, telechargez les 5 fichiers a la main depuis");
+  console.error(`      https://huggingface.co/${DEPOT}/tree/main`);
+  console.error(`      et placez-les dans models/parakeet-tdt-0.6b-v3/.`);
   process.exit(1);
 });

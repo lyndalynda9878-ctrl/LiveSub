@@ -86,6 +86,11 @@
       line-height: 1.35;
       overflow-wrap: break-word;
       min-height: 2.7em;
+      /* Un message d'echec dit trois choses -- ce qui manque, ou, quoi faire --
+         et il les dit sur trois lignes. Sans `pre-line` elles seraient recollees
+         en un seul bloc de 230 px de large, illisible. `min-height` est un
+         plancher, pas un plafond : la popup s'agrandit pour le message. */
+      white-space: pre-line;
     }
     #status {
       margin-top: 10px;

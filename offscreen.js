@@ -549,6 +549,116 @@ function prepSecondesContenu(echantillons) {
 }
 
 // ---------------------------------------------------------------------------
+// LES CINQ FICHIERS DU MODELE : on regarde AVANT, pas pendant
+// ---------------------------------------------------------------------------
+//
+// Le modele pese 640 Mo et n'est pas dans le depot : il est telecharge a
+// l'installation. Quelqu'un qui clone le projet et lance l'extension sans
+// l'avoir telecharge doit l'apprendre en une phrase, tout de suite -- pas
+// deviner.
+//
+// ⚠️ CE QUE CETTE VERIFICATION REMPLACE, MESURE LE 2026-08-30 DANS CHROME.
+// L'echec etait deja signale (l'attente de `prepChargement` s'en charge), mais
+// il ne nommait RIEN :
+//   dossier renomme  -> « Parakeet n'a pas pu charger : Failed to fetch »  (3,1 s)
+//   encodeur renomme -> « Parakeet n'a pas pu charger : Failed to fetch »  (1,0 s)
+//   encodeur vide    -> « ... Can't create a session. ERROR_CODE: 2,
+//                        ERROR_MESSAGE: No graph was found in the protobuf. » (1,0 s)
+// Trois pannes differentes, deux messages identiques, et pas un mot sur le
+// fichier en cause ni sur ce qu'il faut faire.
+//
+// ⚠️ UNE SEULE LISTE, ET C'EST CELLE QU'ON CHARGE. `prepUrlsModele` sert a la
+// fois a la verification et au message `init` du worker. Verifier une liste et
+// en charger une autre donnerait un detecteur qui jure que tout va bien pendant
+// que le chargement echoue sur un fichier qu'il ne regardait pas.
+const PREP_MODELE_DOSSIER = "models/parakeet-tdt-0.6b-v3/";
+
+// L'ordre compte : c'est celui dans lequel les fichiers seront nommes a
+// l'ecran, et il ne doit pas dependre de l'ordre ou les reponses reviennent.
+const PREP_MODELE_FICHIERS = [
+  ["encodeur", "encoder-model.int8.onnx"],
+  ["decodeur", "decoder_joint-model.int8.onnx"],
+  ["preproc", "nemo128.onnx"],
+  ["vocab", "vocab.txt"],
+  ["config", "config.json"],
+];
+
+function prepUrlsModele() {
+  const urls = {};
+  for (const [role, nom] of PREP_MODELE_FICHIERS) {
+    urls[role] = chrome.runtime.getURL(PREP_MODELE_DOSSIER + nom);
+  }
+  return urls;
+}
+
+// Present ? Non vide ? Rend "ok", "absent" ou "vide".
+//
+// ⚠️ ON NE PEUT PAS LIRE LA TAILLE DANS UN EN-TETE. Mesure du 2026-08-30 sur
+// les cinq fichiers : une reponse chrome-extension:// ne porte PAS de
+// `content-length`. Ses en-tetes sont cache-control, content-security-policy,
+// content-type, etag, last-modified -- et rien d'autre. Un controle base sur
+// `content-length` aurait donc trouve tous les fichiers vides, tout le temps.
+//
+// D'ou la lecture d'UN SEUL morceau du corps. C'est ce qui garde la
+// verification instantanee au lieu de lui faire couter le chargement qu'elle
+// est censee eviter : sur l'encodeur de 652 Mo, le premier `read()` rend
+// 1 024 octets en 2,8 ms. On annule le flux juste apres ; le reste des 652 Mo
+// n'est jamais lu.
+async function prepEtatFichierModele(url) {
+  let reponse;
+  try {
+    reponse = await fetch(url);
+  } catch (erreur) {
+    // Un fichier absent ne rend pas un 404 ici : `fetch` REJETTE, avec
+    // « TypeError: Failed to fetch » (mesure : ~1 ms). C'est ce rejet-la,
+    // remonte tel quel jusqu'a l'ecran, qui ne disait rien a personne.
+    return "absent";
+  }
+  if (!reponse.ok || !reponse.body) return "absent";
+
+  const lecteur = reponse.body.getReader();
+  try {
+    const premier = await lecteur.read();
+    if (premier.done || !premier.value || premier.value.length === 0) return "vide";
+    return "ok";
+  } finally {
+    lecteur.cancel().catch(() => {});
+  }
+}
+
+// Les cinq en parallele : la verification complete coute quelques millisecondes.
+async function prepModeleManquant() {
+  const urls = prepUrlsModele();
+  const etats = await Promise.all(
+    PREP_MODELE_FICHIERS.map(([role]) => prepEtatFichierModele(urls[role]))
+  );
+  const soucis = [];
+  PREP_MODELE_FICHIERS.forEach(([, nom], i) => {
+    if (etats[i] !== "ok") soucis.push({ nom, etat: etats[i] });
+  });
+  return soucis;
+}
+
+// Les TROIS choses a dire, et pas une de moins : ce qui manque, ou, quoi faire.
+//
+// Trois lignes plutot qu'un paragraphe : le message est affiche dans une boite
+// de sous-titres et dans une popup de 230 px. En un seul bloc il devient un mur
+// qu'on ne lit pas. (Les deux destinataires rendent les retours a la ligne :
+// voir `white-space: pre-line` dans content.js et popup.html.)
+function prepMessageModeleManquant(soucis) {
+  const details = soucis
+    .map((s) => `${s.nom} (${s.etat === "vide" ? "vide, 0 octet" : "absent"})`)
+    .join(", ");
+  const tout = soucis.length === PREP_MODELE_FICHIERS.length;
+
+  return (
+    `Modèle de transcription ${tout ? "absent" : "incomplet"}.\n` +
+    `Manque dans ${PREP_MODELE_DOSSIER} : ${details}.\n` +
+    `Lancez « npm run fetch-model » dans le dossier du projet, puis rechargez l'extension.`
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Le worker Whisper de la preparation (le sien, pas celui du direct)
 // ---------------------------------------------------------------------------
 
@@ -635,16 +745,13 @@ function prepDemarrerParakeet() {
   // `chrome.runtime` existe dans un document offscreen (c'est `chrome.storage`
   // qui n'y est pas). Le worker, lui, est un worker DEDIE : `chrome.*` n'y
   // existe pas du tout. C'est donc ici qu'on construit les URL des modeles.
-  prepWorker.postMessage({
-    type: "init",
-    urls: {
-      encodeur: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/encoder-model.int8.onnx"),
-      decodeur: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/decoder_joint-model.int8.onnx"),
-      vocab: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/vocab.txt"),
-      preproc: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/nemo128.onnx"),
-      config: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/config.json"),
-    },
-  });
+  //
+  // ⚠️ LES MEMES URL QUE CELLES QU'ON VIENT DE VERIFIER, et c'est la seule
+  // raison pour laquelle `prepUrlsModele` existe. Une liste ecrite ici en dur et
+  // une autre dans le verificateur finiraient par diverger le jour ou un fichier
+  // change de nom -- et le verificateur jurerait alors que tout va bien pendant
+  // que le chargement echoue.
+  prepWorker.postMessage({ type: "init", urls: prepUrlsModele() });
 
   return prepChargement;
 }
@@ -1226,6 +1333,28 @@ async function demarrerPreparation(options) {
 
   prepReinitialiser();
 
+  // ⚠️ LES CINQ FICHIERS D'ABORD, AVANT LE MOINDRE CHARGEMENT.
+  //
+  // Avant cette ligne : aucun worker instancie, aucun `getUserMedia`, aucun
+  // AudioContext, et surtout `PREPARATION_PILOTER` pas encore envoye -- donc
+  // AUCUNE BARRE DE PROGRESSION ne peut demarrer. C'est le point de la
+  // verification autant que le message : une barre qui avance pendant qu'il ne
+  // se passe rien est un mensonge, et CLAUDE.md le dit deja (« une barre de
+  // progression n'est pas une preuve de travail »).
+  //
+  // On rejette avec `modeleIncomplet` pose sur l'erreur : c'est ce drapeau qui
+  // fait passer le message a l'ecran TEL QUEL, sans le prefixe « La capture
+  // silencieuse a echoue » -- lequel serait ici une fausse piste (la capture
+  // n'a pas echoue, elle n'a jamais commence).
+  const soucisModele = await prepModeleManquant();
+  if (soucisModele.length) {
+    const detail = soucisModele.map((s) => `${s.nom} : ${s.etat}`).join(", ");
+    console.error(`❌ Preparation : modele inutilisable — ${detail}`);
+    const erreur = new Error(prepMessageModeleManquant(soucisModele));
+    erreur.modeleIncomplet = true;
+    throw erreur;
+  }
+
   // Le modele d'abord : il met du temps a charger, autant qu'il commence
   // pendant qu'on branche l'audio. Rien ne sera transcrit avant `ready` de
   // toute facon.
@@ -1503,9 +1632,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .catch((err) => {
         console.error("❌ demarrerPreparation a rejete :", err);
         prepActif = false;
+        const brut = err && err.message ? err.message : String(err);
         sendResponse({
           success: false,
-          error: "La capture silencieuse a echoue : " + (err && err.message ? err.message : err),
+          // ⚠️ Le modele manquant passe SANS prefixe. « La capture silencieuse a
+          // echoue » decrit bien les autres pannes, mais pas celle-la : la
+          // capture n'a pas echoue, on ne l'a jamais demarree. Et le prefixe
+          // couterait 35 caracteres au message qui doit, lui, dire trois choses.
+          error: err && err.modeleIncomplet ? brut : "La capture silencieuse a echoue : " + brut,
         });
       });
     return true;

@@ -258,11 +258,72 @@ function prepFormaterDuree(secondes) {
 // mais n'appelle PAS afficherStatut : celui-la a sa propre regle (« un statut
 // n'ecrase jamais du vrai texte »), qui n'a rien a voir avec ce qu'on fait ici.
 function prepAfficher(texte, discret) {
+  // Le premier affichage normal qui suit un echec rend a la boite ses reglages
+  // d'origine. Se reparer toute seule vaut mieux que compter sur un appel pose
+  // au bon endroit : il y a plusieurs chemins pour recommencer une preparation.
+  if (prepBoiteEnErreur) prepBoiteNormale();
   subtitleBox.style.display = "block";
   subtitleBox.style.opacity = discret ? "0.8" : "1";
   subtitleBox.style.fontStyle = discret ? "italic" : "normal";
   ligne.style.transform = "";
   ligne.textContent = texte;
+}
+
+// ---------------------------------------------------------------------------
+// UN MESSAGE D'ECHEC N'EST JAMAIS COUPE
+// ---------------------------------------------------------------------------
+//
+// ⚠️ CE QUI ARRIVAIT SANS CETTE FONCTION, VU A L'ECRAN LE 2026-08-30 (capture a
+// l'appui) : `zone` fait deux lignes de hauteur FIXE avec `overflow: hidden`,
+// donc l'overlay affichait
+//
+//     « ❌ La capture silencieuse a echoue : Parakeet n'a pas pu charger :
+//       Can't create a session. ERROR_CODE: 2, ERROR_MESSAGE: No graph was »
+//
+// et s'arretait la. La fin du message etait sous la coupe, invisible. Un
+// message qui doit dire ce qui manque, ou, et quoi faire ne tiendra JAMAIS en
+// deux lignes de 24 px : le dire sans le montrer ne vaut rien.
+//
+// La boite s'agrandit donc pour ce cas-la, et pour lui seul :
+//   - `prepAfficher` garde ses deux lignes fixes pour tout le reste (statuts,
+//     progression, avertissements en cours de route) ;
+//   - un echec n'est JAMAIS suivi de sous-titres -- la preparation s'est
+//     arretee. La boite ne peut donc pas « sauter » pendant une lecture : il
+//     n'y aura pas de lecture. L'acquis « la boite ne change pas de hauteur »
+//     porte sur l'affichage du texte, et il est intact.
+//
+// `pre-line` rend les retours a la ligne du message : les trois choses a dire
+// sont sur trois lignes, pas dans un mur de texte.
+let prepBoiteEnErreur = false;
+
+function prepAfficherErreur(texte) {
+  prepBoiteEnErreur = true;
+  subtitleBox.style.display = "block";
+  subtitleBox.style.opacity = "1";
+  subtitleBox.style.fontStyle = "normal";
+  ligne.style.transform = "";
+  ligne.style.whiteSpace = "pre-line";
+  subtitleBox.style.fontSize = "19px";
+  zone.style.height = "auto";
+  zone.style.overflow = "visible";
+  // La boite est rendue a ses reglages d'origine des qu'on reaffiche du texte
+  // (voir prepBoiteNormale) ; le cache de hauteur est invalide pour que
+  // `prepLectHauteur` reapplique la sienne au lieu de se croire deja bon.
+  prepLectHauteurCourante = null;
+  ligne.textContent = texte;
+}
+
+// Remet la boite exactement comme elle etait avant `prepAfficherErreur`.
+// Appelee des qu'on recommence a afficher quoi que ce soit d'autre : sans elle,
+// un echec suivi d'une preparation reussie laisserait les sous-titres en 19 px
+// sur une boite sans hauteur fixe.
+function prepBoiteNormale() {
+  prepBoiteEnErreur = false;
+  ligne.style.whiteSpace = "";
+  subtitleBox.style.fontSize = "24px";
+  zone.style.overflow = "hidden";
+  zone.style.height = `${LIGNES_VISIBLES * HAUTEUR_LIGNE}em`;
+  prepLectHauteurCourante = LIGNES_VISIBLES;
 }
 
 // La <video> a piloter.
@@ -674,7 +735,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .then((etats) => {
         const r = request.resume;
         if (request.erreur) {
-          prepAfficher("❌ " + request.erreur);
+          // ⚠️ `prepAfficherErreur`, pas `prepAfficher` : un message d'echec doit
+          // etre lu EN ENTIER. Avec `prepAfficher` il etait coupe au bout de deux
+          // lignes -- et c'est justement la fin d'un message d'echec (« voici
+          // quoi faire ») qui compte le plus.
+          prepAfficherErreur("❌ " + request.erreur);
         } else if (r && typeof r.nbMots === "number") {
           prepAfficher(
             `✅ Prêt — ${r.nbMots} mots préparés, ${prepFormaterDuree(r.dureeCouverteS)} couvertes`
