@@ -96,6 +96,9 @@ document.getElementById("charger").addEventListener("click", async () => {
 const FICHIERS = {
   "/speech.wav": ["test/speech.wav", "audio/wav"],
   "/speech-fr.mp3": ["test/speech-fr.mp3", "audio/mpeg"],
+  // Ajoute pour l etape 4 : l extrait ARTE francais (« trous noirs »), le seul
+  // materiel qui permette de verifier que les fautes de whisper-tiny ont disparu.
+  "/extrait-fr-dur.wav": ["test/extrait-fr-dur.wav", "audio/wav"],
 };
 
 http

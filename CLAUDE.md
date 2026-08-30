@@ -455,6 +455,340 @@ de fonctionner, ce qui est pire qu'une absence. Mais deux choses le rendaient br
   maintenant par l'**opacité**, avec un fondu de 220 ms posé sur la boîte (et
   `pointer-events: none`, pour qu'une boîte invisible n'intercepte pas les clics).
 
+### 5. `CONFIRMÉ` — le dernier bloc était le seul dont personne ne choisissait la durée
+
+Symptôme rapporté : *des fautes qui apparaissent quand la vidéo approche de sa fin*.
+
+Tous les blocs font 15 s **sauf le dernier** : lui, c'est ce qui reste quand la
+vidéo s'arrête. Il pouvait donc faire 1 s. Et un bloc de la préparation n'a **aucun
+contexte** — pas de recouvrement, chaque bloc est transcrit une fois, seul.
+
+Mesure du 2026-08-28, vrai whisper-tiny fp32 sous Node (voir la mémoire
+`whisper-reel-sous-node`), même extrait, on ne garde que la fin :
+
+| reste seul | texte rendu | verdict |
+|---|---|---|
+| 0,5 s | « You » | inventé |
+| 1,0 s | « God, free. » | inventé (vrai : « your country. ») |
+| 1,5 s | « for your country. » | juste |
+| 2,0 s | « can do for your country. » | juste |
+| 3,0 s | « Ask what you can do for your country. » | juste |
+
+La bascule est nette et basse : **sous ~1,5 s, le modèle fabrique une phrase
+crédible sans rapport avec le son**. Et il ne s'agit pas d'un cas de bord rare —
+banc Node/vm sur **401 durées de vidéo** (20 s à 220 s, pas de 0,5 s) :
+
+| | avant | après |
+|---|---|---|
+| dernier bloc le plus court | **1,01 s** | **5,03 s** |
+| vidéos dont la fin tombe sous 1,5 s | 13 / 401 (3,2 %) | 0 |
+| vidéos dont la fin **n'est pas transcrite du tout** | 25 / 401 (6,2 %) | 0 |
+| bloc le plus long | 15,0 s | 20,0 s (sans danger : Whisper complète à 30 s) |
+
+Les 6,2 % sont l'autre moitié du défaut : sous `PREP_RESTE_MIN_CONTENU`, le reste
+était **jeté en silence** — les derniers mots de la vidéo n'existaient nulle part.
+
+Correctif : la pompe garde `PREP_RESERVE_FIN = 5` s de contenu en réserve et ne
+coupe un bloc plein que s'il en reste au moins autant derrière lui. La fin de
+vidéo part alors d'un seul bloc de 5 à 20 s. Coût : 5 s de contenu (2,5 s
+d'horloge à x2) d'attente dans la file, et rien d'autre — la préparation tourne
+plus vite que la vidéo.
+
+⚠️ **Le corollaire dans `prepTraiterBloc`** : « bloc plein » ne veut plus dire
+« taille == un bloc », mais « et il reste quelque chose derrière ». Sinon la
+coupure au silence rendrait à la file un morceau de moins d'une seconde — soit
+exactement le reste court qu'on vient d'interdire.
+
+*Ce qui prouverait que c'est faux* : des fins de vidéo encore fausses alors que le
+journal de l'offscreen montre un dernier bloc de 5 s ou plus. Ce serait alors la
+qualité de whisper-tiny sur ce son-là, pas la durée du bloc.
+
+### 6. `CONFIRMÉ` — sur du silence, Whisper écrit quand même
+
+Même séance : sur du silence numérique pur, **quelle qu'en soit la durée** (1 s,
+3 s, 10 s), whisper-tiny rend « you ». En français, c'est la phrase de générique
+(« Sous-titres réalisés par… »). C'est un décodeur : il ne sait pas se taire. Une
+vidéo qui se termine par un fondu au silence récoltait donc un mot inventé, posé
+pile à la fin.
+
+Correctif : `prepEstSilence` — un bloc sous **-80 dBFS en moyenne ET -50 dBFS en
+crête** n'est pas envoyé à Whisper. `prepConsommes` avance quand même, donc la zone
+reste couverte : elle ne porte simplement aucun mot. Banc : une vidéo de 40 s sans
+aucun son donnait **40 mots inventés**, elle en donne **0**.
+
+⚠️ **Ce n'est pas le filtre anti-hallucination que `prepTraiterBloc` s'interdit** :
+on ne juge pas le texte rendu, on constate qu'il n'y a rien à transcrire *avant* de
+demander. Aucun mot ne peut être perdu — s'il n'y a pas de son, il n'y a pas de mot.
+Les seuils sont absurdes de sévérité exprès : de la parole très basse est 100 fois
+au-dessus, une vidéo en pause rend exactement 0.
+
+### 5 bis. `CONFIRMÉ` — on ne captait qu'un canal sur deux
+
+Symptôme : *des fautes de transcription, partout, pas seulement à la fin*.
+
+`preparation.worklet.js` lisait `entrees[0][0]` — le canal **gauche**, et lui seul.
+La moitié du son de l'onglet partait à la poubelle, et **laquelle était tirée au
+sort**. Or dans un mixage vidéo la voix est au centre (identique à gauche et à
+droite) tandis que la musique et les effets sont étalés : prendre un seul canal
+garde toute la musique de ce côté-là, alors que la moyenne (G+D)/2 garde toute la
+voix et fait s'annuler en partie ce qui diffère entre les deux.
+
+Mesure du 2026-08-28, vrai whisper-tiny fp32, extrait JFK + lit musical, deux
+niveaux de musique, 44 mots de référence par ligne :
+
+| mixage | canal gauche seul | moyenne (G+D)/2 |
+|---|---|---|
+| musique identique G/D (mono) | 19 fautes | 19 fautes |
+| musique étalée (décorrélée) | 19 fautes | **4 fautes** |
+| musique à gauche | 19 fautes | **4 fautes** |
+| musique à droite | **0 faute** | 6 fautes |
+| **total** | **57 / 176** | **33 / 176** |
+
+Le rapport signal/bruit gagne jusqu'à **5,6 dB** — une mesure physique, pas une
+opinion.
+
+⚠️ **La quatrième ligne est le prix honnête** : quand la musique était justement du
+côté qu'on ne prenait pas, on avait de la chance, et on la perd. Mais c'est bien de
+la *chance* : le canal gauche est un tirage au sort, et sur les trois autres cas il
+coûte 15 fautes de plus. La moyenne, elle, ne peut jamais être pire que le pire des
+deux canaux.
+
+Le worklet annonce désormais le nombre de canaux reçus (`🎚️ l'onglet arrive en N
+canal(aux)`). **Si la console dit 1, ce correctif n'apporte rien sur cette page-là** —
+et c'est ça qui prouverait qu'il ne sert à rien ici.
+
+### 5 ter. `CONFIRMÉ` — chaque bloc était transcrit aveugle
+
+Contrairement au moteur en flux, où chaque passe reprend la fenêtre depuis son
+début, un bloc de la préparation n'avait **aucun contexte** : Whisper attaquait 15 s
+de son sans rien savoir de la phrase en cours. On lui redonne les dernières
+secondes du bloc précédent, **en audio** ; il transcrit l'ensemble, et seuls les
+mots qui tombent après le contexte entrent au stock.
+
+Combien de contexte ? Mesuré, 9 situations (3 niveaux de musique × 3 points de
+coupe), 198 mots de référence :
+
+| contexte | fautes | WER | temps du bloc |
+|---|---|---|---|
+| 0 s | 63 | 31,8 % | 1517 ms |
+| 1 s | 58 | 29,3 % | +2 % |
+| 2 s | 54 | 27,3 % | +2 % |
+| **3 s** | **51** | **25,8 %** | **+4 %** |
+| 4 s | 51 | 25,8 % | +5 % |
+| 6 s | 54 | 27,3 % | +10 % |
+
+Un cinquième des fautes en moins pour 4 % de temps — le surcoût est faible parce que
+Whisper complète tout extrait à 30 s de toute façon. **Et ça ne monte pas
+indéfiniment** : à 6 s c'est déjà moins bon qu'à 3.
+
+Sur la chaîne complète (offscreen.js réel + vrai whisper, piste de 46 s, blocs de
+15 s), le gain est plus modeste parce qu'il n'y a que deux jointures : **27 → 24
+fautes**, 0 doublon, 0 instant qui recule, aucun mot perdu. C'est logique — le
+contexte soigne les *jointures*, et un bloc de 15 s en compte peu.
+
+⚠️ **Deux pièges, tous deux traités** :
+- `recollerMots` doit tourner sur **tout** l'extrait, contexte compris, *avant* le
+  filtrage. Un « mot » de Whisper n'est pas un mot ; filtrer d'abord laisserait un
+  début de mot orphelin au bord.
+- le filtre par l'heure laisse passer un mot du contexte qui commence dans la marge.
+  `prepOterDoublons` enlève les premiers mots neufs qui répètent la fin du stock —
+  trois au plus, pour ne pas avaler une vraie répétition de la parole.
+
+### 5 quater. Ce qui a été essayé et ÉCARTÉ (mesuré, pas supposé)
+
+- `num_beams` (recherche par faisceaux) : **le pipeline de transformers.js 4.2.0
+  l'ignore**. Texte rigoureusement identique à 3 et à 5 faisceaux, temps identique,
+  alors que `max_new_tokens` passe bien par le même chemin. Ce n'est pas « le beam
+  search n'aide pas » — c'est « cette option n'arrive pas au modèle ».
+- `no_repeat_ngram_size` mis à 0 : **aucune différence** sur 88 mots à quatre
+  niveaux de musique. Le garde-fou ne coûte pas de mots justes. On le garde.
+- **Normalisation du niveau** : aucun gain. Un son ramené à 8 % de son niveau donne
+  *moins* de fautes que le même son normalisé (20 contre 30 sur 88). Whisper
+  normalise déjà ce qu'il faut ; y toucher est au mieux inutile.
+- **Passer la préparation à x1** : l'aller-retour de rééchantillonnage à x2 ne coûte
+  aucun mot dans la mesure (il en fait même gagner, par effet passe-bas). Rien à
+  gagner à ralentir, donc `PREP_VITESSE = 2` reste.
+
+### 6 bis. `CONFIRMÉ` — l'attente à la fin n'est pas le dernier bloc, c'est la dette
+
+Journaux d'un run réel, temps par bloc de 15 s : **6,9 / 15,2 / 26,0 / 23,3 / 6,5 /
+puis ~6,5 s**. Trois blocs quatre fois plus lents, puis retour à la normale.
+
+À x2, la vidéo livre 15 s de contenu toutes les **7,5 s** d'horloge, et un bloc coûte
+~6,15 s. La marge est donc de **1,35 s par bloc**. Le retard accumulé :
+
+| bloc | coût | budget | dette cumulée |
+|---|---|---|---|
+| 1 | 6,9 s | 7,5 s | −0,6 s |
+| 2 | 15,2 s | 7,5 s | **+7,1 s** |
+| 3 | 26,0 s | 7,5 s | **+25,6 s** |
+| 4 | 23,3 s | 7,5 s | **+41,4 s** |
+| 5 à 10 | 6,5 s | 7,5 s | 35,4 s |
+
+**41 s de dette, remboursée à 1 s par bloc : il faut 41 blocs, soit 10 minutes de
+vidéo, pour revenir à zéro.** Sur toute vidéo plus courte que ça, la dette est encore
+là à la fin — et se paie d'un coup, en ~30 s d'attente. C'est bien **un seul
+problème**, pas deux : régler les blocs lents règle l'attente finale.
+
+⚠️ **Et la vraie leçon est ailleurs** : une marge de 1,35 s sur 7,5 s ne pardonne
+aucun incident. Le système n'avait aucune capacité de récupération. C'est ça qu'on
+corrige, pas seulement l'incident.
+
+**Le levier : la taille du bloc.** Whisper complète tout extrait à 30 s, donc
+l'*encodeur* coûte pareil pour 10 s ou 27 s de contenu. Un bloc deux fois plus gros,
+c'est deux fois moins d'encodeurs par minute de vidéo. Mesuré (whisper-tiny fp32,
+piste de 115 s, contexte de 3 s inclus, deux passages alternés) :
+
+| bloc | débit | rapport à 15 s | reporté sur Chrome (2,44x à 15 s) | marge par bloc |
+|---|---|---|---|---|
+| 10 s | 6,77x | 0,75 | ~1,83x | négative |
+| 15 s | 9,00x | 1,00 | 2,44x | 1,35 s |
+| **20 s** | **10,80x** | **1,20** | **~2,93x** | **~3,2 s** |
+| 25 s | 12,46x | 1,38 | ~3,38x | ~5,1 s |
+| 27 s | 14,92x | 1,66 | ~4,05x | ~7,4 s |
+
+`PREP_BLOC_CONTENU` passe donc de 15 à **20 s** : 20 % de débit en plus, et un retard
+rattrapé **2,4 fois plus vite** (41 s effacés en 13 blocs au lieu de 41).
+
+⚠️ **Pourquoi pas 27 s, qui serait encore mieux** : les 30 s sont un **mur**. Ce qu'on
+envoie vaut au pire `PREP_BLOC_CONTENU + PREP_RESERVE_FIN + PREP_CONTEXTE` = 20 + 5 + 3
+= **28 s**. À 25 s de bloc on serait à 33 s, et Whisper couperait les 3 dernières
+secondes **sans rien dire**.
+
+**La cause des blocs lents eux-mêmes reste ouverte** :
+- `PROBABLE` — la page était occupée (rechargement de tampon, changement de qualité).
+  Ce qui va dans ce sens : un bloc **entièrement muet** a été signalé dans la même
+  zone, et une vidéo qui cale ne produit plus de son alors que la capture continue.
+- `ÉCARTÉ` — la longueur du texte : 54 mots en 26 s contre 35 mots en 6,6 s, ça ne
+  suit pas.
+
+D'où l'instrumentation : chaque bloc journalise désormais `reech` (le
+rééchantillonnage), `video +X s` (de combien la vidéo a **réellement** avancé pendant
+ce bloc), `file` (ce qui attend derrière) et `retard` (la dette du tableau ci-dessus,
+en direct). **Si `video +X s` est nettement inférieur à la durée du bloc, c'est le
+lecteur qui a calé, pas Whisper.** Et à l'arrêt, deux lignes disent en clair si
+l'attente finale vient de la dette ou du seul dernier bloc.
+
+### 6 ter. `CONFIRMÉ` — on peut souffler le vocabulaire de la page à Whisper
+
+Whisper accepte un « contexte précédent » : des jetons introduits par
+`<|startofprev|>`, placés avant `<|startoftranscript|>`. Le modèle devient beaucoup
+plus enclin à écrire les mots qu'il y a vus — c'est ce qui répare les noms propres
+(« Emmanuel Macron », « Algérie ») que whisper-tiny écorche.
+
+⚠️ **transformers.js 4.2.0 ne l'implémente pas sous son nom officiel.** Le champ
+`prompt_ids` existe dans `WhisperGenerationConfig`, il est même documenté — et
+`_retrieve_init_tokens` ne le lit **jamais**. Le passer ne fait rien, exactement comme
+`num_beams`. Ce qui marche : **`decoder_input_ids`**, que `generate` prend à la place
+des jetons de départ qu'il aurait construits. On construit donc la séquence à la main.
+
+Mesure (extrait JFK + musique, 5 niveaux, 110 mots de référence) :
+
+| | fautes |
+|---|---|
+| sans amorce | 39 |
+| amorce « titre de la vidéo » | **16** |
+| amorce **hors sujet** (recettes de cuisine) | **20** |
+
+⚠️ **Lire la troisième ligne.** Une amorce qui parle de cuisine répare presque autant
+qu'une amorce juste. L'essentiel du gain ne vient donc **pas** du vocabulaire : il
+vient du fait qu'il y ait une amorce du tout, qui change le régime de décodage. Le
+vocabulaire vaut les 4 fautes entre 20 et 16 — le quart du gain. C'est réel, et il ne
+faut pas raconter l'inverse.
+
+**D'où vient la liste, et pourquoi c'est 100 % local** : `content.js` relève le titre,
+le nom de la chaîne et les noms propres de la description — du texte **déjà affiché
+dans l'onglet**. Aucune requête, aucune API. Liens, hashtags et chapitrage sont
+retirés ; 300 caractères au plus, recoupés à 100 jetons par le worker.
+
+⚠️ **LE PRIX, MESURÉ AUSSI, ET IL EST LOURD** : sur du son **sans parole**, l'amorce
+multiplie les mots inventés par **dix** :
+
+| condition | sans amorce | avec amorce |
+|---|---|---|
+| silence 3 s | 1 mot | **26 mots** |
+| silence 15 s | 1 mot | **29 mots** |
+| musique 0,2 / 10 s | 1 | 1 |
+| musique 0,4 / 10 s | 2 | 1 |
+| musique 0,6 / 15 s | 2 | **18 mots** |
+| **total** | **7** | **75** |
+
+Et la forme est toujours la même : une **boucle** (« The United States, the United
+States, the United… »). Le bloc muet est déjà écarté par `prepEstSilence` ; la boucle,
+elle, arrive sur de la musique forte, qui n'est pas du silence. D'où
+**`prepEstBoucle`** : un texte dont moins de **35 %** des mots sont distincts est jeté.
+Mesuré sur de vraies sorties — boucles à 0,22 / 0,25 / 0,26, vraies phrases à 0,64 /
+0,91 / 0,97. Le seuil est à mi-chemin, loin des deux.
+
+⚠️ **C'est le seul endroit du fichier où du texte est jeté**, et c'est une exception
+assumée à la règle « aucun filtre anti-hallucination » : on ne l'ajoute que parce
+qu'on vient d'ajouter la cause. Sans amorce, il ne se déclenche jamais.
+
+### 6 quater. `CONFIRMÉ` — l'amorce faisait RENONCER Whisper, et c'est ça qui revidait l'overlay
+
+⚠️ **LE CHIFFRE DE 39 → 16 FAUTES CI-DESSUS A ÉTÉ MESURÉ SUR LA MAUVAISE CONDITION,
+ET LA SUITE LE PROUVE.** Il portait sur des extraits de 11 s d'une seule phrase.
+Rejoué sur la vraie chaîne — piste de 115 s, blocs de 20 s, musique forte — l'amorce
+fait l'inverse :
+
+| musique 0,45 | mots | fautes | trous > 3 s | pire trou | écran vide |
+|---|---|---|---|---|---|
+| sans amorce | 228 | 45 | **0** | 0 s | 0 s |
+| avec amorce | 190 | 63 | **3** | **9,4 s** | **11,0 s** |
+
+Et le journal dit pourquoi : *« bloc 4 INCOMPLET — dernier mot à 10,5 s sur 19,9 s
+(53 % couvert) »*. Whisper ne part pas en boucle : **il renonce en plein bloc**. La
+seconde moitié n'a alors aucun mot — et comme un bloc fait 20 s, le trou dépasse
+largement les 3 s au bout desquelles `content.js` efface la boîte.
+
+**C'est exactement le symptôme rapporté : « l'overlay a redisparu à plusieurs
+reprises ».** Deux changements se sont additionnés : l'amorce a créé les trous, les
+blocs de 20 s les ont rendus deux fois plus visibles.
+
+⚠️ **Et cette leçon était DÉJÀ écrite dans ce fichier, pour q8** : « ne jamais valider
+une variante sur le seul chargement : toujours lire la sortie, et sur des fragments
+courts, pas seulement sur un extrait propre ». Il fallait la lire dans l'autre sens
+aussi — **un gain mesuré sur un extrait court ne dit rien de ce qui arrive sur un bloc
+long et difficile**. C'est la deuxième fois que ce piège se referme sur ce projet.
+
+**Le correctif — la passe de secours.** On ne renonce pas à l'amorce, on l'empêche de
+nuire : quand un bloc revient tronqué (couverture < `PREP_COUVERTURE_SECOURS` = 80 %)
+ou en boucle **alors qu'on avait mis une amorce**, on refait le même bloc **sans
+elle**, et on garde la meilleure des deux passes. L'amorce ne peut plus que gagner ;
+au pire elle coûte une inférence de plus sur les blocs difficiles.
+
+| musique 0,45, après correctif | mots | fautes | trous > 3 s | écran vide | passes de secours |
+|---|---|---|---|---|---|
+| sans amorce | 228 | 45 | 0 | 0 s | — |
+| avec amorce | **229** | **43** | **0** | **0 s** | 2 blocs sur 6 |
+
+L'amorce redevient un gain net (43 contre 45) au lieu d'un désastre (63), et il n'y a
+plus un seul trou.
+
+**La mesure du symptôme, désormais journalisée à chaque fin de préparation** :
+
+```
+🕳️ Preparation : N trou(s) de plus de 3 s dans le stock, le pire X s,
+   Y s d'ecran vide au total. (secours N, boucles N, tronques N)
+```
+
+C'est le seul chiffre qui dit si « l'overlay disparaît » est réglé, et il ne dépend
+d'aucune théorie sur la cause. **Si `secours` est élevé, l'amorce gêne plus qu'elle
+n'aide sur cette vidéo-là** — c'est le signal pour la couper.
+
+### 7. Ce qui reste ouvert sur la fin de vidéo
+
+- `HYPOTHÈSE` — **le silence capté après la pause du lecteur étire le dernier bloc.**
+  `prepSurFin` met la vidéo en pause, puis l'offscreen enregistre encore ~0,3 s
+  (aller-retour du message + les 250 ms d'attente du worklet). Ce silence entre dans
+  le dernier bloc, mais `prepPositionDe` l'extrapole comme si la vidéo avait avancé
+  pendant ce temps — donc `echelle` peut monter à ~1,1 sur un bloc de 5 s, soit
+  jusqu'à 0,5 s de retard sur les tout derniers mots. Non mesuré. Ce qui le
+  trancherait : comparer l'instant du dernier mot du stock à sa position réelle dans
+  la vidéo.
+- `PREP_MARGE_FIN = 0,35` s de content.js : les 0,35 dernières secondes de la vidéo
+  ne sont jamais captées. Voulu, mais c'est bien du son jamais transcrit.
+
 ⚠️ Si l'écran continue de se vider souvent après tout ça, **ce n'est plus l'affichage** :
 c'est qu'il reste des trous dans le stock. `PREPARATION_BLOCS` rend `ecranVideS` — le temps
 total sans aucun sous-titre — et c'est cette mesure-là qu'il faut regarder, pas l'écran.
@@ -572,6 +906,29 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
   Voir la section dédiée plus haut. ⚠️ Validé **au banc Node/vm uniquement** — la coupure au
   silence et le plafond de jetons demandent une vérification sur du son réel dans Chrome
   (couverture par bloc, `ecranVideS`).
+- ✅ **Moins de fautes, sans changer de modèle** : les deux canaux de l'onglet au lieu
+  d'un seul (jusqu'à 5,6 dB de rapport signal/bruit gagnés, 57 → 33 fautes sur le banc)
+  et 3 s de contexte audio avant chaque bloc (−19 % de fautes en isolé, 27 → 24 sur la
+  chaîne complète, +4 % de temps). Quatre autres pistes mesurées et écartées. Voir les
+  points 5 bis à 5 quater. ⚠️ **À vérifier dans Chrome** : la console de l'offscreen doit
+  annoncer `🎚️ l'onglet arrive en 2 canal(aux)` — si elle dit 1, le premier correctif
+  n'apporte rien sur cette page.
+- ✅ **Fin de vidéo — les fautes de la dernière minute** : le dernier bloc ne peut plus
+  être court (`PREP_RESERVE_FIN`), et un bloc sans le moindre son n'est plus envoyé à
+  Whisper. Mesuré sur le vrai whisper-tiny (sous 1,5 s il invente ; sur du silence il
+  écrit « you ») et au banc sur 401 durées de vidéo. Voir les points 5 et 6 de la
+  section « préparer d'abord ». ⚠️ **Pas encore vérifié dans Chrome sur une vraie
+  vidéo** : le journal de l'offscreen doit montrer un dernier bloc ≥ 5 s.
+- ✅ **Blocs de 20 s + instrumentation du retard** : la préparation récupère 2,4 fois
+  plus vite après un incident, et chaque bloc dit en clair si c'est le lecteur ou
+  Whisper qui a traîné. Voir le point 6 bis.
+- ✅ **Vocabulaire de la page soufflé à Whisper** (`decoder_input_ids`, pas
+  `prompt_ids` qui est mort dans transformers.js), **avec sa passe de secours** : sans
+  elle, l'amorce faisait renoncer Whisper en plein bloc et revidait l'overlay (3 trous,
+  9,4 s le pire). Avec, 0 trou et un gain net. Voir les points 6 ter et 6 quater.
+  ⚠️ **Une seule chose à regarder dans Chrome** : la ligne `🕳️` de fin de préparation.
+- ⬜ **La cause des blocs 4x plus lents** : instrumentée, pas encore élucidée. Le
+  prochain run tranche avec `video +X s` et `reech`.
 - ⬜ **Étape 3 — retard du son à zéro par défaut** : garder les lèvres synchrones et
   laisser le texte suivre à ~2-3 s, comme les sous-titres du direct à la télé. L'option
   « Auto » reste pour qui préfère l'inverse.

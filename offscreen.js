@@ -1804,18 +1804,123 @@ const PREP_VITESSE = 2;
 // ferait passer la preparation de 2,44x a 4,20x le temps reel, soit de « ca
 // passe sans marge » a « c'est fini bien avant la video ».
 //
-// On ne le fait PAS dans la meme fournee : un bloc plus long est aussi un trou
-// plus grand quand Whisper renonce sur ce bloc-la, et c'est justement ce qu'on
-// est en train de corriger. A mesurer separement, sur du son reel : couverture
-// et nombre de mots par seconde a 15 s contre 30 s.
-const PREP_BLOC_CONTENU = 15;
+// ⚠️ MISE A JOUR DU 2026-08-28 (2) : ON PASSE A 20 s, ET C'EST UNE QUESTION DE
+// SURVIE, PAS DE CONFORT.
+//
+// LE PROBLEME CONSTATE. Journaux d'un run reel : trois blocs consecutifs quatre
+// fois plus lents que les autres (15,1 s / 26,0 s / 23,3 s au lieu de ~6,5 s),
+// puis retour a la normale. A 15 s de contenu, la video a x2 livre un bloc
+// toutes les 7,5 s d'horloge et un bloc coute ~6,15 s : la marge est de 1,35 s
+// par bloc. Un incident de 40 s de retard demande donc TRENTE blocs pour etre
+// rattrape -- c'est-a-dire jamais, a l'echelle d'une video. Le retard ne se
+// resorbe pas, il attend la fin et se paie d'un coup.
+//
+// POURQUOI UN BLOC PLUS GROS VA PLUS VITE. Whisper complete tout extrait a 30 s
+// avant de le traiter : l'ENCODEUR coute donc exactement pareil pour 10 s ou
+// pour 27 s de contenu. Doubler la taille du bloc, c'est payer deux fois moins
+// d'encodeurs par minute de video.
+//
+// Mesure du 2026-08-28, vrai whisper-tiny fp32 sous Node, piste de 115 s,
+// contexte de 3 s inclus, deux passages alternes. On lit les RAPPORTS, pas les
+// millisecondes (le CPU de Node n'est pas le WASM de Chrome) :
+//
+//   bloc    debit      rapport a 15 s
+//   10 s     6,77x         0,75
+//   15 s     9,00x         1,00   (ce qu'on faisait)
+//   20 s    10,80x         1,20
+//   25 s    12,46x         1,38
+//   27 s    14,92x         1,66
+//
+// Reporte sur la mesure Chrome de 2,44x a 15 s, 20 s donne ~2,93x. La marge par
+// bloc passe de 1,35 s a ~3,2 s, soit un retard rattrape 2,4 fois plus vite, et
+// 20 % de debit en plus sur toute la video.
+//
+// ⚠️ POURQUOI PAS 27 s, QUI SERAIT ENCORE MEILLEUR : la borne des 30 s est un
+// MUR, pas une preference. Ce qu'on envoie vaut au pire
+//     PREP_BLOC_CONTENU + PREP_RESERVE_FIN + PREP_CONTEXTE
+// soit 20 + 5 + 3 = 28 s. A 25 s de bloc on serait a 33 s, et Whisper couperait
+// les 3 dernieres secondes SANS RIEN DIRE.
+const PREP_BLOC_CONTENU = 20;
 
 // Ce que Whisper attend.
 const PREP_TAUX = 16000;
 
-// En dessous de ca, un reste de fin n'est pas transcrit : sur moins d'une
-// seconde whisper-tiny n'ecoute plus, il recite (voir CLAUDE.md).
+// ---------------------------------------------------------------------------
+// LA FIN DE LA VIDEO : un reste court est un reste FAUX
+// ---------------------------------------------------------------------------
+//
+// ⚠️ C'EST LA CAUSE DES FAUTES EN FIN DE VIDEO, ET ELLE EST MESUREE.
+//
+// A l'arret, la pompe transcrivait TOUT ce qui restait, aussi court que ce
+// soit -- le plancher etait a 1 s de contenu. Or un bloc de la preparation n'a
+// AUCUN contexte : contrairement au moteur en flux, il n'y a pas de
+// recouvrement, chaque bloc est transcrit une fois, seul. Sur un extrait d'une
+// seconde, whisper-tiny n'a plus rien pour s'appuyer : il n'ecoute plus, il
+// recite.
+//
+// Mesure du 2026-08-28, vrai whisper-tiny fp32 sous Node, meme extrait (JFK),
+// on ne garde que la FIN et on la transcrit seule :
+//
+//   reste    texte rendu                              verdict
+//   0,5 s    « You »                                  invente
+//   1,0 s    « God, free. »                           invente (vrai : « your country. »)
+//   1,5 s    « for your country. »                    juste
+//   2,0 s    « can do for your country. »             juste
+//   3,0 s    « Ask what you can do for your country. » juste
+//
+// La bascule est nette et elle est basse : en dessous de ~1,5 s le modele
+// fabrique une phrase credible qui n'a aucun rapport avec le son. Et c'est
+// exactement le symptome decrit -- des fautes qui n'apparaissent QUE quand la
+// video approche de sa fin, parce que le reste de fin est le SEUL bloc dont la
+// duree n'est pas choisie : c'est ce qui tombe.
+//
+// (Le meme phenomene etait deja note dans content.js, vu dans Chrome le
+// 2026-08-27 : « Whisper part en repetition EN FIN DE PISTE et entasse 14 mots
+// en 940 ms ». La fusion de blocs qui y repond soigne la lisibilite, pas le
+// texte.)
+//
+// LE CORRECTIF : on ne laisse plus la fin decider de la taille du dernier bloc.
+// La pompe garde en reserve PREP_RESERVE_FIN secondes de contenu et ne coupe un
+// bloc plein que s'il en reste au moins autant derriere lui. Le dernier bloc
+// fait donc toujours entre PREP_RESERVE_FIN et PREP_BLOC_CONTENU +
+// PREP_RESERVE_FIN secondes -- jamais 1 s.
+//
+// 5 s et pas 2 : la bascule mesuree est a ~1,5 s sur de l'anglais propre, et on
+// veut de la marge pour du francais bruite (1,55 jeton par mot, et une fin de
+// video est souvent musique + generique). 5 s coute une attente de 5 s de
+// contenu dans la file -- soit 2,5 s d'horloge a x2 -- et rien d'autre : la
+// preparation tourne plus vite que la video, elle a le temps.
+//
+// Le bloc de fin peut donc atteindre 20 s de contenu. C'est sans danger :
+// Whisper complete tout extrait a 30 s de toute facon, et le plafond de jetons
+// suit la duree (PREP_JETONS_PAR_S).
+const PREP_RESERVE_FIN = 5.0;
+
+// En dessous de ca, un reste de fin n'est pas transcrit du tout : il n'y a plus
+// aucune chance d'en tirer autre chose qu'une invention.
 const PREP_RESTE_MIN_CONTENU = 1.0;
+
+// ---------------------------------------------------------------------------
+// Un bloc SANS LE MOINDRE SON n'est pas envoye a Whisper
+// ---------------------------------------------------------------------------
+//
+// Mesure du meme jour, toujours whisper-tiny fp32 : sur du silence numerique
+// pur, quelle qu'en soit la duree (1 s, 3 s, 10 s), le modele ecrit « you ».
+// Il ecrit toujours quelque chose -- c'est un decodeur, il ne sait pas se taire.
+// En francais, c'est la phrase de generique (« Sous-titres realises par… ») qui
+// sort. Une video qui se termine par un fondu au silence recolte donc un mot
+// invente, pose pile a la fin.
+//
+// Ce n'est PAS le filtre anti-hallucination que ce fichier s'interdit plus bas :
+// on ne juge pas le texte rendu, on constate qu'il n'y a rien a transcrire AVANT
+// de demander. Aucun mot ne peut etre perdu par ce test -- s'il n'y a pas de
+// son, il n'y a pas de mot.
+//
+// Les seuils sont volontairement absurdes de severite : -80 dBFS en moyenne ET
+// -50 dBFS en crete. De la parole tres basse est 100 fois au-dessus. Une video
+// en pause rend exactement 0.
+const PREP_SILENCE_RMS = 1e-4;
+const PREP_SILENCE_CRETE = 3e-3;
 
 // ---------------------------------------------------------------------------
 // Combien de jetons Whisper a le droit d'ecrire pour UN bloc
@@ -1867,6 +1972,106 @@ const PREP_JETONS_PAR_S = 12;
 const PREP_RECUL_COUPE = 1.5;   // secondes de CONTENU
 const PREP_TRAME_COUPE = 0.02;  // 20 ms : la resolution de la recherche
 
+// ---------------------------------------------------------------------------
+// Chaque bloc entend la fin du precedent
+// ---------------------------------------------------------------------------
+//
+// ⚠️ LE DEFAUT DE FOND DU DECOUPAGE EN BLOCS : chaque bloc etait transcrit
+// AVEUGLE. Whisper attaquait 15 s de son sans rien savoir de ce qui precede --
+// ni la phrase en cours, ni la voix, ni le sujet. C'est exactement l'inverse du
+// moteur en flux, ou chaque passe reprend la fenetre depuis son debut.
+//
+// On lui redonne donc les dernieres secondes du bloc precedent, en AUDIO. Il
+// transcrit l'ensemble, et on ne garde que les mots qui tombent apres le
+// contexte -- ceux d'avant sont deja au stock.
+//
+// Mesure du 2026-08-28, vrai whisper-tiny fp32, 9 situations (3 niveaux de
+// musique x 3 points de coupe), 198 mots de reference :
+//
+//   contexte   fautes   WER      temps du bloc
+//    0 s        63     31,8 %     1517 ms   (ce qu'on faisait)
+//    1 s        58     29,3 %     1541 ms   +2 %
+//    2 s        54     27,3 %     1553 ms   +2 %
+//    3 s        51     25,8 %     1583 ms   +4 %   <- retenu
+//    4 s        51     25,8 %     1589 ms   +5 %
+//    6 s        54     27,3 %     1661 ms   +10 %
+//
+// Un cinquieme des fautes en moins pour 4 % de temps. Le surcout est faible
+// parce que Whisper complete tout extrait a 30 s de toute facon : les 3 s en
+// plus ne coutent que les quelques mots supplementaires a decoder.
+//
+// Et ca ne remonte pas indefiniment : a 6 s c'est deja moins bon qu'a 3. Un
+// contexte trop long dilue le bloc dans un extrait ou Whisper a le droit de
+// s'arreter avant d'y arriver.
+//
+// ⚠️ La borne des 30 s reste respectee : le plus gros bloc possible fait
+// PREP_BLOC_CONTENU + PREP_RESERVE_FIN = 20 s, plus 3 s de contexte = 23 s.
+const PREP_CONTEXTE = 3.0;
+
+// Un mot ne tombe jamais pile sur la frontiere. La marge dit de quel cote on
+// range celui qui commence juste avant la fin du contexte ; ce qui passe quand
+// meme est rattrape par prepOterDoublons.
+const PREP_CONTEXTE_MARGE = 0.2;
+
+// ---------------------------------------------------------------------------
+// Le vocabulaire souffle a Whisper, et le filet qui va avec
+// ---------------------------------------------------------------------------
+//
+// content.js releve le titre et la description de la page et les envoie ici ;
+// on les passe au worker, qui en fait une amorce (voir construireAmorce dans
+// whisper.worker.js). Tout est local : c'est du texte deja affiche dans
+// l'onglet, rien ne sort de la machine.
+//
+// ⚠️ CE QUE CA COUTE, MESURE : sur du son SANS PAROLE, l'amorce multiplie les
+// mots inventes par dix (7 -> 75 sur cinq extraits de silence et de musique
+// seule), et la forme que ca prend est toujours la meme -- une BOUCLE (« The
+// United States, the United States, the United… »). Le bloc muet est deja
+// ecarte par prepEstSilence ; la boucle, elle, arrive sur de la musique forte,
+// qui n'est pas du silence. D'ou le filet ci-dessous.
+//
+// La mesure : un texte en boucle a tres peu de mots DISTINCTS. Sur les sorties
+// mesurees, une boucle tourne autour de 0,20 a 0,25 de mots distincts, une
+// vraie phrase autour de 0,60. Le seuil est pose a 0,35, a mi-chemin et loin
+// des deux.
+//
+// ⚠️ Ce filtre-la juge le texte rendu -- c'est exactement ce que prepTraiterBloc
+// s'interdit plus bas, et ce n'est PAS une contradiction : on ne l'ajoute que
+// parce qu'on vient d'ajouter la cause. Sans amorce, il ne se declenche jamais.
+const PREP_DIVERSITE_MIN = 0.35;
+
+// En dessous, un texte est trop court pour qu'un taux de repetition veuille
+// dire quoi que ce soit.
+const PREP_BOUCLE_MOTS_MIN = 10;
+
+// ---------------------------------------------------------------------------
+// LA PASSE DE SECOURS — l'amorce ne doit JAMAIS pouvoir creuser un trou
+// ---------------------------------------------------------------------------
+//
+// ⚠️ CE QUI S'EST PASSE, ET C'EST MESURE. L'amorce avait ete jugee sur des
+// extraits de 11 s d'une seule phrase : 39 fautes -> 16. Rejouee sur la vraie
+// chaine -- piste de 115 s, blocs de 20 s, musique forte -- elle fait
+// exactement l'inverse :
+//
+//   musique 0,45   sans amorce : 228 mots, 45 fautes, AUCUN trou
+//                  avec amorce : 190 mots, 63 fautes, 3 trous, le pire de 9,4 s
+//
+// Et le journal dit pourquoi : « bloc 4 INCOMPLET — dernier mot a 10,5 s sur
+// 19,9 s (53 % couvert) ». Whisper ne part pas en boucle, il RENONCE en plein
+// bloc. La seconde moitie du bloc n'a alors aucun mot, et comme un bloc fait
+// 20 s, le trou depasse largement les 3 s au bout desquelles content.js efface
+// la boite. C'est ca, l'overlay qui disparait.
+//
+// ⚠️ LA LECON, ET ELLE ETAIT DEJA ECRITE DANS CE FICHIER pour q8 : une variante
+// jugee sur un extrait court et propre peut se degrader en production. Un gain
+// mesure sur 11 s ne dit rien de ce qui arrive sur 20 s de son difficile.
+//
+// LE CORRECTIF n'est pas de renoncer a l'amorce -- elle repare bien les noms
+// propres -- mais de ne jamais la laisser faire de degat : quand un bloc revient
+// tronque ou en boucle ALORS QU'ON AVAIT MIS UNE AMORCE, on refait le meme bloc
+// SANS elle et on garde la meilleure des deux passes. L'amorce ne peut plus que
+// gagner ; au pire elle coute une inference de plus sur les blocs difficiles.
+const PREP_COUVERTURE_SECOURS = 0.8;
+
 let prepActif = false;
 let prepContext = null;
 let prepStream = null;
@@ -1916,6 +2121,13 @@ let prepAncres = [];  // [{ echantillons, position }], les deux croissants
 // au-dela on garde une ancre sur deux, ce qui double simplement le pas.
 const PREP_ANCRES_MAX = 8000;
 
+// Le vocabulaire de la page (titre + description), tel que content.js l'a releve.
+let prepAmorce = "";
+
+// La fin du bloc precedent, gardee pour la donner en contexte au suivant.
+// Au taux de la CAPTURE, comme prepBlocs.
+let prepContexteAudio = new Float32Array(0);
+
 // Le son capte, en attente de decoupage. Au taux de la CAPTURE (48 kHz), pas
 // encore ramene a la vitesse normale.
 let prepBlocs = [];
@@ -1936,6 +2148,72 @@ let prepTemoins = [];
 // Combien de blocs ont probablement ete coupes par le quota de jetons.
 let prepBlocsTronques = 0;
 
+// Le NUMERO du bloc dans le journal. Distinct de prepTemoins.length : celui-ci
+// ne compte que les blocs transcrits, donc un bloc muet ou en boucle donnait son
+// numero au suivant -- deux lignes du journal parlaient du meme numero sans
+// parler du meme bloc.
+let prepBlocsVus = 0;
+
+// Combien de blocs sont partis en boucle de repetition (et ont donc ete jetes).
+let prepBlocsEnBoucle = 0;
+
+// Combien de blocs ont du etre refaits sans l'amorce. C'est le prix de l'amorce,
+// en clair : s'il monte, c'est qu'elle gene plus qu'elle n'aide sur cette video.
+let prepBlocsSecours = 0;
+
+// La memoire WebAssembly du worker Parakeet, telle qu'il la mesure lui-meme.
+// ⚠️ `performance.memory` ne compte QUE le tas JavaScript : les poids du modele
+// vivent dans la memoire lineaire du WASM, qui n'y figure pas. C'est le worker
+// qui garde une reference sur son objet WebAssembly.Memory et nous renvoie sa
+// taille reelle (voir parakeet.worker.js).
+let prepMemoireWasmMo = null;
+
+// Combien de fois chaque garde-fou anti-hallucination s'est declenche. Ils sont
+// GARDES pour l'instant, mais on veut savoir s'ils servent encore avec un
+// transducteur : chaque declenchement est journalise avec son texte, et le
+// total est rappele a la fin de la preparation.
+let prepBlocsSilencieux = 0;
+
+// Les blocs perdus pour de bon : une exception dans la pompe. C'est ce compteur
+// qui repond a « combien de blocs abandonnes ? » -- la ligne rouge dans la
+// console est facile a rater, un nombre dans le resume ne l'est pas.
+let prepBlocsAbandonnes = 0;
+
+// ⚠️ CHAQUE DECLENCHEMENT D'UN GARDE-FOU, AVEC SON TEXTE.
+//
+// Les garde-fous sont gardes pour l'instant, mais il faut pouvoir juger s'ils
+// servent encore avec un transducteur -- et pour ca il faut VOIR ce qu'ils ont
+// jete, pas seulement combien de fois. Le journal de l'offscreen le dit deja,
+// mais ce document n'est pas une cible DevTools dans une session pilotee (voir
+// CLAUDE.md, « les trois consoles ») : sans cette liste, le texte jete serait
+// invisible pour qui ne peut pas ouvrir cette console-la.
+let prepGardeFous = [];
+
+// ⚠️ LA PROMESSE DE CHARGEMENT DU MODELE, ET POURQUOI ELLE EXISTE.
+//
+// Sans elle, un modele qui ne charge pas donnait ceci (mesure du 2026-08-30,
+// contre-preuve du volet A : dossier de modele renomme) : la preparation
+// demarrait, la barre de progression montait normalement de 0 a 2 min 48 s, et
+// la video se terminait sur « ✅ Prêt — 0 mots préparés ». Une coche VERTE sur
+// un echec total. C'est exactement la panne que CLAUDE.md decrit : « une barre
+// de progression n'est pas une preuve de travail ».
+//
+// La raison etait mecanique : `prepStatut` ecrit dans l'overlay, mais
+// content.js ignore un statut tant que la progression tourne (« Un statut ne
+// doit jamais recouvrir la progression »). Le message d'erreur etait donc
+// produit, envoye... et jete.
+//
+// Le seul chemin qui aboutit vraiment a un « ❌ » a l'ecran est celui de
+// l'ECHEC AU DEMARRAGE : `demarrerPreparation` rejette -> background.js
+// l'attrape -> il envoie PREPARATION_RESTAURER avec `erreur` -> content.js
+// affiche « ❌ ... » et remet le lecteur en place. On attend donc le `ready`
+// AVANT de rendre la main.
+let prepChargement = null;
+
+// L'horloge de la seance : Date.now() au tout premier bloc traite. Sert a dire,
+// a chaque bloc, de combien la transcription est en retard sur le defilement.
+let prepDepartHorloge = 0;
+
 function prepStatut(texte) {
   console.log("💬 Preparation :", texte);
   chrome.runtime.sendMessage({ type: "PREPARATION_STATUT", texte }).catch(() => {});
@@ -1948,10 +2226,21 @@ function prepReinitialiser() {
   prepMots = [];
   prepTemoins = [];
   prepBlocsTronques = 0;
+  prepBlocsEnBoucle = 0;
+  prepBlocsSecours = 0;
+  prepBlocsSilencieux = 0;
+  prepBlocsAbandonnes = 0;
+  prepGardeFous = [];
+  prepChargement = null;
+  prepMemoireWasmMo = null;
+  prepBlocsVus = 0;
+  prepDepartHorloge = 0;
   prepArretDemande = false;
   prepDepartConfirme = false;
   prepPositionDepart = 0;
   prepAncres = [];
+  prepContexteAudio = new Float32Array(0);
+  prepAmorce = "";
   prepAttentes.clear();
 }
 
@@ -2040,33 +2329,65 @@ function prepSecondesContenu(echantillons) {
 // Le worker Whisper de la preparation (le sien, pas celui du direct)
 // ---------------------------------------------------------------------------
 
-function prepDemarrerWhisper(memo) {
-  if (prepWorker) return;
-  console.log("⏳ Preparation : chargement du modele...");
-  prepWorker = new Worker(chrome.runtime.getURL("whisper.worker.js"), { type: "module" });
+// ---------------------------------------------------------------------------
+// LE MOTEUR DE LA PREPARATION : Parakeet, dans SON worker
+// ---------------------------------------------------------------------------
+//
+// ⚠️ UN SEUL MODELE VIVANT A LA FOIS -- CONTRAINTE DE MEMOIRE, PAS DE STYLE.
+// Le worker Parakeet occupe 1 335 Mo de memoire WebAssembly (mesure a l'etape 3
+// -- et `performance.memory` ne compte PAS cette memoire-la). La machine
+// plafonne a ~2 100 Mo. Les deux modeles charges ensemble ne tiennent pas.
+//
+// D'ou deux terminaisons, et il faut les DEUX :
+//   - ici, on termine le worker Whisper du mode direct avant de charger
+//     Parakeet. Le direct ne se termine jamais tout seul : il garde son worker
+//     pour la capture suivante (`if (whisperWorker) return;`). Sans ce menage,
+//     les deux modeles cohabiteraient.
+//   - a la fin de la preparation, on termine celui-ci (voir arreterPreparation).
+//
+// ⚠️ AUCUN REPLI VERS WHISPER, NULLE PART. Si Parakeet ne charge pas, la
+// preparation echoue et le DIT. Un repli silencieux rendrait faux tout ce qu'on
+// mesure ensuite : on croirait juger Parakeet en lisant du whisper-tiny.
+function prepDemarrerParakeet() {
+  if (prepWorker) return prepChargement;
+
+  if (whisperWorker) {
+    console.log(
+      "🧹 Preparation : on termine le worker Whisper du mode direct avant de " +
+        "charger Parakeet (un seul modele vivant a la fois)."
+    );
+    whisperWorker.terminate();
+    whisperWorker = null;
+    whisperPret = false;
+  }
+
+  console.log("⏳ Preparation : chargement de Parakeet dans son worker...");
+  prepStatut("⏳ Chargement du modèle de transcription…");
+
+  prepWorker = new Worker(chrome.runtime.getURL("parakeet.worker.js"), { type: "module" });
+
+  let charge;
+  let echoue;
+  prepChargement = new Promise((resolve, reject) => { charge = resolve; echoue = reject; });
 
   prepWorker.onmessage = (evenement) => {
     const m = evenement.data;
     switch (m.type) {
       case "ready":
         prepWorkerPret = true;
-        console.log(`✅ Preparation : Whisper pret sur ${m.backend}`);
-        // Meme chemin que le direct : c'est le service worker qui range le
-        // verdict, l'offscreen n'a pas acces a chrome.storage.
-        chrome.runtime
-          .sendMessage({ type: "WHISPER_BACKEND", backend: m.backend, signature: m.signature })
-          .catch(() => {});
+        prepMemoireWasmMo = m.memoireWasmMo ?? null;
+        console.log(
+          `✅ Preparation : Parakeet pret en ${(m.msChargement / 1000).toFixed(1)} s ` +
+            `(ONNX Runtime ${m.versionOrt || "?"}, bundle ${m.bundle}, ${m.fils} fil(s), ` +
+            `memoire WASM ${prepMemoireWasmMo === null ? "non mesuree" : prepMemoireWasmMo + " Mo"})`
+        );
+        charge();
         prepLancerPompe();
-        break;
-      case "progress":
-        prepStatut(`⬇️ Téléchargement du modèle : ${Math.round(m.pourcent)} %`);
-        break;
-      case "info":
-        console.log("ℹ️  Preparation :", m.message);
         break;
       case "result": {
         const a = prepAttentes.get(m.id);
         prepAttentes.delete(m.id);
+        if (m.memoireWasmMo != null) prepMemoireWasmMo = m.memoireWasmMo;
         if (a) a.resolve(m);
         break;
       }
@@ -2074,40 +2395,99 @@ function prepDemarrerWhisper(memo) {
         const cle = m.id == null ? "init" : m.id;
         const a = prepAttentes.get(cle);
         prepAttentes.delete(cle);
-        if (a) a.reject(new Error(m.message));
-        else console.error("❌ Preparation, Whisper :", m.message);
+        // ⚠️ Un echec de chargement n'a pas d'`id` : personne ne l'attend, et il
+        // passerait donc inapercu. On le fait remonter a l'ecran.
+        if (a) {
+          a.reject(new Error(m.message));
+        } else {
+          console.error("❌ Preparation, Parakeet :", m.message);
+          prepStatut("❌ Transcription impossible : " + m.message);
+          echoue(new Error("Parakeet n'a pas pu charger : " + m.message));
+        }
         break;
       }
+      default:
+        console.log("ℹ️ Preparation, Parakeet :", JSON.stringify(m).slice(0, 200));
     }
   };
 
+  // ⚠️ Une erreur de CHARGEMENT du worker (CSP, import introuvable, dossier de
+  // modele absent) n'arrive pas dans onmessage : elle arrive ici. Sans ce
+  // gestionnaire, la preparation attendrait un `ready` qui ne viendrait jamais,
+  // barre de progression comprise.
   prepWorker.onerror = (evenement) => {
-    const err = new Error(evenement.message || "erreur inconnue dans le worker");
+    const err = new Error(evenement.message || "erreur inconnue dans le worker Parakeet");
     for (const a of prepAttentes.values()) a.reject(err);
     prepAttentes.clear();
-    console.error("❌ Preparation, worker :", err.message);
+    console.error("❌ Preparation, worker Parakeet :", err.message);
+    prepStatut("❌ Transcription impossible : " + err.message);
+    echoue(new Error("Parakeet n'a pas pu charger : " + err.message));
   };
 
-  prepWorker.postMessage({ type: "init", memo: memo ?? null });
+  // `chrome.runtime` existe dans un document offscreen (c'est `chrome.storage`
+  // qui n'y est pas). Le worker, lui, est un worker DEDIE : `chrome.*` n'y
+  // existe pas du tout. C'est donc ici qu'on construit les URL des modeles.
+  prepWorker.postMessage({
+    type: "init",
+    urls: {
+      encodeur: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/encoder-model.int8.onnx"),
+      decodeur: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/decoder_joint-model.int8.onnx"),
+      vocab: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/vocab.txt"),
+      preproc: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/nemo128.onnx"),
+      config: chrome.runtime.getURL("models/parakeet-tdt-0.6b-v3/config.json"),
+    },
+  });
+
+  return prepChargement;
 }
 
-function prepTranscrire(audio, dureeContenu) {
+// Termine le worker de la preparation et libere ses 1,3 Go. Appele a la fin de
+// chaque preparation : sans ca, le modele resterait charge pendant toute la
+// lecture, et le mode direct n'aurait plus la place de charger le sien.
+function prepTerminerWorker() {
+  if (!prepWorker) return;
+  console.log(
+    `🧹 Preparation : on termine le worker Parakeet ` +
+      `(memoire WASM au moment de l'arret : ${prepMemoireWasmMo === null ? "non mesuree" : prepMemoireWasmMo + " Mo"}).`
+  );
+  prepWorker.terminate();
+  prepWorker = null;
+  prepWorkerPret = false;
+  for (const a of prepAttentes.values()) a.reject(new Error("worker termine"));
+  prepAttentes.clear();
+}
+
+// Une inference. Rien d'autre a passer que le son.
+//
+// ⚠️ CE QUI A DISPARU ICI, ET POURQUOI :
+//   - `maxJetons` (PREP_JETONS_PAR_S) : `max_new_tokens` est un reglage de
+//     Whisper, qui ecrit jeton par jeton jusqu'a un quota. Parakeet est un
+//     TRANSDUCTEUR : il emet au rythme des trames audio, il n'a pas de quota a
+//     atteindre ni a depasser. Le plafond coupait la fin des blocs (« bloc
+//     INCOMPLET — dernier mot a 15,5 s sur 18,6 s ») ; il n'a plus d'objet.
+//   - `amorce` (decoder_input_ids) : mecanisme propre a Whisper, qui accepte un
+//     « contexte precedent » avant ses jetons de depart. Parakeet n'a pas
+//     d'equivalent. Le vocabulaire de la page continue d'arriver dans
+//     `prepAmorce` (content.js l'envoie, on ne touche pas a content.js) : il
+//     n'est simplement plus utilise, et `demarrerPreparation` le journalise.
+//
+// ⚠️ LE TAMPON EST TRANSFERE, DONC LE MEME AUDIO NE PEUT PARTIR QU'UNE FOIS.
+// C'est ce qui produisait « bloc abandonne — An ArrayBuffer is detached and
+// could not be cloned » : l'ancienne passe de secours renvoyait le MEME
+// Float32Array apres l'avoir deja transfere. Il n'y a plus qu'une passe, donc
+// plus de second envoi -- et si un jour il y en avait un, le garde-fou
+// ci-dessous le dit clairement au lieu de laisser passer un message cryptique.
+function prepTranscrire(audio) {
+  if (!audio.byteLength) {
+    throw new Error(
+      "tampon audio deja transfere (detache) — un bloc ne peut partir qu'une fois vers le worker"
+    );
+  }
   const id = prepProchainId++;
   const promesse = new Promise((resolve, reject) => {
     prepAttentes.set(id, { resolve, reject });
   });
-  // Le plafond de jetons est dimensionne SUR LE BLOC, pas herite du direct.
-  // Voir PREP_JETONS_PAR_S : 60 jetons coupent le francais au bout de 13 s.
-  prepWorker.postMessage(
-    {
-      type: "transcribe",
-      id,
-      audio,
-      langue: prepLangue,
-      maxJetons: Math.ceil((dureeContenu || PREP_BLOC_CONTENU) * PREP_JETONS_PAR_S),
-    },
-    [audio.buffer]
-  );
+  prepWorker.postMessage({ type: "transcribe", id, audio, taux: PREP_TAUX }, [audio.buffer]);
   return promesse;
 }
 
@@ -2236,37 +2616,111 @@ function prepTailleJusquAuSilence(taille) {
 // saute pendant ce bloc-la. On ne la suit alors que dans une fourchette etroite :
 // au-dela, l'incident n'est pas une lente derive mais un trou franc, et etirer
 // les mots dessus les mettrait tous au mauvais endroit plutot qu'un seul.
-function prepMotsDuBloc(morceaux, posDebut, posFin, dureeBloc) {
+// `dureeContexte` : les premieres secondes de l'extrait envoye ne sont PAS ce
+// bloc-ci, c'est la fin du precedent (voir PREP_CONTEXTE). Les mots qui y
+// tombent sont deja au stock, on les jette.
+// Les mots d'un bloc, ramenes a la position REELLE dans la video.
+//
+// ⚠️ `recollerMots` A DISPARU D'ICI, ET C'EST VOULU. Un « mot » de Whisper n'en
+// est pas un (« J'adore, » arrivait en « J » puis « 'adore, ») : il fallait les
+// recoller en se servant de l'espace qui precede. Parakeet, lui, assemble ses
+// mots lui-meme a partir du marqueur SentencePiece `▁`, et le worker les rend
+// deja entiers, avec un debut, une fin et une confiance. Recoller une deuxieme
+// fois ne ferait que casser ce qui est juste.
+//
+// Le reste du traitement ne change PAS : filtre du contexte, bornage dans le
+// bloc, instants croissants, mise a l'echelle sur les positions video observees
+// (prepAncres). La sortie garde exactement la meme forme, { mot, instant }.
+function prepMotsDuBloc(mots, posDebut, posFin, dureeBloc, dureeContexte = 0) {
   let echelle = dureeBloc > 0 ? (posFin - posDebut) / dureeBloc : 1;
   if (!Number.isFinite(echelle) || echelle < 0.8 || echelle > 1.25) echelle = 1;
 
-  // recollerMots() est la fonction du moteur en flux, reutilisee telle quelle :
-  // un « mot » de Whisper n'est pas un mot typographique (« J'adore, » arrive
-  // en deux morceaux, « J » puis « 'adore, »), et c'est l'espace qui precede
-  // qui distingue les deux cas.
-  const recolles = recollerMots(morceaux || []);
   const sortie = [];
   let precedent = 0;
+  let horloge = 0; // l'heure dans le repere « contexte + bloc »
 
-  for (const recolle of recolles) {
-    let t = recolle.debut;
-    if (t == null || !Number.isFinite(t)) t = precedent;
+  for (const mot of mots || []) {
+    const texte = String(mot.text || "").trim();
+    if (!texte) continue;
 
-    // ⚠️ Whisper complete tout extrait a 30 s : sur un bloc plus court, ou en
-    // fin de video, l'alignement place parfois des mots DANS le silence de
-    // remplissage -- mesure a +7,4 s au-dela de la fin. Un mot date apres la
-    // fin du bloc serait attribue au bloc suivant et desynchroniserait tout.
-    if (t < 0) t = 0;
-    if (t > dureeBloc) t = dureeBloc;
-    if (t < precedent) t = precedent; // jamais en arriere
-    precedent = t;
+    let t = mot.start_time;
+    if (t == null || !Number.isFinite(t)) t = horloge;
+    if (t < horloge) t = horloge; // jamais en arriere
+    horloge = t;
+
+    // Ce mot appartient au contexte audio : le bloc precedent l'a deja verse au
+    // stock.
+    if (t < dureeContexte - PREP_CONTEXTE_MARGE) continue;
+
+    let u = t - dureeContexte;
+    if (u < 0) u = 0;
+    if (u > dureeBloc) u = dureeBloc;
+    if (u < precedent) u = precedent;
+    precedent = u;
 
     sortie.push({
-      mot: recolle.mot,
-      instant: Number((posDebut + t * echelle).toFixed(3)),
+      mot: texte,
+      instant: Number((posDebut + u * echelle).toFixed(3)),
     });
   }
   return sortie;
+}
+
+// Le filet du filtre par l'heure : un mot du contexte qui commence dans la marge
+// passe quand meme. On enleve donc les premiers mots neufs qui repetent, dans
+// l'ordre, la fin de ce qui est deja au stock.
+//
+// Trois mots au plus : au-dela, une vraie repetition de la parole (« oui, oui,
+// oui ») serait avalee -- et le bloc precedent a ete coupe dans un silence,
+// donc un chevauchement long n'a pas lieu d'etre.
+function prepOterDoublons(neufs) {
+  if (!neufs.length || !prepMots.length) return neufs;
+  const norme = (m) => normaliserTexte(String(m || "")).trim();
+  const maximum = Math.min(3, neufs.length, prepMots.length);
+  for (let k = maximum; k >= 1; k--) {
+    let pareil = true;
+    for (let i = 0; i < k; i++) {
+      const a = norme(prepMots[prepMots.length - k + i].mot);
+      const b = norme(neufs[i].mot);
+      // Deux morceaux sans lettre ni chiffre ne « se ressemblent » pas : ils
+      // sont juste vides tous les deux.
+      if (!a || a !== b) { pareil = false; break; }
+    }
+    if (pareil) return neufs.slice(k);
+  }
+  return neufs;
+}
+
+// Vrai si le texte rendu est une boucle de repetition plutot qu'une phrase.
+// Voir PREP_DIVERSITE_MIN : c'est le prix de l'amorce, et le seul cas ou on
+// jette du texte.
+function prepEstBoucle(mots) {
+  if (mots.length < PREP_BOUCLE_MOTS_MIN) return false;
+  const formes = [];
+  for (const m of mots) {
+    const forme = normaliserTexte(String(m.mot || "")).trim();
+    if (forme) formes.push(forme);
+  }
+  if (formes.length < PREP_BOUCLE_MOTS_MIN) return false;
+  const distincts = new Set(formes).size;
+  return distincts / formes.length < PREP_DIVERSITE_MIN;
+}
+
+// Vrai si le bloc ne contient aucun son audible. Deux mesures et pas une : une
+// moyenne (RMS) seule serait trompee par un long silence contenant un unique
+// craquement, une crete seule par un souffle continu tres bas.
+function prepEstSilence(brut) {
+  if (!brut.length) return true;
+  let somme = 0;
+  let crete = 0;
+  for (let i = 0; i < brut.length; i++) {
+    const v = brut[i];
+    somme += v * v;
+    const a = v < 0 ? -v : v;
+    if (a > crete) crete = a;
+  }
+  const rms = Math.sqrt(somme / brut.length);
+  return rms < PREP_SILENCE_RMS && crete < PREP_SILENCE_CRETE;
 }
 
 async function prepTraiterBloc(taille) {
@@ -2276,10 +2730,16 @@ async function prepTraiterBloc(taille) {
 
   // Un bloc PLEIN se coupe au silence le plus proche ; un reste de fin part tel
   // quel (il n'y a plus rien apres lui pour reprendre ce qu'on laisserait).
-  const complet = taille === prepEchantillonsParBloc();
+  //
+  // ⚠️ « il reste quelque chose derriere » fait partie de la definition : a
+  // l'arret, le dernier bloc peut faire exactement la taille d'un bloc plein.
+  // Le couper au silence rendrait alors a la file un morceau de moins d'une
+  // seconde -- soit exactement le reste court qu'on vient d'interdire.
+  const complet = taille === prepEchantillonsParBloc() && prepEnAttente > taille;
   const brut = prepPrendre(complet ? prepTailleJusquAuSilence(taille) : taille);
   if (!brut.length) return;
 
+  prepBlocsVus++;
   prepConsommes += brut.length;
   const dureeBloc = prepSecondesContenu(brut.length);
 
@@ -2289,49 +2749,157 @@ async function prepTraiterBloc(taille) {
   const posDebut = prepPositionDe(debutEchantillons);
   const posFin = prepPositionDe(debutEchantillons + brut.length);
 
-  const audio = await prepReechantillonner(brut);
+  // ⚠️ RIEN A ECOUTER = RIEN A DEMANDER. Voir PREP_SILENCE_RMS : sur du silence
+  // Whisper ecrit quand meme un mot, et ce mot atterrit pile a la fin de la
+  // video. On avance quand meme prepConsommes : la zone reste couverte, elle ne
+  // porte simplement aucun mot -- ce que prepResume sait deja representer.
+  // On garde la fin de CE bloc pour le suivant. Avant tout `await` : entre deux
+  // reprises, prepTraiterBloc peut avoir ete rappelee.
+  const contexte = prepContexteAudio;
+  const dureeContexte = prepSecondesContenu(contexte.length);
+  const aGarder = Math.round((PREP_CONTEXTE * prepTauxCapture) / PREP_VITESSE);
+  prepContexteAudio =
+    brut.length > aGarder ? brut.slice(brut.length - aGarder) : brut.slice();
 
+  // ⚠️ GARDE-FOU 1 sur 2 : LE SILENCE (prepEstSilence). Ce n'est pas un filtre
+  // anti-hallucination au sens strict -- on ne juge pas le texte rendu, on
+  // constate qu'il n'y a rien a transcrire AVANT de demander. Aucun mot ne peut
+  // etre perdu : s'il n'y a pas de son, il n'y a pas de mot. On le garde, et on
+  // le compte, pour savoir s'il sert encore.
+  if (prepEstSilence(brut)) {
+    prepBlocsSilencieux++;
+    prepGardeFous.push({
+      garde: "silence",
+      bloc: prepBlocsVus,
+      position: Number(posDebut.toFixed(1)),
+      dureeS: Number(dureeBloc.toFixed(1)),
+      texte: null, // rien n'a ete demande au modele : il n'y a pas de texte
+    });
+    console.log(
+      `🔇 GARDE-FOU « silence » : bloc ${prepBlocsVus} sans le moindre son ` +
+        `(${dureeBloc.toFixed(1)} s a partir de ${posDebut.toFixed(1)} s) — non transcrit, ` +
+        `aucun texte concerne (rien n'a ete demande au modele)`
+    );
+    return;
+  }
+
+  // Le contexte devant, le bloc derriere. Whisper transcrit les deux ; seuls
+  // les mots qui tombent apres le contexte entrent au stock.
+  let ensemble = brut;
+  if (contexte.length) {
+    ensemble = new Float32Array(contexte.length + brut.length);
+    ensemble.set(contexte, 0);
+    ensemble.set(brut, contexte.length);
+  }
+
+  const debutReech = performance.now();
+  const audio = await prepReechantillonner(ensemble);
+  const msReech = Math.round(performance.now() - debutReech);
+
+  if (!prepDepartHorloge) prepDepartHorloge = Date.now();
+
+  // Une seule passe. La passe de SECOURS a disparu avec l'amorce : elle
+  // existait pour refaire un bloc « sans vocabulaire » quand l'amorce faisait
+  // renoncer Whisper en plein bloc. Sans amorce, il n'y a rien a refaire -- et
+  // c'est aussi ce qui supprime le second envoi du meme tampon, donc l'erreur
+  // « ArrayBuffer is detached ».
   const debut = performance.now();
-  const resultat = await prepTranscrire(audio, dureeBloc);
+  const resultat = await prepTranscrire(audio);
   const ms = Math.round(performance.now() - debut);
+
+  const nouveaux = prepOterDoublons(
+    prepMotsDuBloc(resultat.words, posDebut, posFin, dureeBloc, dureeContexte)
+  );
+  const dernierMot = nouveaux.length ? nouveaux[nouveaux.length - 1].instant - posDebut : 0;
+  const couvert = dureeBloc > 0 ? dernierMot / dureeBloc : 1;
+  const enBoucle = prepEstBoucle(nouveaux);
+
   prepTemoins.push(ms);
 
-  const nouveaux = prepMotsDuBloc(resultat.mots, posDebut, posFin, dureeBloc);
+  // ⚠️ GARDE-FOU 2 sur 2 : LE RADOTAGE (prepEstBoucle). C'est le seul endroit
+  // de ce fichier ou du texte est jete.
+  //
+  // Il avait ete ajoute parce qu'on venait d'ajouter sa cause : l'amorce faisait
+  // partir whisper-tiny en boucle sur du son sans parole (7 mots inventes sans
+  // amorce, 75 avec). L'amorce n'existe plus sur ce chemin, et Parakeet est un
+  // transducteur -- il n'a pas de raison de radoter. On le GARDE quand meme
+  // pour le moment, et on journalise chaque declenchement AVEC LE TEXTE, pour
+  // savoir s'il sert encore. Voir le compte final dans arreterPreparation.
+  if (enBoucle) {
+    prepBlocsEnBoucle++;
+    prepGardeFous.push({
+      garde: "radotage",
+      bloc: prepBlocsVus,
+      position: Number(posDebut.toFixed(1)),
+      dureeS: Number(dureeBloc.toFixed(1)),
+      texte: nouveaux.map((m) => m.mot).join(" "),
+    });
+    console.warn(
+      `🔁 GARDE-FOU « radotage » : bloc ${prepBlocsVus} a ${posDebut.toFixed(1)} s — ` +
+        `${nouveaux.length} mots JETES.\n   texte jete : « ${nouveaux.map((m) => m.mot).join(" ")} »`
+    );
+    prepStatut(`⚠️ ${prepBlocsEnBoucle} bloc(s) écarté(s) : texte en boucle`);
+    return;
+  }
+
   prepMots.push(...nouveaux);
 
-  // ⚠️ DETECTEUR DE TRONCATURE — pour qu'une perte de texte ne soit JAMAIS muette.
+  // ⚠️ DETECTEUR DE TRONCATURE — GARDE EXPRES, MEME S'IL NE DEVRAIT PLUS RIEN
+  // TROUVER.
   //
-  // `max_new_tokens` coupe la sortie de Whisper sans rien signaler : le bloc
-  // rend un texte parfaitement credible, simplement plus court que l'audio.
-  // Rien dans le resultat ne dit « j'ai ete coupe ». Le seul indice est que le
-  // dernier mot date d'AVANT la fin du bloc alors qu'on parlait encore.
+  // Il servait a rendre visible une coupure par `max_new_tokens` : le bloc
+  // rendait un texte credible, simplement plus court que l'audio, et rien dans
+  // le resultat ne disait « j'ai ete coupe ». Ce plafond n'existe plus sur ce
+  // chemin.
   //
-  // Un bloc qui se termine par du silence declenche le meme signal, d'ou la
-  // condition sur le nombre de morceaux : peu de mots = vrai silence, beaucoup
-  // de mots = quota atteint.
-  const morceaux = Array.isArray(resultat.mots) ? resultat.mots.length : 0;
-  const dernier = nouveaux.length ? nouveaux[nouveaux.length - 1].instant - posDebut : 0;
-  const couvert = dureeBloc > 0 ? dernier / dureeBloc : 1;
-  // ⚠️ Le seuil de morceaux a BAISSE (30 -> 12) le 2026-08-28. Il valait 30
-  // parce que le plafond de jetons etait a 60 : sous 30 morceaux, un bloc court
-  // ne pouvait etre que du silence. Le plafond suit maintenant la duree du bloc,
-  // donc un bloc de 15 s qui ne rend que 12 mots n'est plus un bloc coupe par le
-  // quota : c'est un bloc ou Whisper a renonce. C'est ca qu'on veut voir.
+  // On ne retire pas le detecteur pour autant : le supprimer rendrait « zero
+  // bloc incomplet » vrai par construction, donc sans valeur. En le gardant, le
+  // zero est une MESURE. La mention du plafond de jetons, elle, disparait du
+  // message : elle n'aurait plus de sens.
+  const morceaux = nouveaux.length;
+  const dernier = dernierMot;
   if (couvert < 0.9 && morceaux >= 12) {
     console.warn(
-      `⚠️ Preparation : bloc ${prepTemoins.length} INCOMPLET — ` +
-        `${morceaux} morceaux, dernier mot a ${dernier.toFixed(1)} s sur ${dureeBloc.toFixed(1)} s ` +
-        `(${Math.round(couvert * 100)} % couvert, plafond ${Math.ceil(dureeBloc * PREP_JETONS_PAR_S)} jetons)`
+      `⚠️ Preparation : bloc ${prepBlocsVus} INCOMPLET — ` +
+        `${morceaux} mots, dernier mot a ${dernier.toFixed(1)} s sur ${dureeBloc.toFixed(1)} s ` +
+        `(${Math.round(couvert * 100)} % couvert)`
     );
     prepBlocsTronques++;
+    prepGardeFous.push({
+      garde: "troncature",
+      bloc: prepBlocsVus,
+      position: Number(posDebut.toFixed(1)),
+      dureeS: Number(dureeBloc.toFixed(1)),
+      couvert: Number(couvert.toFixed(2)),
+      // Rien n'est jete ici : on signale, on garde le texte.
+      texte: nouveaux.map((m) => m.mot).join(" "),
+    });
     prepStatut(`⚠️ Texte incomplet sur ${prepBlocsTronques} bloc(s)`);
   }
 
+  // ⚠️ CE JOURNAL EST UN INSTRUMENT DE MESURE, PAS UNE DECORATION. Il porte de
+  // quoi trancher, sans rien deviner, les deux questions qui se posent quand la
+  // preparation traine :
+  //   « video » : de combien la video a REELLEMENT avance pendant ce bloc. Si
+  //       c'est nettement moins que la duree de contenu, le lecteur a cale --
+  //       et c'est le lecteur qu'il faut regarder, pas Whisper.
+  //   « file »  : ce qui attend derriere. C'est ca qui se paiera a la fin.
+  //   « retard »: l'ecart entre le temps d'horloge ecoule et le temps qu'aurait
+  //       pris la video a x2. Il monte quand un bloc est lent et redescend
+  //       quand ils sont normaux. S'il ne redescend jamais, la marge est trop
+  //       mince -- c'est ce qui a fait passer les blocs de 15 s a 20 s.
+  const avanceVideo = posFin - posDebut;
+  const fileS = prepSecondesContenu(prepEnAttente);
+  const retard =
+    (Date.now() - prepDepartHorloge) / 1000 - prepSecondesContenu(prepConsommes) / PREP_VITESSE;
   console.log(
-    `📦 Preparation : bloc ${prepTemoins.length} — ` +
-      `${dureeBloc.toFixed(1)} s de contenu a partir de ${posDebut.toFixed(1)} s (video), ` +
+    `📦 Preparation : bloc ${prepBlocsVus} — ` +
+      `${dureeBloc.toFixed(1)} s de contenu a partir de ${posDebut.toFixed(1)} s (video) ` +
+      `+ ${dureeContexte.toFixed(1)} s de contexte, ` +
       `${nouveaux.length} mots, ${ms} ms ` +
-      `(${(dureeBloc / (ms / 1000)).toFixed(2)}x le temps reel)`
+      `(${(dureeBloc / (ms / 1000)).toFixed(2)}x le temps reel) ` +
+      `| reech ${msReech} ms | video +${avanceVideo.toFixed(1)} s ` +
+      `| file ${fileS.toFixed(1)} s | retard ${retard >= 0 ? "+" : ""}${retard.toFixed(1)} s`
   );
 
   // Aucun filtre anti-hallucination ici, et c'est deliberé : un filtre qui
@@ -2343,12 +2911,26 @@ async function prepTraiterBloc(taille) {
 function prepPeutTraiter() {
   if (!prepWorkerPret) return 0;
   const besoin = prepEchantillonsParBloc();
-  if (prepEnAttente >= besoin) return besoin;
-  // A l'arret, on transcrit le reste meme s'il est incomplet.
-  if (prepArretDemande) {
-    const minimum = Math.round((PREP_RESTE_MIN_CONTENU * prepTauxCapture) / PREP_VITESSE);
-    if (prepEnAttente >= minimum) return prepEnAttente;
+  const reserve = Math.round((PREP_RESERVE_FIN * prepTauxCapture) / PREP_VITESSE);
+
+  // ⚠️ TANT QUE LA VIDEO DEFILE : on ne coupe un bloc plein que s'il reste de
+  // quoi faire un reste DECENT derriere lui. C'est tout le correctif : sans
+  // cette reserve, la video peut s'arreter juste apres une coupure et le
+  // dernier bloc ne fait alors qu'une poignee de dixiemes de seconde -- une
+  // duree sur laquelle whisper-tiny invente (voir PREP_RESERVE_FIN).
+  if (!prepArretDemande) {
+    return prepEnAttente >= besoin + reserve ? besoin : 0;
   }
+
+  // A L'ARRET : on vide, mais toujours en blocs assez longs.
+  //   - il reste plus d'un bloc + la reserve  -> un bloc plein, il restera au
+  //     moins la reserve derriere ;
+  //   - il reste moins que ca                 -> TOUT part d'un coup, quitte a
+  //     faire un bloc de 20 s de contenu. C'est sans danger (Whisper complete
+  //     a 30 s) et c'est ce qui garantit qu'aucun reste court n'existe.
+  const minimum = Math.round((PREP_RESTE_MIN_CONTENU * prepTauxCapture) / PREP_VITESSE);
+  if (prepEnAttente > besoin + reserve) return besoin;
+  if (prepEnAttente >= minimum) return prepEnAttente;
   return 0;
 }
 
@@ -2382,6 +2964,7 @@ function prepLancerPompe() {
         await prepTraiterBloc(taille);
       }
     } catch (err) {
+      prepBlocsAbandonnes++;
       console.error("❌ Preparation : bloc abandonne —", err && err.message ? err.message : err);
       prepStatut("⚠️ Un bloc n'a pas pu être transcrit : " + (err && err.message ? err.message : err));
     } finally {
@@ -2428,10 +3011,25 @@ async function demarrerPreparation(options) {
   prepReinitialiser();
   prepLangue = options.langue || "french";
 
-  // Whisper d'abord : le modele met du temps a charger (jusqu'a une minute au
-  // tout premier lancement), autant qu'il commence pendant qu'on branche
-  // l'audio. Rien ne sera transcrit avant `ready` de toute facon.
-  prepDemarrerWhisper(options.memoBackend);
+  // Le modele d'abord : il met du temps a charger, autant qu'il commence
+  // pendant qu'on branche l'audio. Rien ne sera transcrit avant `ready` de
+  // toute facon.
+  //
+  // ⚠️ `options.memoBackend` n'est plus utilise : c'etait le verdict GPU/CPU
+  // memorise pour Whisper. Parakeet tourne sur le CPU, sans mesure prealable.
+  prepDemarrerParakeet();
+
+  // Le vocabulaire de la page continue d'arriver (content.js l'envoie, et on ne
+  // touche pas a content.js), mais il n'est PLUS UTILISE sur ce chemin :
+  // l'amorce etait un mecanisme propre a Whisper (`decoder_input_ids`), et
+  // Parakeet n'a pas d'equivalent. On le dit, plutot que de laisser croire
+  // qu'il agit encore.
+  if (prepAmorce) {
+    console.log(
+      `📖 Preparation : vocabulaire de la page ignore (${prepAmorce.length} caracteres) — ` +
+        `l'amorce etait propre a Whisper, Parakeet n'en a pas.`
+    );
+  }
 
   prepStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -2468,6 +3066,18 @@ async function demarrerPreparation(options) {
 
   prepNoeud.port.onmessage = (evenement) => {
     const m = evenement.data;
+
+    // Combien de canaux l'onglet nous envoie reellement. En mono, la moyenne du
+    // worklet ne change rien ; en stereo, c'est elle qui recupere la voix
+    // centrale au lieu d'un seul cote (voir preparation.worklet.js).
+    if (m.type === "canaux") {
+      console.log(`🎚️ Preparation : l'onglet arrive en ${m.nombre} canal(aux)`);
+      chrome.runtime
+        .sendMessage({ type: "PREPARATION_STATUT", texte: `🎚️ ${m.nombre} canal(aux) captés` })
+        .catch(() => {});
+      return;
+    }
+
     if (m.type !== "audio") return;
 
     // Tant que la position de depart n'est pas connue, on JETTE : ce son-la est
@@ -2479,6 +3089,36 @@ async function demarrerPreparation(options) {
     prepEnAttente += m.bloc.length;
     prepLancerPompe();
   };
+
+  // ⚠️ ON ATTEND QUE LE MODELE SOIT LA AVANT DE RENDRE LA MAIN.
+  //
+  // Le chargement a demarre tout en haut de cette fonction, en parallele du
+  // branchement audio : on ne perd donc que ce qui depasse. Mais on ne rend
+  // « success » qu'une fois le modele pret -- sinon un echec de chargement
+  // devient une preparation qui tourne dans le vide avec une belle barre de
+  // progression (voir prepChargement).
+  //
+  // AUCUN REPLI VERS WHISPER ICI NI AILLEURS : si ca ne charge pas, ca echoue.
+  try {
+    await prepChargement;
+  } catch (err) {
+    console.error("❌ Preparation : abandon au demarrage —", err.message);
+    prepTerminerWorker();
+    try {
+      prepNoeud.port.postMessage("stop");
+      prepSource.disconnect();
+      prepNoeud.disconnect();
+    } catch (e) { /* deja debranche */ }
+    if (prepStream) {
+      prepStream.getTracks().forEach((piste) => { piste.stop(); piste.enabled = false; });
+      prepStream = null;
+    }
+    if (prepContext) { prepContext.close().catch(() => {}); prepContext = null; }
+    prepSource = null;
+    prepNoeud = null;
+    prepActif = false;
+    throw err; // -> background.js -> PREPARATION_RESTAURER { erreur } -> « ❌ » a l'ecran
+  }
 
   prepActif = true;
   console.log("✅ Preparation : capture silencieuse demarree");
@@ -2492,6 +3132,18 @@ async function arreterPreparation() {
 
   console.log("⏸️ Preparation : arret");
   prepArretDemande = true;
+
+  // ⚠️ CE QUI SUIT REPOND A UNE QUESTION PRECISE : « l'attente a la fin, c'est le
+  // dernier bloc qui est lent, ou c'est la file qui se vide ? » On releve donc
+  // l'heure exacte ou la video se termine et ce qui reste a traiter a cet
+  // instant, pour pouvoir comparer avec l'heure du dernier bloc.
+  const heureFinVideo = Date.now();
+  const fileALaFin = prepSecondesContenu(prepEnAttente);
+  const blocsAvant = prepTemoins.length;
+  console.log(
+    `🏁 Preparation : la video est finie. Il reste ${fileALaFin.toFixed(1)} s de contenu ` +
+      `en file (${blocsAvant} blocs deja traites).`
+  );
 
   // 1. Demander au worklet de rendre son tampon, puis debrancher la source :
   //    plus rien n'arrive apres ce point.
@@ -2525,7 +3177,10 @@ async function arreterPreparation() {
     console.error("❌ Preparation : fin de file en echec —", err);
   }
 
-  // 3. Fermer.
+  // 3. Fermer. LE WORKER D'ABORD : c'est lui qui tient les 1,3 Go. Tant qu'il
+  //    vit, le mode direct n'a pas la place de charger le sien.
+  prepTerminerWorker();
+
   if (prepContext) {
     prepContext.close().catch(() => {});
     prepContext = null;
@@ -2534,7 +3189,34 @@ async function arreterPreparation() {
   prepNoeud = null;
   prepActif = false;
 
+  const apres = Math.round((Date.now() - heureFinVideo) / 1000);
+  console.log(
+    `⏱️ Preparation : ${apres} s d'attente APRES la fin de la video, ` +
+      `pour ${prepTemoins.length - blocsAvant} bloc(s) restant(s) et ${fileALaFin.toFixed(1)} s de contenu. ` +
+      (fileALaFin > PREP_BLOC_CONTENU
+        ? "⚠️ La file avait pris du retard PENDANT la video — ce n'est pas le dernier bloc qui est lent."
+        : "La file etait a jour : l'attente est celle du dernier bloc, rien de plus.")
+  );
+
   const resume = prepResume();
+  console.log(
+    `🕳️ Preparation : ${resume.trous.nombre} trou(s) de plus de ${PREP_TROU_VISIBLE} s dans le stock, ` +
+      `le pire ${resume.trous.pire.toFixed(1)} s, ${resume.trous.videS.toFixed(1)} s d'ecran vide au total. ` +
+      `(boucles ${prepBlocsEnBoucle}, tronques ${prepBlocsTronques})`
+  );
+
+  // ⚠️ LE COMPTE DES GARDE-FOUS. Ils sont gardes pour l'instant ; ce sont ces
+  // trois chiffres qui diront s'ils servent encore maintenant que le moteur est
+  // un transducteur. Chaque declenchement a ete journalise plus haut AVEC le
+  // texte concerne.
+  console.log(
+    `🛡️ Preparation, garde-fous : silence ${prepBlocsSilencieux} bloc(s), ` +
+      `radotage ${prepBlocsEnBoucle} bloc(s) jete(s), ` +
+      `troncature ${prepBlocsTronques} bloc(s) signale(s) — sur ${prepBlocsVus} bloc(s) vus. ` +
+      (prepBlocsEnBoucle === 0 && prepBlocsTronques === 0
+        ? "Aucun filtre de texte n'a mordu."
+        : "⚠️ Au moins un filtre a mordu : lire les lignes 🔁 / ⚠️ ci-dessus.")
+  );
   console.log(
     `✅ Preparation terminee : ${resume.nbMots} mots, ` +
       `${resume.dureeCouverteS.toFixed(1)} s couvertes, ` +
@@ -2545,6 +3227,28 @@ async function arreterPreparation() {
 
 // Ce que le service worker et l'overlay ont besoin de savoir. Le stock lui-meme
 // (prepMots) RESTE ICI, en memoire : c'est l'etape B qui viendra le chercher.
+// ⚠️ LA MESURE DU SYMPTOME, ET PAS DE SON EXPLICATION. « L'overlay disparait »
+// se traduit ici par : un ecart de plus de BLOC_APRES_PAROLE secondes entre deux
+// mots consecutifs du stock. C'est le seul chiffre qui dit si le probleme est
+// regle, et il ne depend d'aucune theorie sur sa cause.
+const PREP_TROU_VISIBLE = 3.0; // = BLOC_APRES_PAROLE de content.js
+
+function prepTrousDuStock() {
+  if (!prepMots.length) return { nombre: 0, pire: 0, videS: 0 };
+  let nombre = 0, pire = 0, videS = 0;
+  let precedent = prepMots[0].instant;
+  for (let i = 1; i < prepMots.length; i++) {
+    const trou = prepMots[i].instant - precedent;
+    if (trou > PREP_TROU_VISIBLE) {
+      nombre++;
+      videS += trou - PREP_TROU_VISIBLE;
+      if (trou > pire) pire = trou;
+    }
+    precedent = prepMots[i].instant;
+  }
+  return { nombre, pire, videS };
+}
+
 function prepResume() {
   // La zone preparee se lit sur la video, pas sur le compteur d'echantillons :
   // c'est elle qui dit jusqu'ou l'affichage a le droit de promettre du texte.
@@ -2560,6 +3264,25 @@ function prepResume() {
     motsParSeconde: dureeCouverteS > 0 ? prepMots.length / dureeCouverteS : 0,
     nbBlocs: prepTemoins.length,
     blocsTronques: prepBlocsTronques,
+    blocsEnBoucle: prepBlocsEnBoucle,
+    blocsSecours: prepBlocsSecours,
+    // ⚠️ AJOUTE POUR POUVOIR MESURER SANS LA CONSOLE DE L'OFFSCREEN. Ce
+    // document n'est pas une cible DevTools dans une session pilotee (voir
+    // CLAUDE.md, « les trois consoles ») : sans ces champs, « zero bloc
+    // abandonne » ne serait qu'une affirmation.
+    blocsVus: prepBlocsVus,
+    blocsAbandonnes: prepBlocsAbandonnes,
+    blocsSilencieux: prepBlocsSilencieux,
+    memoireWasmMo: prepMemoireWasmMo,
+    workerVivant: prepWorker !== null,
+    // ⚠️ LA PREUVE QUE LES DEUX MODELES NE COHABITENT PAS. On lit ici l'etat
+    // du worker du mode direct -- sans toucher a son code : s'il etait encore
+    // vivant pendant qu'un modele Parakeet de 1,3 Go est charge, la contrainte
+    // de memoire serait violee, et ce champ le dirait.
+    whisperVivant: whisperWorker !== null,
+    gardeFous: prepGardeFous,
+    amorce: prepAmorce,
+    trous: prepTrousDuStock(),
     // Contre-preuve : si la capture ne recevait rien, cette liste serait vide.
     premiersMots: prepMots.slice(0, 30),
     // Temoin de seance : au-dela de 15 % de derive, la mesure est a jeter.
@@ -2610,6 +3333,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     prepNoterPosition(position);
     sendResponse({ success: true });
+    return;
+  }
+
+  // Le vocabulaire de la page. Arrive une fois, au demarrage du defilement,
+  // envoye par content.js (lui seul voit le DOM). Voir prepAmorce.
+  if (request.type === "PREPARATION_VOCABULAIRE") {
+    prepAmorce = String(request.texte || "").trim();
+    console.log(
+      prepAmorce
+        ? `📖 Preparation : vocabulaire recu (${prepAmorce.length} caracteres) — « ${prepAmorce.slice(0, 120)}… »`
+        : "📖 Preparation : aucun vocabulaire trouve sur cette page"
+    );
+    sendResponse({ success: true, longueur: prepAmorce.length });
     return;
   }
 

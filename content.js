@@ -869,6 +869,122 @@ function prepDecrireVideo() {
 // Piloter
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// LE VOCABULAIRE DE LA PAGE — souffler les noms propres a Whisper
+// ===========================================================================
+//
+// whisper-tiny ecorche les noms propres : il ne les a pas assez vus, et un nom
+// propre n'a par definition aucun voisin phonetique plausible dans son
+// vocabulaire courant. « Emmanuel Macron » et « Algerie » ressortent en
+// n'importe quoi.
+//
+// Or la page CONTIENT ces mots : ils sont dans le titre et dans la description,
+// deja affiches sous la video. On les releve et on les passe a Whisper comme
+// amorce (voir construireAmorce dans whisper.worker.js).
+//
+// ⚠️ TOUT RESTE LOCAL. On lit le DOM d'un onglet deja ouvert -- aucune requete,
+// aucune API, rien qui sorte de la machine. C'est la meme regle que pour le son.
+//
+// ⚠️ ET CE N'EST PAS DE LA MAGIE, la mesure le dit : une amorce HORS SUJET
+// repare presque autant qu'une amorce juste (20 fautes contre 16, sur 39 sans
+// amorce). L'essentiel du gain vient de l'existence d'une amorce ; le
+// vocabulaire vaut le quart. Les deux sont bons a prendre, mais il ne faut pas
+// attendre du titre qu'il fasse des miracles.
+
+// Ce qu'on envoie au bout du compte. Au-dela, l'amorce mange la fenetre du
+// decodeur pour rien (le worker recoupe de toute facon a 100 jetons).
+const PREP_VOCAB_CARACTERES = 300;
+const PREP_VOCAB_NOMS_MAX = 24;
+
+function prepNettoyerTexte(brut) {
+  return String(brut || "")
+    .replace(/https?:\/\/\S+/g, " ")     // liens
+    .replace(/[#@]\S+/g, " ")             // hashtags, mentions
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, " ") // chapitrage « 01:23 »
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Les suites de mots a majuscule : c'est ca, un nom propre, et c'est reperable
+// sans dictionnaire. On saute celles qui ouvrent une phrase quand elles sont
+// d'un seul mot -- « Aujourd'hui, » n'est pas un nom propre, il est juste en
+// debut de ligne.
+function prepNomsPropres(texte, maximum) {
+  const motif =
+    /\p{Lu}[\p{L}'’\-]+(?:\s+(?:d[eu']|des|de|du|la|le|les|van|von|el|al)?\s*\p{Lu}[\p{L}'’\-]+)*/gu;
+  const vus = new Set();
+  const sortie = [];
+  let trouve;
+  while ((trouve = motif.exec(texte)) !== null) {
+    const suite = trouve[0];
+    const avant = texte.slice(Math.max(0, trouve.index - 2), trouve.index);
+    const ouvreUnePhrase = trouve.index === 0 || /[.!?…]\s$/.test(avant);
+    if (ouvreUnePhrase && !suite.includes(" ")) continue;
+    const cle = suite.toLowerCase();
+    if (vus.has(cle)) continue;
+    vus.add(cle);
+    sortie.push(suite);
+    if (sortie.length >= maximum) break;
+  }
+  return sortie;
+}
+
+function prepTexteDe(selecteurs) {
+  for (const selecteur of selecteurs) {
+    const noeud = document.querySelector(selecteur);
+    if (!noeud) continue;
+    const texte = noeud.tagName === "META" ? noeud.getAttribute("content") : noeud.textContent;
+    if (texte && texte.trim().length > 2) return texte;
+  }
+  return "";
+}
+
+function prepReleverVocabulaire() {
+  // Le titre d'abord : c'est le plus fiable, et il est presque toujours court.
+  const titre = prepNettoyerTexte(
+    prepTexteDe([
+      "h1.ytd-watch-metadata yt-formatted-string",
+      "h1.ytd-watch-metadata",
+      "meta[property='og:title']",
+      "meta[name='title']",
+      "h1",
+    ]) || document.title.replace(/\s*[-–—|]\s*YouTube\s*$/i, "")
+  );
+
+  const chaine = prepNettoyerTexte(
+    prepTexteDe(["ytd-channel-name #text a", "ytd-channel-name #text", "meta[itemprop='author']"])
+  );
+
+  const description = prepNettoyerTexte(
+    prepTexteDe([
+      "#description-inline-expander",
+      "ytd-text-inline-expander #plain-snippet-text",
+      "#description",
+      "meta[property='og:description']",
+      "meta[name='description']",
+    ])
+  );
+
+  const morceaux = [];
+  if (titre) morceaux.push(titre);
+  if (chaine && !titre.toLowerCase().includes(chaine.toLowerCase())) morceaux.push(chaine);
+
+  const deja = morceaux.join(" ").toLowerCase();
+  for (const nom of prepNomsPropres(description, PREP_VOCAB_NOMS_MAX)) {
+    if (deja.includes(nom.toLowerCase())) continue;
+    morceaux.push(nom);
+  }
+
+  let texte = morceaux.join(", ").replace(/\s+/g, " ").trim();
+  if (texte.length > PREP_VOCAB_CARACTERES) {
+    // On coupe a la virgule, pas au milieu d'un nom.
+    texte = texte.slice(0, PREP_VOCAB_CARACTERES);
+    const virgule = texte.lastIndexOf(",");
+    if (virgule > 40) texte = texte.slice(0, virgule);
+  }
+  return texte;
+}
+
 async function prepPiloter(vitesse) {
   const v = prepTrouverVideo();
   if (!v) return prepDecrireVideo(); // renvoie le message d'erreur clair
@@ -938,6 +1054,22 @@ async function prepPiloter(vitesse) {
   v.addEventListener("ended", prepSurFin);
   prepTick = setInterval(prepBattre, PREP_PAS_TICK);
   prepBattre();
+
+  // Le vocabulaire de la page, envoye UNE fois. Si le relevé echoue, on
+  // continue sans : l'amorce est un bonus, jamais une condition.
+  try {
+    const vocabulaire = prepReleverVocabulaire();
+    console.log(
+      vocabulaire
+        ? `📖 Preparation : vocabulaire de la page — « ${vocabulaire} »`
+        : "📖 Preparation : aucun titre ni description exploitable sur cette page"
+    );
+    chrome.runtime
+      .sendMessage({ type: "PREPARATION_VOCABULAIRE", texte: vocabulaire })
+      .catch(() => {});
+  } catch (err) {
+    console.warn("Preparation : relevé du vocabulaire impossible —", err && err.message);
+  }
 
   console.log(`▶️ Preparation : defilement a x${prepVitesseCible} depuis ${v.currentTime.toFixed(2)} s`);
   // ⚠️ DEUX positions, et elles ne servent pas a la meme chose.

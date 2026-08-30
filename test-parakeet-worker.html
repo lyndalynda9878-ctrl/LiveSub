@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>LiveSub - test Parakeet dans un worker</title>
+
+  <!-- Pas de carte d'import, et ce n'est pas un oubli : voir le commentaire en
+       tete de test-parakeet.js. La forme EN LIGNE est refusee par la CSP du
+       projet ('script-src self', pas de 'unsafe-inline'), la forme EXTERNE est
+       silencieusement ignoree par ce Chrome. Le worker charge donc ONNX Runtime
+       par un chemin relatif.
+
+       ⚠️ Aucune URL de cette page ni du worker ne pointe vers internet. -->
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 900px;
+      margin: 40px auto;
+      padding: 0 20px;
+      color: #1f2937;
+    }
+    h1 { color: #4f46e5; font-size: 20px; }
+    h2 { font-size: 15px; color: #4f46e5; margin: 24px 0 8px; }
+    p.hint { color: #6b7280; font-size: 14px; }
+
+    #choix {
+      margin: 20px 0;
+      padding: 14px;
+      background: #eef2ff;
+      border: 1px solid #c7d2fe;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    #fichier { font-size: 14px; }
+
+    #log, #texte, #mots, #chiffres, #preuve, #journalWorker {
+      margin-top: 10px;
+      padding: 14px;
+      background: #f8f9fa;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    #texte { background: #fffbeb; border-color: #fde68a; font-size: 14px; }
+    #preuve { background: #ecfdf5; border-color: #a7f3d0; }
+    #journalWorker { background: #eef2ff; border-color: #c7d2fe; }
+
+    .ok { color: #0f9d63; }
+    .err { color: #dc2626; }
+    .attention { color: #b45309; }
+
+    /* Le battement du FIL PRINCIPAL. C'est la piece a conviction du critere 5 :
+       a l'etape 2, l'inference tournait dans la page et ce compteur se figeait
+       pendant toute la transcription. Ici le calcul est dans le worker : si le
+       compteur continue d'avancer regulierement, le fil principal est libre.
+       On ne se contente pas de le regarder tourner -- on MESURE l'ecart entre
+       deux battements, parce qu'une barre qui avance ne prouve que l'ecoulement
+       du temps (CLAUDE.md). */
+    #indicateur {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 16px;
+      padding: 12px 14px;
+      background: #eef2ff;
+      border: 1px solid #c7d2fe;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    #indicateur[hidden] { display: none; }
+    .spinner {
+      width: 16px; height: 16px;
+      border: 3px solid #c7d2fe;
+      border-top-color: #4f46e5;
+      border-radius: 50%;
+      animation: tourne 0.8s linear infinite;
+      flex: none;
+    }
+    @keyframes tourne { to { transform: rotate(360deg); } }
+    #compteur {
+      margin-left: auto;
+      font-family: Consolas, monospace;
+      color: #4f46e5;
+      font-variant-numeric: tabular-nums;
+    }
+  </style>
+</head>
+<body>
+  <h1>🦜 LiveSub — Parakeet dans un <em>Web Worker</em></h1>
+
+  <p class="hint">
+    Meme modele et meme audio qu'a l'etape 2, mais l'inference tourne dans un
+    <strong>worker separe</strong> (<code>parakeet.worker.js</code>), cree par
+    <code>chrome.runtime.getURL</code> — jamais depuis une URL <code>blob:</code>,
+    que la CSP de MV3 bloque. Le fil principal ne calcule rien et doit rester
+    repondant. <strong>Aucune requete ne part sur internet.</strong>
+  </p>
+
+  <div id="choix">
+    Fichier .wav a transcrire :
+    <input type="file" id="fichier" accept=".wav,audio/wav" disabled>
+  </div>
+
+  <div id="indicateur" hidden>
+    <div class="spinner"></div>
+    <span class="libelle">Travail en cours</span>
+    <span id="compteur">0.0 s</span>
+  </div>
+
+  <h2>Journal de la page</h2>
+  <div id="log">Creation du worker...</div>
+
+  <h2>Journal remonte par le worker (prefixe [PARAKEET-WORKER])</h2>
+  <div id="journalWorker">—</div>
+
+  <h2>Preuve que c'est le worker qui a calcule</h2>
+  <div id="preuve">—</div>
+
+  <h2>Texte transcrit</h2>
+  <div id="texte">—</div>
+
+  <h2>Les 20 premiers mots — [debut -&gt; fin] mot (confiance)</h2>
+  <div id="mots">—</div>
+
+  <h2>Chiffres</h2>
+  <div id="chiffres">—</div>
+
+  <script type="module" src="test-parakeet-worker.js"></script>
+</body>
+</html>

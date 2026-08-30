@@ -95,6 +95,99 @@ const NO_REPEAT_NGRAM = 6;
 // soit bien plus qu'aucun bloc legitime n'en produira.
 const PLAFOND_JETONS = 400;
 
+// ---------------------------------------------------------------------------
+// L'AMORCE : souffler du vocabulaire a Whisper avant qu'il ecrive
+// ---------------------------------------------------------------------------
+//
+// Whisper accepte un « contexte precedent » : une suite de jetons introduite par
+// <|startofprev|>, placee AVANT <|startoftranscript|>. Le modele s'en sert comme
+// d'un amorcage -- il devient beaucoup plus enclin a ecrire les mots qu'il y a
+// vus. C'est ce qui repare les noms propres (« Emmanuel Macron », « Algerie »)
+// que whisper-tiny ecorche.
+//
+// ⚠️ transformers.js 4.2.0 NE L'IMPLEMENTE PAS par son nom officiel. Le champ
+// `prompt_ids` existe dans WhisperGenerationConfig, il est meme documente -- et
+// `_retrieve_init_tokens` ne le lit JAMAIS. Verifie dans le bundle. Le passer ne
+// fait rien du tout, exactement comme `num_beams`.
+//
+// Ce qui marche : `decoder_input_ids`, que `generate` prend a la place des
+// jetons de depart qu'il aurait construits. On construit donc la sequence
+// complete a la main :
+//     <|startofprev|> …le vocabulaire… <|startoftranscript|> <|langue|> <|transcribe|>
+//
+// Mesure du 2026-08-28, vrai whisper-tiny fp32, extrait JFK + musique, 5 niveaux,
+// 110 mots de reference :
+//     sans amorce                39 fautes
+//     amorce « titre »           16 fautes
+//     amorce HORS SUJET          20 fautes
+//
+// ⚠️ LIRE LA TROISIEME LIGNE. Une amorce qui parle de cuisine repare presque
+// autant qu'une amorce juste. L'essentiel du gain ne vient donc PAS du
+// vocabulaire : il vient du fait qu'il y ait une amorce du tout, qui change le
+// regime de decodage. Le vocabulaire, lui, vaut les 4 fautes d'ecart entre 20
+// et 16. C'est reel, c'est le quart du gain, et il ne faut pas raconter
+// l'inverse.
+//
+// ⚠️ ET LE PRIX, MESURE AUSSI : sur du son SANS PAROLE, l'amorce multiplie les
+// mots inventes par dix (7 -> 75 sur cinq extraits de silence et de musique
+// seule). Elle ne part donc jamais seule : offscreen.js ne transcrit pas un bloc
+// muet, et jette les blocs qui partent en boucle de repetition.
+
+// Au-dela, l'amorce mange la fenetre de 448 jetons du decodeur.
+const AMORCE_JETONS_MAX = 100;
+
+// Le nom de langue de la popup vers le code que porte le jeton <|xx|>.
+const CODE_LANGUE = {
+  french: "fr", english: "en", arabic: "ar", spanish: "es", german: "de",
+  italian: "it", portuguese: "pt", dutch: "nl", russian: "ru", chinese: "zh",
+  japanese: "ja", korean: "ko", turkish: "tr", polish: "pl",
+};
+
+let amorceMemo = null; // { texte, langue, ids } — le tokenizer coute, on garde
+
+// Rend la suite de jetons de depart, ou null si quoi que ce soit manque. Un
+// null se traduit par « pas d'amorce » et surtout pas par une sequence
+// approximative : de mauvais jetons de depart donneraient du texte faux.
+function construireAmorce(pipeline, texte, langue) {
+  const propre = String(texte || "").trim();
+  if (!propre) return null;
+  if (amorceMemo && amorceMemo.texte === propre && amorceMemo.langue === langue) {
+    return amorceMemo.ids;
+  }
+  try {
+    const tokenizer = pipeline && pipeline.tokenizer;
+    if (!tokenizer || typeof tokenizer.encode !== "function") return null;
+
+    const unSeul = (jeton) => {
+      const ids = tokenizer.encode(jeton, { add_special_tokens: false });
+      return Array.isArray(ids) && ids.length === 1 ? ids[0] : null;
+    };
+    const code = CODE_LANGUE[langue] || CODE_LANGUE[LANGUE_DEFAUT];
+    const debutPrec = unSeul("<|startofprev|>");
+    const debutTexte = unSeul("<|startoftranscript|>");
+    const jetonLangue = unSeul(`<|${code}|>`);
+    const jetonTache = unSeul("<|transcribe|>");
+    if (debutPrec == null || debutTexte == null || jetonLangue == null || jetonTache == null) {
+      console.warn("[WORKER] Amorce : jetons speciaux introuvables, on s'en passe");
+      return null;
+    }
+
+    // L'espace de tete n'est pas decoratif : le tokenizer de Whisper code
+    // « mot » et « ␣mot » differemment, et c'est la seconde forme qui apparait
+    // dans une phrase.
+    let mots = tokenizer.encode(" " + propre, { add_special_tokens: false });
+    if (!Array.isArray(mots) || !mots.length) return null;
+    if (mots.length > AMORCE_JETONS_MAX) mots = mots.slice(0, AMORCE_JETONS_MAX);
+
+    const ids = [debutPrec, ...mots, debutTexte, jetonLangue, jetonTache];
+    amorceMemo = { texte: propre, langue, ids };
+    return ids;
+  } catch (erreur) {
+    console.warn("[WORKER] Amorce impossible :", erreur && erreur.message);
+    return null;
+  }
+}
+
 function bornerJetons(demande) {
   const n = Number(demande);
   if (!Number.isFinite(n) || n <= 0) return MAX_JETONS;
@@ -580,7 +673,7 @@ self.onmessage = (event) => {
   }
 
   if (message.type === "transcribe") {
-    const { id, audio, langue, maxJetons } = message;
+    const { id, audio, langue, maxJetons, amorce } = message;
 
     enfiler(async () => {
       try {
@@ -594,12 +687,20 @@ self.onmessage = (event) => {
         //
         // max_new_tokens borne le temps de calcul : c'est ce qui empeche une
         // boucle de repetition de monopoliser le worker (voir MAX_JETONS).
+        // Le vocabulaire souffle, s'il y en a un (voir construireAmorce). Il
+        // remplace les jetons de depart, jamais la langue : celle-ci est
+        // reinjectee dans la sequence.
+        const amorceIds = amorce
+          ? construireAmorce(transcrire, amorce, langue || LANGUE_DEFAUT)
+          : null;
+
         const resultat = await transcrire(audio, {
           language: langue || LANGUE_DEFAUT,
           max_new_tokens: bornerJetons(maxJetons),
           no_repeat_ngram_size: NO_REPEAT_NGRAM,
           // Absent uniquement si une page de mesure a demande `?horodatage=non`.
           ...(HORODATAGE ? { return_timestamps: HORODATAGE } : {}),
+          ...(amorceIds ? { decoder_input_ids: amorceIds } : {}),
         });
 
         // `chunks` n'existe que si on a demande les horodatages. Chaque entree

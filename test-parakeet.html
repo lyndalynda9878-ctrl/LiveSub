@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>LiveSub - test Parakeet</title>
+
+  <!-- Pas de carte d'import ici, et ce n'est pas un oubli : voir le long
+       commentaire en tete de test-parakeet.js. En resume, les deux formes sont
+       impraticables sous la CSP de ce projet -- la forme EN LIGNE est refusee
+       ('script-src self' sans 'unsafe-inline'), et la forme EXTERNE est
+       silencieusement ignoree par ce Chrome. On charge donc ONNX Runtime par
+       un chemin relatif, et on n'appelle jamais le chargeur de parakeet.js.
+
+       ⚠️ Aucune URL de cette page ne pointe vers internet. C'est verifiable :
+       onglet Reseau pendant une transcription -> zero requete externe. -->
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 860px;
+      margin: 40px auto;
+      padding: 0 20px;
+      color: #1f2937;
+    }
+    h1 { color: #4f46e5; font-size: 20px; }
+    h2 { font-size: 15px; color: #4f46e5; margin: 24px 0 8px; }
+    p.hint { color: #6b7280; font-size: 14px; }
+
+    #choix {
+      margin: 20px 0;
+      padding: 14px;
+      background: #eef2ff;
+      border: 1px solid #c7d2fe;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    #fichier { font-size: 14px; }
+
+    #reglages {
+      margin: 20px 0;
+      padding: 14px;
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.9;
+    }
+    #reglages label { margin-right: 22px; }
+    #reglages input[type="number"] { width: 60px; font-size: 14px; }
+    #reglages .note { display: block; color: #92400e; font-size: 13px; line-height: 1.5; }
+
+    #log, #texte, #mots, #chiffres {
+      margin-top: 10px;
+      padding: 14px;
+      background: #f8f9fa;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    #texte { background: #fffbeb; border-color: #fde68a; font-size: 14px; }
+
+    .ok { color: #0f9d63; }
+    .err { color: #dc2626; }
+    .attention { color: #b45309; }
+
+    /* Meme principe que test-whisper.html : ce compteur est mis a jour par un
+       setInterval du FIL PRINCIPAL. S'il defile, la page n'est pas figee.
+       (Ici l'inference tourne sur le fil principal -- c'est une page de mesure,
+       pas la production ; le worker viendra a l'etape suivante.) */
+    #indicateur {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 16px;
+      padding: 12px 14px;
+      background: #eef2ff;
+      border: 1px solid #c7d2fe;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    #indicateur[hidden] { display: none; }
+    .spinner {
+      width: 16px; height: 16px;
+      border: 3px solid #c7d2fe;
+      border-top-color: #4f46e5;
+      border-radius: 50%;
+      animation: tourne 0.8s linear infinite;
+      flex: none;
+    }
+    @keyframes tourne { to { transform: rotate(360deg); } }
+    #compteur {
+      margin-left: auto;
+      font-family: Consolas, monospace;
+      color: #4f46e5;
+      font-variant-numeric: tabular-nums;
+    }
+  </style>
+</head>
+<body>
+  <h1>🦜 LiveSub — test de transcription Parakeet TDT 0.6B v3</h1>
+
+  <p class="hint">
+    Page de test isolee. Elle ne touche ni a la capture audio, ni au VAD, ni a
+    Whisper : elle charge <strong>parakeet.js et les poids depuis le disque</strong>
+    (<code>node_modules/</code> et <code>models/parakeet-tdt-0.6b-v3/</code>),
+    transcrit un fichier .wav, et affiche le texte, l'heure de chaque mot et le
+    temps de calcul. <strong>Aucune requete ne part sur internet.</strong>
+  </p>
+
+  <!-- Les deux reglages a mesurer. Les valeurs par defaut sont celles d'avant :
+       WebGPU coche, 1 fil. Une page ouverte sans rien toucher se comporte
+       exactement comme avant l'ajout de ces cases. -->
+  <div id="reglages">
+    <label>
+      <input type="checkbox" id="webgpu" checked>
+      WebGPU pour l'encodeur <em>(decoche = CPU seul)</em>
+    </label>
+    <label>
+      Fils WASM :
+      <input type="number" id="fils" min="1" max="16" step="1" value="1">
+    </label>
+    <span class="note" id="noteReglages"></span>
+  </div>
+
+  <div id="choix">
+    Fichier .wav a transcrire :
+    <input type="file" id="fichier" accept=".wav,audio/wav" disabled>
+  </div>
+
+  <div id="indicateur" hidden>
+    <div class="spinner"></div>
+    <span class="libelle">Travail en cours</span>
+    <span id="compteur">0.0 s</span>
+  </div>
+
+  <h2>Journal</h2>
+  <div id="log">Chargement du modele...</div>
+
+  <h2>Texte transcrit</h2>
+  <div id="texte">—</div>
+
+  <h2>Les 20 premiers mots — [debut -&gt; fin] mot (confiance)</h2>
+  <div id="mots">—</div>
+
+  <h2>Chiffres</h2>
+  <div id="chiffres">—</div>
+
+  <script type="module" src="test-parakeet.js"></script>
+</body>
+</html>

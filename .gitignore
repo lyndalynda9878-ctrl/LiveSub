@@ -8,3 +8,11 @@ vendor/
 # main par `npm run build:model`. ~150 Mo de poids de modele : hors de question
 # de les versionner.
 models/
+
+# Modele Parakeet (NVIDIA Parakeet TDT 0.6B v3, export ONNX de ysdede).
+# Deja couvert par la regle `models/` ci-dessus ; on le nomme quand meme pour
+# qu'on voie noir sur blanc que ces 640 Mo ne partent jamais dans git.
+# Telecharge a la main depuis huggingface.co/ysdede/parakeet-tdt-0.6b-v3-onnx
+# (5 fichiers : encoder-model.int8.onnx, decoder_joint-model.int8.onnx,
+#  nemo128.onnx, vocab.txt, config.json).
+models/parakeet-tdt-0.6b-v3/
