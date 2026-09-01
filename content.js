@@ -55,16 +55,16 @@ subtitleBox.style.left = "50%";
 subtitleBox.style.transform = "translateX(-50%)";
 subtitleBox.style.width = "80%";
 subtitleBox.style.maxWidth = "800px";
-subtitleBox.style.background = "rgba(0, 0, 0, 0.85)";
+subtitleBox.style.background = "rgba(0, 0, 0, 0.82)";
 subtitleBox.style.color = "white";
-subtitleBox.style.padding = "16px 24px";
-subtitleBox.style.borderRadius = "14px";
+subtitleBox.style.padding = "12px 20px";
+subtitleBox.style.borderRadius = "10px";
 subtitleBox.style.textAlign = "center";
 subtitleBox.style.fontSize = "24px";
 subtitleBox.style.fontWeight = "bold";
 subtitleBox.style.zIndex = "999999";
 subtitleBox.style.boxShadow = "0 8px 30px rgba(0,0,0,0.6)";
-subtitleBox.style.border = "2px solid #4f46e5";
+subtitleBox.style.border = "1px solid rgba(139, 92, 246, 0.55)";
 subtitleBox.style.display = "none"; // Caché au départ
 // La boîte apparaît et disparaît en FONDU, jamais d'un coup.
 //
@@ -99,6 +99,78 @@ zone.style.overflow = "hidden";
 const ligne = document.createElement("div");
 zone.appendChild(ligne);
 subtitleBox.appendChild(zone);
+
+// ---------------------------------------------------------------------------
+// LA ZONE DE LECTURE : DEUX LIGNES, L'ORIGINAL PUIS LA TRADUCTION
+// ---------------------------------------------------------------------------
+//
+// ⚠️ C'est une SECONDE zone, a cote de `zone`, et pas une transformation de
+// celle-ci. `zone` sert encore aux statuts, aux messages d'echec et au ruban :
+// y toucher aurait fait porter le risque a des chemins qui n'ont rien demande.
+// Pendant la lecture on montre `zoneLecture` et on cache `zone` ; a l'arret on
+// fait l'inverse. Personne d'autre n'est concerne.
+//
+// ⚠️ LES HAUTEURS SONT EN PIXELS, PAS EN `em`, ET C'EST DELIBERE. `zone` mesure
+// sa hauteur en `em`, donc elle depend du `font-size` de la boite ; ici les deux
+// lignes ont chacune leur taille propre (18 px et 25 px), et une hauteur en `em`
+// n'aurait plus de sens commun. En pixels, la hauteur est la meme sur toutes les
+// pages, quelle que soit la typographie du site.
+const ST_ORIGINE_PX = 18;
+const ST_TRADUIT_PX = 25;
+const ST_INTERLIGNE = 1.3;
+const ST_ECART_PX = 6;
+const ST_LIGNES_MAX = 2;          // chaque texte tient sur 2 lignes d'ecran, pas plus
+const ST_OMBRE = "0 1px 3px rgba(0,0,0,0.9)";
+
+// La hauteur du PIRE CAS, calculee une fois : deux lignes en haut, deux en bas.
+// Elle ne depend d'aucun texte, donc elle ne peut pas bouger d'un bloc a
+// l'autre -- c'est exactement ce que demande l'acquis « la boite ne change pas
+// de hauteur ».
+const ST_HAUTEUR_ORIGINE = Math.round(ST_ORIGINE_PX * ST_INTERLIGNE * ST_LIGNES_MAX); // 47
+const ST_HAUTEUR_TRADUIT = Math.round(ST_TRADUIT_PX * ST_INTERLIGNE * ST_LIGNES_MAX); // 65
+
+// Les langues qui s'ecrivent de droite a gauche parmi les langues d'arrivee
+// proposees. On compare sur la racine du code (`ar-EG` -> `ar`).
+const ST_LANGUES_RTL = ["ar", "he", "fa", "ur"];
+
+function stDirection(code) {
+  const racine = String(code || "").toLowerCase().split("-")[0];
+  return ST_LANGUES_RTL.indexOf(racine) !== -1 ? "rtl" : "ltr";
+}
+
+const zoneLecture = document.createElement("div");
+zoneLecture.style.display = "none";
+
+// La ligne du HAUT : l'original. Plus petite, plus discrete -- on la lit si on
+// veut, elle ne dispute pas la place a la traduction.
+const boiteOrigine = document.createElement("div");
+boiteOrigine.style.height = ST_HAUTEUR_ORIGINE + "px";
+boiteOrigine.style.overflow = "hidden";
+boiteOrigine.style.marginBottom = ST_ECART_PX + "px";
+const ligneOrigine = document.createElement("div");
+ligneOrigine.style.fontSize = ST_ORIGINE_PX + "px";
+ligneOrigine.style.lineHeight = String(ST_INTERLIGNE);
+ligneOrigine.style.fontWeight = "normal";
+ligneOrigine.style.color = "rgba(255, 255, 255, 0.62)";
+ligneOrigine.style.textShadow = ST_OMBRE;
+boiteOrigine.appendChild(ligneOrigine);
+
+// La ligne du BAS : la traduction. C'est elle qu'on lit.
+const boiteTraduite = document.createElement("div");
+boiteTraduite.style.height = ST_HAUTEUR_TRADUIT + "px";
+boiteTraduite.style.overflow = "hidden";
+const ligneTraduite = document.createElement("div");
+ligneTraduite.style.fontSize = ST_TRADUIT_PX + "px";
+ligneTraduite.style.lineHeight = String(ST_INTERLIGNE);
+ligneTraduite.style.fontWeight = "600";
+ligneTraduite.style.color = "#ffffff";
+ligneTraduite.style.textShadow = ST_OMBRE;
+boiteTraduite.appendChild(ligneTraduite);
+
+zoneLecture.appendChild(boiteOrigine);
+zoneLecture.appendChild(boiteTraduite);
+subtitleBox.appendChild(zoneLecture);
+
 document.body.appendChild(subtitleBox);
 
 console.log("✅ Overlay cree sur la page");
@@ -228,17 +300,62 @@ let prepEnCours = false;
 let prepFinSignalee = false;
 let prepRecalages = 0;
 let prepPositionMax = 0;   // la progression ne recule JAMAIS
-let prepVeille = null;     // filet de securite de la restauration
+let prepSonde = null;      // la minuterie qui interroge l'avancement
+let prepAvancement = null; // dernier PREPARATION_PROGRES recu
+let prepDerniereAvancee = { signature: null, quand: 0 };
+let prepResteAffiche = null;  // temps restant montre, en secondes -- jamais croissant
+let prepResteQuand = 0;
+let prepJournalReste = [];    // toutes les valeurs annoncees, pour la mesure
 
-// Combien de temps on accepte d'attendre l'ordre de restauration avant de
-// rendre le lecteur de nous-memes.
+// ---------------------------------------------------------------------------
+// Le filet de la restauration : un detecteur de PANNE, pas de duree
+// ---------------------------------------------------------------------------
 //
 // ⚠️ CE FILET EXISTE PARCE QUE LE CAS S'EST PRODUIT. Un blocage cote offscreen
 // a empeche le service worker d'envoyer PREPARATION_RESTAURER : la video est
 // restee a x2, sur la page de l'utilisateur, sans le moindre message. On
 // emprunte le lecteur de quelqu'un d'autre -- le rendre ne doit dependre de
 // personne d'autre que nous.
-const PREP_VEILLE_MS = 60000;
+//
+// ⛔ MAIS IL A LONGTEMPS POSE LA MAUVAISE QUESTION, ET CA A COUTE UNE VIDEO
+// ENTIERE. C'etait un simple `setTimeout(60 s)` arme a la fin du defilement :
+// il mesurait LE TEMPS QUI PASSE, pas LE TRAVAIL QUI AVANCE. C'est le miroir
+// exact de « une barre de progression n'est pas une preuve de travail » --
+// ici, une file qui met longtemps n'est pas une preuve de panne.
+//
+// Mesure du 2026-08-31, vraie video de 9 minutes, preparation SAINE :
+//   - la file a culmine a 262 s de contenu en attente ;
+//   - la vidange APRES la fin de la video a dure 3 min 45 s ;
+//   - les 28 blocs sont tous revenus, le stock est complet (825 mots).
+// L'ancien filet tuait donc l'affichage d'une preparation qui se portait bien,
+// et il l'aurait fait sur toute video de plus de ~3 minutes.
+//
+// ⛔ ET ON N'AUGMENTE PAS LE SEUIL : 60 s -> 300 s deplacerait simplement le
+// probleme a 25 minutes de video. Ce qu'on surveille change de nature -- ce
+// n'est plus une duree, c'est l'IMMOBILITE des compteurs de travail.
+//
+// PREP_PANNE_MS : temps pendant lequel RIEN n'a bouge (ni bloc parti, ni bloc
+// termine, ni contenu consomme, ni mot ajoute au stock). Dimensionne sur la
+// mesure, pas au jugé : sur le run de 9 minutes, le plus long silence entre
+// deux blocs TERMINES a ete de 18,5 s, et CLAUDE.md documente des blocs allant
+// jusqu'a 26 s. 90 s laisse donc un facteur ~3,5 sur le pire cas connu.
+const PREP_PANNE_MS = 90000;
+
+// Cadence a laquelle on demande son avancement a l'offscreen. Cinq secondes :
+// assez fin pour que le temps restant bouge de facon lisible, assez lache pour
+// que deux sauts de message toutes les 5 s ne pesent rien a cote d'un bloc de
+// 20 s.
+const PREP_SONDE_MS = 5000;
+
+// Avant ce nombre de blocs TERMINES, on n'annonce aucun temps restant.
+//
+// ⚠️ Ce n'est pas de la prudence decorative. Le temps restant ne doit jamais
+// reculer ; il est donc borne par sa valeur precedente. Une premiere estimation
+// faite sur un seul bloc serait un plancher pose pour de bon, et un plancher
+// faux ne se rattrape plus. Mesure du run de 9 minutes : le debit vaut 2,12 sur
+// le premier bloc (le worker vient de demarrer, la file est vide) puis se pose
+// entre 1,03 et 1,14 des le troisieme. On attend donc le troisieme.
+const PREP_BLOCS_AVANT_ESTIMATION = 3;
 
 // Au-dela de ca sans que la position avance alors que la lecture est censee
 // tourner, on considere le lecteur perdu.
@@ -495,6 +612,9 @@ async function prepPiloter(vitesse) {
   prepDerniereProgression = { position: v.currentTime, quand: Date.now() };
   v.addEventListener("ended", prepSurFin);
   prepTick = setInterval(prepBattre, PREP_PAS_TICK);
+  // La sonde tourne des le debut, et pas seulement a la fin : c'est elle qui
+  // mesure le debit, et sans debit il n'y a pas de temps restant a annoncer.
+  prepDemarrerSonde();
   prepBattre();
 
   console.log(`▶️ Preparation : defilement a x${prepVitesseCible} depuis ${v.currentTime.toFixed(2)} s`);
@@ -584,10 +704,14 @@ function prepBattre() {
   const fait = prepPositionMax - prepAvant.position;
   const total = Number.isFinite(v.duration) ? v.duration - prepAvant.position : null;
 
+  // ⚠️ Le temps restant vient de la SONDE, pas d'un calcul fait ici. Le
+  // rythme du defilement ne suffit pas a le predire : sur le run de 9 minutes,
+  // le moteur transcrivait a 1,06 quand la video livrait a 2,0 — c'est lui qui
+  // commandait, et lui seul sait a quel rythme il avance.
   prepAfficher(
     total
-      ? `⏳ Préparation… ${prepFormaterDuree(fait)} sur ${prepFormaterDuree(total)}`
-      : `⏳ Préparation… ${prepFormaterDuree(fait)}`,
+      ? `⏳ Préparation… ${prepFormaterDuree(fait)} sur ${prepFormaterDuree(total)}${prepTexteReste()}`
+      : `⏳ Préparation… ${prepFormaterDuree(fait)}${prepTexteReste()}`,
     true
   );
 
@@ -595,6 +719,164 @@ function prepBattre() {
     v.ended ||
     (Number.isFinite(v.duration) && v.currentTime >= v.duration - PREP_MARGE_FIN);
   if (finie) prepSurFin();
+}
+
+// ---------------------------------------------------------------------------
+// LA SONDE D'AVANCEMENT — « ca avance, ou c'est bloque ? »
+// ---------------------------------------------------------------------------
+//
+// Elle sert a DEUX choses, et c'est la meme information :
+//   - dire s'il y a PANNE (rien n'a bouge depuis PREP_PANNE_MS) ;
+//   - dire combien de temps il reste.
+//
+// ⚠️ La signature ne compte PAS que les blocs termines. Un bloc juge silencieux
+// par l'offscreen (`prepEstSilence`) revient sans jamais passer par le compteur
+// des blocs transcrits : une suite de blocs muets laisserait « blocs termines »
+// immobile alors que le moteur travaille. Mesure du 2026-08-31 sur YouTube :
+// 27 blocs PARTIS pour 3 TERMINES sur une piste devenue muette. On regarde donc
+// les quatre compteurs, et il suffit qu'UN SEUL bouge pour que ce ne soit pas
+// une panne.
+function prepSignatureAvancement(a) {
+  if (!a) return null;
+  return [a.blocsPartis, a.blocsTermines, a.contenuTraiteS, a.nbMots].join("/");
+}
+
+// Le temps restant, en secondes. `null` tant qu'on ne sait pas.
+//
+// Deux chemins, et le plus lent commande :
+//   - la TRANSCRIPTION : ce qui attend dans la file, plus ce que la video n'a
+//     pas encore livre, divise par le debit du MOTEUR ;
+//   - le DEFILEMENT : ce que la video n'a pas encore livre, a x2.
+// Quand le moteur va plus vite que la video, c'est la video qui commande ;
+// quand il va moins vite (le cas mesure : ~1,15 contre 2), c'est lui.
+//
+// ⚠️ `debitS` EST LE DEBIT DU MOTEUR, PAS CELUI DE L'HORLOGE, et la distinction
+// a deja coute une mesure fausse. Le debit d'horloge (contenu consomme / temps
+// ecoule) vaut ~2 tant que la file est vide, parce qu'il mesure alors le
+// DEFILEMENT et non le moteur : le 2026-08-31 il faisait annoncer 251 s la ou
+// il en restait 480. Le debit moteur, lui, rapporte le contenu au temps ou le
+// moteur a reellement travaille -- voir `msMoteur` dans offscreen.js.
+function prepResteBrutS(v) {
+  const a = prepAvancement;
+  if (!a || !a.debitS || a.debitS <= 0) return null;
+  if ((a.blocsTermines || 0) < PREP_BLOCS_AVANT_ESTIMATION) return null;
+
+  let resteACapturer = 0;
+  if (!prepFinSignalee && v && Number.isFinite(v.duration)) {
+    resteACapturer = Math.max(0, v.duration - v.currentTime);
+  }
+  const parLaTranscription = (a.fileS + resteACapturer) / a.debitS;
+  const parLeDefilement = resteACapturer / (prepVitesseCible || 1);
+  return Math.max(parLaTranscription, parLeDefilement);
+}
+
+// ⚠️ LE TEMPS RESTANT NE RECULE JAMAIS. Un chiffre qui remonte ment : il dit au
+// lecteur que le travail a regresse, ce qui n'arrive pas. On le borne donc par
+// sa valeur precedente diminuee du temps reellement ecoule -- il peut chuter si
+// l'estimation s'ameliore, jamais grimper.
+//
+// Le prix, assume : si l'estimation etait trop optimiste, le compteur atteint
+// zero avant la fin. On cesse alors d'annoncer un chiffre (« encore un
+// instant… ») au lieu d'en inventer un.
+function prepResteMonotoneS(estimation) {
+  const maintenant = Date.now();
+  if (estimation === null) return prepResteAffiche;
+  if (prepResteAffiche === null) {
+    prepResteAffiche = estimation;
+  } else {
+    const ecoule = (maintenant - prepResteQuand) / 1000;
+    const plafond = Math.max(0, prepResteAffiche - ecoule);
+    prepResteAffiche = Math.min(estimation, plafond);
+  }
+  prepResteQuand = maintenant;
+  prepJournalReste.push({
+    ms: maintenant,
+    estimationS: Math.round(estimation),
+    afficheS: Math.round(prepResteAffiche),
+  });
+  return prepResteAffiche;
+}
+
+// Le morceau de phrase « — encore ~3 min 40 s », ou rien du tout.
+function prepTexteReste() {
+  if (prepResteAffiche === null) return "";
+  if (prepResteAffiche < 1) return " — encore un instant…";
+  return " — encore ~" + prepFormaterDuree(prepResteAffiche);
+}
+
+async function prepSonder() {
+  // Le lecteur a deja ete rendu : il n'y a plus rien a surveiller.
+  if (!prepVideo) {
+    prepArreterSonde();
+    return;
+  }
+
+  let reponse = null;
+  try {
+    reponse = await chrome.runtime.sendMessage({ type: "PREPARATION_PROGRES" });
+  } catch (err) {
+    reponse = { success: false, injoignable: true, error: String((err && err.message) || err) };
+  }
+
+  const maintenant = Date.now();
+
+  if (reponse && reponse.success) {
+    prepAvancement = reponse;
+    const signature = prepSignatureAvancement(reponse);
+    if (signature !== prepDerniereAvancee.signature) {
+      prepDerniereAvancee = { signature, quand: maintenant };
+    }
+  } else if (reponse && reponse.injoignable) {
+    // L'offscreen ne repond plus. Ce n'est pas « c'est long » : plus rien ne
+    // peut avancer. On laisse le compteur d'immobilite courir, il tranchera.
+    console.warn("⚠️ Preparation : le module audio ne repond pas —", reponse.error);
+  }
+
+  prepResteMonotoneS(prepResteBrutS(prepVideoResolue()));
+
+  // ⚠️ ON NE JUGE QU'APRES LA FIN DU DEFILEMENT. Pendant la video, c'est le
+  // detecteur d'enlisement (PREP_ENLISEMENT_MS) qui surveille le lecteur ; ici
+  // on ne fait qu'alimenter le temps restant.
+  if (!prepFinSignalee) return;
+
+  prepAfficher("⏳ Préparation… derniers mots en cours de transcription" + prepTexteReste(), true);
+
+  const immobileMs = prepDerniereAvancee.quand ? maintenant - prepDerniereAvancee.quand : 0;
+  if (immobileMs <= PREP_PANNE_MS) return;
+
+  // PANNE. Et on dit CE QU'ON A CONSTATE, pas « ca a pris trop longtemps » :
+  // c'est la seule facon de distinguer, plus tard, une vraie panne d'une file
+  // simplement longue.
+  const a = prepAvancement || {};
+  console.error(
+    "❌ Preparation : PANNE — rien n'a bouge depuis " + Math.round(immobileMs / 1000) + " s " +
+      "(blocs partis " + a.blocsPartis + ", termines " + a.blocsTermines +
+      ", file " + a.fileS + " s, mots " + a.nbMots + "). On rend le lecteur."
+  );
+  prepArreterSonde();
+  await prepRestaurer();
+  prepAfficher(
+    "⚠️ Préparation bloquée — rien n'a avancé depuis " + Math.round(immobileMs / 1000) + " s. " +
+      "Le lecteur a été remis en état."
+  );
+}
+
+function prepDemarrerSonde() {
+  prepArreterSonde();
+  prepAvancement = null;
+  prepDerniereAvancee = { signature: null, quand: Date.now() };
+  prepResteAffiche = null;
+  prepResteQuand = 0;
+  prepJournalReste = [];
+  prepSonde = setInterval(prepSonder, PREP_SONDE_MS);
+  prepSonder();
+}
+
+function prepArreterSonde() {
+  if (prepSonde) {
+    clearInterval(prepSonde);
+    prepSonde = null;
+  }
 }
 
 // Fin du defilement : on met le lecteur en PAUSE tout de suite (plus aucun son
@@ -618,18 +900,14 @@ function prepSurFin() {
     /* le lecteur a pu disparaitre entre-temps */
   }
 
-  prepAfficher("⏳ Préparation… derniers mots en cours de transcription", true);
+  prepAfficher("⏳ Préparation… derniers mots en cours de transcription" + prepTexteReste(), true);
   chrome.runtime.sendMessage({ type: "PREPARATION_FIN" }).catch(() => {});
 
-  // Si l'ordre de restauration n'arrive pas, on rend le lecteur quand meme.
-  if (prepVeille) clearTimeout(prepVeille);
-  prepVeille = setTimeout(async () => {
-    prepVeille = null;
-    if (!prepVideo) return; // deja restaure, tout va bien
-    console.warn("⚠️ Preparation : aucun ordre de restauration, on rend le lecteur");
-    await prepRestaurer();
-    prepAfficher("⚠️ Préparation interrompue — le lecteur a été remis en état");
-  }, PREP_VEILLE_MS);
+  // ⚠️ PLUS AUCUNE MINUTERIE ICI. La sonde tourne deja depuis le debut du
+  // defilement ; a partir de maintenant elle JUGE, au lieu de se contenter
+  // d'alimenter le temps restant. Le lecteur sera rendu si — et seulement si —
+  // plus rien n'avance.
+  if (!prepSonde) prepDemarrerSonde();
 }
 
 // ---------------------------------------------------------------------------
@@ -645,10 +923,7 @@ async function prepRestaurer() {
   const avant = prepAvant;
   if (!v) return null;
 
-  if (prepVeille) {
-    clearTimeout(prepVeille);
-    prepVeille = null;
-  }
+  prepArreterSonde();
   prepEnCours = false;
   if (prepTick) {
     clearInterval(prepTick);
@@ -834,6 +1109,7 @@ const PREP_LECT_SAUT_S = 0.35;
 
 let prepLectStock = [];           // [{ mot, instant }], instants croissants
 let prepLectZone = null;          // { debut, fin } en secondes de video
+let prepLectTraduction = null;    // { source, cible } quand le stock est traduit
 let prepLectResume = "";          // le texte « Pret — N mots… »
 let prepLectActif = false;
 let prepLectRaf = null;
@@ -1124,6 +1400,255 @@ function prepBlocsDepuisMots(mots, finZone) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Mode « blocs », variante TRADUITE : les blocs viennent DEJA DECOUPES
+// ---------------------------------------------------------------------------
+//
+// ⚠️ POURQUOI ON NE PEUT PAS REUTILISER prepBlocsDepuisMots ICI. Cette
+// fonction-la travaille sur des mots QUI PORTENT CHACUN UN INSTANT : c'est ce
+// qui lui permet de choisir ou couper, de mesurer le temps a l'ecran, et de
+// fusionner en arriere. Un texte traduit n'a plus rien de tout ca -- une
+// traduction n'a ni le meme nombre de mots ni le meme ordre. Lui inventer des
+// instants par mot serait fabriquer une synchronisation qui n'a jamais ete
+// mesuree.
+//
+// Le decoupage a donc ete fait EN AMONT, dans offscreen.js, sur les mots
+// D'ORIGINE et leurs vrais instants. Chaque segment arrive avec :
+//   - `instant`    : l'instant du PREMIER mot d'origine du segment ;
+//   - `finParole`  : l'instant du DERNIER mot d'origine du segment ;
+//   - `texteOrigine` et `texteTraduit`.
+//
+// Ici on ne fait donc plus qu'une chose : poser les memes bornes d'affichage que
+// prepBlocsDepuisMots -- `fin`, `disparition` -- avec EXACTEMENT les memes
+// regles, pour que rien de ce qui a ete mesure sur l'affichage ne change.
+// ⚠️ MESURER, PAS ESTIMER. Pour savoir si un texte tient dans sa case, on
+// l'ECRIT dans l'element reel et on lit son `scrollHeight` : meme police, meme
+// largeur, meme retour a la ligne que ce que verra l'oeil. Un comptage de
+// caracteres se tromperait sur les mots longs et sur toute page qui change la
+// typographie.
+//
+// Les elements doivent etre POSES pour etre mesurables : au moment ou on
+// construit les blocs, la boite est encore cachee. On la rend donc mesurable le
+// temps de la mesure -- affichee mais transparente -- puis on remet tout en
+// place. C'est synchrone, le navigateur ne repeint pas entre les deux.
+function stTientDansLaBoite(haut, bas, avecHaut) {
+  const dBox = subtitleBox.style.display;
+  const oBox = subtitleBox.style.opacity;
+  const dZone = zoneLecture.style.display;
+  const dHaut = boiteOrigine.style.display;
+  const tHaut = ligneOrigine.textContent;
+  const tBas = ligneTraduite.textContent;
+  const trHaut = ligneOrigine.style.transform;
+
+  subtitleBox.style.display = "block";
+  subtitleBox.style.opacity = "0";
+  zoneLecture.style.display = "block";
+  boiteOrigine.style.display = "block";
+  try {
+    ligneOrigine.style.transform = "";
+    ligneTraduite.textContent = bas;
+    if (ligneTraduite.scrollHeight > boiteTraduite.clientHeight) return false;
+    if (!avecHaut) return true;
+    ligneOrigine.textContent = haut;
+    return ligneOrigine.scrollHeight <= boiteOrigine.clientHeight;
+  } finally {
+    ligneOrigine.textContent = tHaut;
+    ligneTraduite.textContent = tBas;
+    ligneOrigine.style.transform = trHaut;
+    boiteOrigine.style.display = dHaut;
+    zoneLecture.style.display = dZone;
+    subtitleBox.style.opacity = oBox;
+    subtitleBox.style.display = dBox;
+  }
+}
+
+function prepBlocsDepuisSegments(segments, finZone) {
+  if (!Array.isArray(segments) || !segments.length) return [];
+
+  const dernier = segments[segments.length - 1];
+  const fin = Math.max(
+    Number(finZone) || 0,
+    (Number(dernier.finParole) || 0) + BLOC_DUREE_MIN
+  );
+
+  // ⚠️ LES DEUX TEXTES VOYAGENT ENSEMBLE. `texte` reste celui de Parakeet -- il
+  // n'est jamais ecrase -- et `texteTraduit` s'ajoute a cote. Un segment dont la
+  // traduction a echoue arrive avec `texteTraduit: null` : il s'affichera dans
+  // sa langue d'origine, et l'echec est dit ailleurs (la console de l'offscreen
+  // et le bilan de la popup le comptent).
+  const liste = segments.map((s) => {
+    const instant = Number(s.instant) || 0;
+    return {
+      instant,
+      finParole: Math.max(instant, Number(s.finParole) || instant),
+      nbMots: Number(s.nbMots) || 0,
+      texte: String(s.texteOrigine || ""),
+      texteTraduit: s.texteTraduit ? String(s.texteTraduit) : null,
+    };
+  });
+
+  // -------------------------------------------------------------------------
+  // FUSION EN ARRIERE — UN BLOC TROP COURT N'EST PAS UN BLOC, C'EST UN CLIN D'OEIL
+  // -------------------------------------------------------------------------
+  //
+  // ⚠️ CE QUI MANQUAIT, ET CE QUE CA A COUTE. `prepBlocsDepuisMots` refuse
+  // depuis toujours qu'un bloc reste moins de BLOC_DUREE_MIN a l'ecran : elle
+  // fusionne le trop court avec son voisin. Les segments de traduction, eux,
+  // sont decoupes pour la TRADUCTION (une phrase entiere a donner au
+  // traducteur), pas pour la LECTURE -- et rien ne les empechait de defiler
+  // trop vite.
+  //
+  // Mesure du 2026-09-01, meme piste de 3 minutes :
+  //     « Langue d'origine » (prepBlocsDepuisMots)   : 20 blocs,  0 trop court
+  //     traduit (segments, sans cette passe)         : 46 blocs,  7 trop courts,
+  //                                                    le pire a 746 ms
+  // Et depuis l'affichage a deux lignes il y a DEUX textes a lire dans le meme
+  // temps : 746 ms ne suffisent plus du tout. C'est ca qu'on lit comme « le
+  // texte ne colle plus a la voix » -- il ne colle pas moins, il passe trop vite.
+  //
+  // Deux garde-fous, et l'ordre compte :
+  //   1. LA BOITE D'ABORD. Un bloc fusionne qui deborde serait invisible, ce
+  //      qui est pire que trop court. On MESURE avant de fusionner.
+  //   2. ON NE MELANGE PAS TRADUIT ET NON TRADUIT. Coller un segment traduit a
+  //      un segment qui ne l'est pas fabriquerait une ligne moitie francais
+  //      moitie anglais, et ferait disparaitre le bloc du compte des « sans
+  //      traduction ». On saute ce cas-la.
+  const avecHaut = liste.some((b) => b.texteTraduit);
+  for (let k = liste.length - 1; k >= 1; k--) {
+    const q = liste[k];
+    const suivant = k + 1 < liste.length ? liste[k + 1].instant : fin;
+    if (suivant - q.instant >= BLOC_DUREE_MIN) continue;
+
+    const p = liste[k - 1];
+    if (Boolean(p.texteTraduit) !== Boolean(q.texteTraduit)) continue;
+
+    const fusionHaut = (p.texte + " " + q.texte).trim();
+    const fusionBas = p.texteTraduit
+      ? (p.texteTraduit + " " + q.texteTraduit).trim()
+      : fusionHaut;
+    if (!stTientDansLaBoite(fusionHaut, fusionBas, avecHaut)) continue;
+
+    p.texte = fusionHaut;
+    if (p.texteTraduit) p.texteTraduit = fusionBas;
+    p.finParole = q.finParole;
+    p.nbMots += q.nbMots;
+    liste.splice(k, 1);
+  }
+
+  // Les bornes d'affichage se calculent APRES la fusion : elles dependent du
+  // bloc SUIVANT, qui vient peut-etre de changer.
+  return liste.map((b, k) => {
+    const suivant = k + 1 < liste.length ? liste[k + 1].instant : fin;
+    return {
+      instant: b.instant,
+      fin: suivant,
+      finParole: b.finParole,
+      // Les trois memes bornes que dans prepBlocsDepuisMots, dans le meme ordre,
+      // et la plus petite gagne.
+      disparition: Math.min(
+        suivant,
+        Math.max(b.finParole + BLOC_APRES_PAROLE, b.instant + BLOC_DUREE_MIN)
+      ),
+      nbMots: b.nbMots,
+      texte: b.texte,
+      texteTraduit: b.texteTraduit,
+    };
+  });
+}
+
+// Ce qu'on MONTRE EN GRAND : le traduit s'il existe, sinon l'original. Une seule
+// fonction, utilisee partout ou du texte de bloc est ecrit ou mesure -- sinon
+// l'affichage et l'audit finiraient par ne pas parler du meme texte.
+function prepBlocTexte(bloc) {
+  return (bloc && bloc.texteTraduit) || (bloc && bloc.texte) || "";
+}
+
+// La ligne du BAS : celle qu'on lit. C'est `prepBlocTexte`, sous un autre nom,
+// pour que les deux lignes se lisent en miroir a l'endroit ou on les ecrit.
+function prepBlocBas(bloc) {
+  return prepBlocTexte(bloc);
+}
+
+// La ligne du HAUT : l'original, et SEULEMENT quand il y a une traduction
+// au-dessous.
+//
+// ⚠️ Un bloc sans traduction rend une chaine VIDE ici, et son original passe en
+// bas, en grand. Ecrire le meme texte sur les deux lignes serait le pire des
+// affichages : il aurait l'air de fonctionner. La boite, elle, garde sa hauteur
+// -- la ligne du haut reste presente, simplement vide.
+function prepBlocHaut(bloc) {
+  return bloc && bloc.texteTraduit ? bloc.texte || "" : "";
+}
+
+// ⚠️ COMBIEN DE BLOCS ONT MANQUE LEUR TRADUCTION. Compte sur le STOCK COMPLET
+// au chargement, pas sur ce qui a ete lu : un chiffre qui depend de jusqu'ou on
+// a regarde la video ne veut rien dire. Zero est alors une MESURE.
+let prepBlocsSansTraduction = 0;
+
+// ---------------------------------------------------------------------------
+// LES DEUX HAUTEURS FIXES, ET IL N'Y EN A QUE DEUX
+// ---------------------------------------------------------------------------
+//
+// - avec traduction : ligne du haut + ecart + ligne du bas = 47 + 6 + 65 px ;
+// - sans traduction : la ligne du bas seule = 65 px.
+//
+// Ni l'une ni l'autre ne depend du texte. Un bloc de deux mots occupe donc
+// exactement la meme place qu'un bloc de quinze : c'est ce qui fait que la
+// boite ne saute jamais.
+let prepLectDeuxLignes = null; // null = zone de lecture pas encore posee
+
+function prepLectBoiteLecture(avecTraduction) {
+  prepLectDeuxLignes = Boolean(avecTraduction);
+  boiteOrigine.style.display = avecTraduction ? "block" : "none";
+  zone.style.display = "none";
+  zoneLecture.style.display = "block";
+}
+
+function prepLectBoiteSimple() {
+  prepLectDeuxLignes = null;
+  zoneLecture.style.display = "none";
+  zone.style.display = "block";
+}
+
+// La direction d'ecriture des deux lignes, posee UNE FOIS a la lecture du
+// stock. La ligne du bas suit la langue d'ARRIVEE, la ligne du haut celle de
+// DEPART : chaque texte s'ecrit dans le sens de sa propre langue.
+function prepLectPoserDirections(traduction) {
+  const dirBas = stDirection(traduction && traduction.cible);
+  const dirHaut = stDirection(traduction && traduction.source);
+  ligneTraduite.style.direction = dirBas;
+  ligneTraduite.style.textAlign = dirBas === "rtl" ? "right" : "center";
+  ligneOrigine.style.direction = dirHaut;
+  ligneOrigine.style.textAlign = dirHaut === "rtl" ? "right" : "center";
+}
+
+// Ecrit les deux lignes et les colle l'une a l'autre.
+//
+// L'original est pousse VERS LE BAS de sa case, la traduction reste EN HAUT de
+// la sienne : les deux textes se rejoignent au milieu, separes des 6 px voulus,
+// quel que soit le nombre de lignes de chacun. Sans ca, un original d'une seule
+// ligne flotterait a 25 px de sa traduction.
+//
+// On pousse a la main plutot que de s'en remettre a un alignement du
+// navigateur, comme le fait deja `rendre()` : ici on connait exactement de
+// combien ca depasse, donc le resultat est le meme partout.
+function prepLectEcrireDeux(haut, bas) {
+  let deborde = 0;
+
+  ligneTraduite.style.transform = "";
+  ligneTraduite.textContent = bas;
+  if (ligneTraduite.scrollHeight > boiteTraduite.clientHeight) deborde++;
+
+  if (prepLectDeuxLignes) {
+    ligneOrigine.style.transform = "";
+    ligneOrigine.textContent = haut;
+    const reste = boiteOrigine.clientHeight - ligneOrigine.scrollHeight;
+    if (reste < 0) deborde++;
+    ligneOrigine.style.transform = reste > 0 ? "translateY(" + reste + "px)" : "";
+  }
+  return deborde;
+}
+
 // Le bloc en vigueur a la position `t` : le dernier dont le premier mot est
 // deja passe. -1 quand on est avant le tout premier.
 function prepBlocIndex(t) {
@@ -1144,26 +1669,23 @@ function prepBlocIndex(t) {
 // la ligne du BAS, comme un sous-titre de film -- d'ou le decalage vers le bas,
 // plutot qu'un alignement herite de la page, qui changerait d'un site a l'autre.
 function prepBlocRendre(k) {
-  prepLectHauteur(LIGNES_VISIBLES);
+  const b = prepLectBlocs[k];
   subtitleBox.style.display = "block";
   subtitleBox.style.opacity = "1";
   subtitleBox.style.fontStyle = "normal";
-  ligne.style.transform = "";
-  ligne.textContent = prepLectBlocs[k].texte;
 
-  const reste = zone.clientHeight - ligne.scrollHeight;
-  if (reste < 0) {
-    // Ne devrait pas arriver : BLOC_MOTS_ABSOLU et BLOC_CARACTERES_ABSOLU sont
-    // la pour ca. Si ca arrive quand meme, on montre le DEBUT -- le ruban, lui,
-    // montre la fin, mais ici rien ne coule, la suite ne viendra jamais -- et on
-    // le DIT, plutot que de laisser du texte disparaitre en silence.
-    prepBlocDebordements++;
+  const deborde = prepLectEcrireDeux(prepBlocHaut(b), prepBlocBas(b));
+  if (deborde) {
+    // Ne devrait pas arriver : BLOC_MOTS_ABSOLU et BLOC_CARACTERES_ABSOLU
+    // bornent la source, et le decoupage de la traduction est plus serre
+    // encore. Si ca arrive quand meme, on le DIT, plutot que de laisser du
+    // texte disparaitre sous la coupe en silence.
+    prepBlocDebordements += deborde;
     console.warn(
-      "⚠️ LiveSub : bloc trop long pour la boite (" + -reste + " px) — « " +
-        prepLectBlocs[k].texte + " »"
+      "⚠️ LiveSub : bloc trop long pour la boite (" + deborde + " ligne(s)) — haut « " +
+        prepBlocHaut(b) + " » / bas « " + prepBlocBas(b) + " »"
     );
   }
-  ligne.style.transform = reste > 0 ? "translateY(" + reste + "px)" : "";
   prepLectEtatAffiche = "bloc";
 }
 
@@ -1256,9 +1778,22 @@ function prepLectRendre(n) {
   prepLectEtatAffiche = "ruban";
 }
 
+// ⚠️ PENDANT LA LECTURE, UN MESSAGE OCCUPE LA MEME BOITE QUE LES SOUS-TITRES,
+// A LA MEME HAUTEUR. C'est ce qui manquait pour que l'acquis 4 tienne vraiment :
+// « ⏭️ Au-dela de la preparation » affiche dans l'ancienne zone aurait fait
+// changer la boite de hauteur en pleine lecture, exactement ce qu'on interdit.
+// Le message va donc sur la ligne du bas, et la ligne du haut reste vide.
 function prepLectMessage(cle, texte) {
   if (prepLectEtatAffiche === cle) return;
   prepLectEtatAffiche = cle;
+  if (prepLectDeuxLignes !== null) {
+    if (prepBoiteEnErreur) prepBoiteNormale();
+    subtitleBox.style.display = "block";
+    subtitleBox.style.opacity = "0.8";
+    subtitleBox.style.fontStyle = "italic";
+    prepLectEcrireDeux("", texte);
+    return;
+  }
   prepLectHauteur(LIGNES_VISIBLES); // un message entier, pas un message coupe
   prepAfficher(texte, true);
 }
@@ -1366,6 +1901,10 @@ function prepLectDemarrer() {
   prepLectEtatAffiche = "";
   prepLectDernierTick = 0;
   prepLectDernierePosition = 0;
+  // La boite passe en mode lecture : DEUX lignes s'il y a une traduction, UNE
+  // seule sinon. La hauteur est fixee ici, une fois, et plus rien ne la touche
+  // jusqu'a l'arret.
+  if (PREP_LECT_STYLE === "blocs") prepLectBoiteLecture(Boolean(prepLectTraduction));
   prepLectRaf = requestAnimationFrame(prepLectBoucleRaf);
   prepLectMinuterie = setInterval(prepLectBattre, PREP_LECT_PAS_MS);
   console.log(
@@ -1387,6 +1926,7 @@ function prepLectArreter() {
   }
   // ⚠️ OBLIGATOIRE : `zone` est partagee avec le mode direct, qui compte sur ses
   // deux lignes. La laisser a une ligne le casserait a distance.
+  prepLectBoiteSimple();
   prepLectHauteur(LIGNES_VISIBLES);
 }
 
@@ -1407,14 +1947,44 @@ async function prepLectCharger(resume) {
     // Le decoupage en phrases se fait UNE fois, ici, sur le stock complet. C'est
     // la seule facon d'avoir la duree d'un bloc : elle depend du premier mot du
     // bloc SUIVANT, donc de texte qui n'existe pas encore en direct.
+    // ⚠️ `prepLectStock` reste TOUJOURS les mots de Parakeet, avec leurs
+    // instants par mot : la traduction ne le remplace pas. C'est lui qui sert au
+    // mode « mots », a la mesure par mot, et c'est le texte d'origine que je
+    // veux garder.
+    //
+    // Les segments traduits, eux, arrivent DEJA decoupes (voir
+    // prepBlocsDepuisSegments). Quand il n'y en a pas -- « Langue d'origine » --
+    // on retombe exactement sur le chemin d'avant, sans une ligne de difference.
+    const segments = Array.isArray(reponse.segments) ? reponse.segments : [];
     prepLectBlocs =
-      PREP_LECT_STYLE === "blocs"
-        ? prepBlocsDepuisMots(prepLectStock, prepLectZone.fin)
-        : [];
+      PREP_LECT_STYLE !== "blocs"
+        ? []
+        : segments.length
+          ? prepBlocsDepuisSegments(segments, prepLectZone.fin)
+          : prepBlocsDepuisMots(prepLectStock, prepLectZone.fin);
+    prepLectTraduction = reponse.traduction || null;
+    prepLectPoserDirections(prepLectTraduction);
+
+    // ⚠️ LE COMPTE DES BLOCS SANS TRADUCTION, ET IL DOIT SE VOIR. Un bloc qui
+    // s'affiche en grand dans sa langue d'origine a exactement l'air de
+    // fonctionner : sans ce chiffre, une traduction a moitie tombee en panne
+    // passerait inapercue.
+    prepBlocsSansTraduction = prepLectTraduction
+      ? prepLectBlocs.filter((b) => !b.texteTraduit).length
+      : 0;
+    if (prepBlocsSansTraduction) {
+      console.warn(
+        "⚠️ LiveSub : " + prepBlocsSansTraduction + " bloc(s) sur " + prepLectBlocs.length +
+          " sans traduction — ils s'affichent dans la langue d'origine."
+      );
+    }
     if (resume && typeof resume.nbMots === "number") {
       prepLectResume =
         `✅ Prêt — ${resume.nbMots} mots préparés, ` +
-        `${prepFormaterDuree(resume.dureeCouverteS)} couvertes`;
+        `${prepFormaterDuree(resume.dureeCouverteS)} couvertes` +
+        (prepBlocsSansTraduction
+          ? ` — ⚠️ ${prepBlocsSansTraduction} bloc(s) sans traduction`
+          : "");
     }
     prepLectDemarrer();
   } catch (err) {
@@ -1474,6 +2044,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       // Mode blocs : un ecart par BLOC (critere 1) et le temps reellement passe
       // a l'ecran par chacun (critere 3).
       blocCourant: prepLectBlocCourant,
+      traduction: prepLectTraduction,
+      blocsSansTraduction: prepBlocsSansTraduction,
+      deuxLignes: prepLectDeuxLignes,
+      hauteurBoitePx: subtitleBox.getBoundingClientRect().height,
+      // Le temps restant, toutes les valeurs annoncees dans l'ordre. C'est la
+      // seule facon de VERIFIER qu'il n'a jamais recule : un chiffre lu a
+      // l'oeil de temps en temps ne prouve rien.
+      journalReste: prepJournalReste,
+      avancement: prepAvancement,
       ecartBlocs: prepStats(prepBlocEcarts),
       dureeBlocs: prepStats(prepBlocDurees),
       debordementsVus: prepBlocDebordements,
@@ -1493,11 +2072,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // pas entre deux : rien ne clignote, et l'affichage est remis en place avant
   // de rendre la main.
   if (request.type === "PREPARATION_BLOCS") {
-    const sauveTexte = ligne.textContent;
-    const sauveTransform = ligne.style.transform;
-    const hauteurZone = zone.clientHeight;
+    // ⚠️ ON AUDITE LA BOITE REELLEMENT UTILISEE. Depuis l'affichage a deux
+    // lignes, mesurer `zone` reviendrait a mesurer une boite que personne ne
+    // regarde pendant la lecture : le zero serait vrai par construction, donc
+    // sans valeur.
+    const sauveHaut = ligneOrigine.textContent;
+    const sauveBas = ligneTraduite.textContent;
+    const sauveTransformHaut = ligneOrigine.style.transform;
+    const hauteurZone = boiteTraduite.clientHeight;
+    const hauteurZoneHaut = boiteOrigine.clientHeight;
 
     let debordent = 0;
+    let debordentHaut = 0;
     let hauteurMax = 0;
     let plusLong = null;
 
@@ -1506,13 +2092,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     let vide = 0; // secondes ou la boite est effacee, faute de texte a montrer
 
     for (const b of prepLectBlocs) {
-      ligne.style.transform = "";
-      ligne.textContent = b.texte;
-      const h = ligne.scrollHeight;
+      // ⚠️ ON MESURE CE QUI EST AFFICHE. Auditer le texte d'origine pendant que
+      // l'ecran montre la traduction rendrait le chiffre faux precisement dans
+      // le cas ou il compte : une traduction plus longue que sa source.
+      const affiche = prepBlocBas(b);
+      ligneTraduite.style.transform = "";
+      ligneTraduite.textContent = affiche;
+      const h = ligneTraduite.scrollHeight;
       if (h > hauteurZone) debordent++;
       if (h > hauteurMax) hauteurMax = h;
-      if (!plusLong || b.texte.length > plusLong.texte.length) {
-        plusLong = { texte: b.texte, nbMots: b.nbMots, hauteurPx: h };
+      if (!plusLong || affiche.length > plusLong.texte.length) {
+        plusLong = { texte: affiche, nbMots: b.nbMots, hauteurPx: h };
+      }
+      if (prepLectDeuxLignes) {
+        ligneOrigine.style.transform = "";
+        ligneOrigine.textContent = prepBlocHaut(b);
+        if (ligneOrigine.scrollHeight > hauteurZoneHaut) debordentHaut++;
       }
       // Le temps VISIBLE, pas la largeur du creneau : depuis l'etape du
       // 2026-08-28 un bloc s'efface quand son dernier mot est passe depuis
@@ -1520,11 +2115,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const d = Math.round((b.disparition - b.instant) * 1000);
       durees.push(d);
       vide += b.fin - b.disparition;
-      if (d < BLOC_DUREE_MIN * 1000) courts.push({ ms: d, texte: b.texte });
+      if (d < BLOC_DUREE_MIN * 1000) courts.push({ ms: d, texte: affiche });
     }
 
-    ligne.textContent = sauveTexte;
-    ligne.style.transform = sauveTransform;
+    ligneOrigine.textContent = sauveHaut;
+    ligneOrigine.style.transform = sauveTransformHaut;
+    ligneTraduite.textContent = sauveBas;
 
     sendResponse({
       success: true,
@@ -1539,11 +2135,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       nbCourts: courts.length,
       exemplesCourts: courts.slice(0, 5),
       motsMax: prepLectBlocs.reduce((m, b) => Math.max(m, b.nbMots), 0),
-      caracteresMax: prepLectBlocs.reduce((m, b) => Math.max(m, b.texte.length), 0),
+      caracteresMax: prepLectBlocs.reduce((m, b) => Math.max(m, prepBlocTexte(b).length), 0),
+      // La longueur du texte D'ORIGINE, a cote : c'est l'ecart entre les deux
+      // qui dit de combien la traduction a allonge le texte, et donc si la
+      // boite est en train de devenir trop petite.
+      caracteresMaxOrigine: prepLectBlocs.reduce((m, b) => Math.max(m, (b.texte || "").length), 0),
+      traduction: prepLectTraduction,
       hauteurZonePx: hauteurZone,
+      hauteurZoneHautPx: hauteurZoneHaut,
       hauteurMaxPx: hauteurMax,
       nbDebordent: debordent,
+      nbDebordentHaut: debordentHaut,
       debordementsVus: prepBlocDebordements,
+      // La hauteur de la BOITE, mesuree et non calculee : c'est elle que l'oeil
+      // voit bouger ou non.
+      hauteurBoitePx: subtitleBox.getBoundingClientRect().height,
+      deuxLignes: prepLectDeuxLignes,
+      blocsSansTraduction: prepBlocsSansTraduction,
       plusLong,
       // La liste, plafonnee : elle sert a verifier DEPUIS LA PAGE que le texte
       // reellement affiche est bien celui qu'on attendait, a l'heure qu'on
@@ -1551,13 +2159,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       // sur une video de deux heures -- d'ou le plafond, et d'ou `tronquee`,
       // parce qu'une liste coupee en silence ferait croire a une couverture
       // complete.
+      // ⚠️ LES DEUX TEXTES SONT RENDUS, TOUJOURS. `texte` est ce qui s'affiche,
+      // `texteOrigine` ce que Parakeet avait transcrit. C'est ce qui permet de
+      // verifier depuis la page, sans rien croire sur parole, que la traduction
+      // a bien eu lieu -- et de comparer les deux mot a mot.
       blocs: prepLectBlocs.slice(0, 400).map((b) => ({
         instant: b.instant,
         fin: b.fin,
         finParole: b.finParole,
         disparition: b.disparition,
         nbMots: b.nbMots,
-        texte: b.texte,
+        texte: prepBlocTexte(b),
+        texteOrigine: b.texte,
+        texteTraduit: b.texteTraduit || null,
       })),
       tronquee: prepLectBlocs.length > 400,
     });

@@ -1,0 +1,16 @@
+{
+  "_note": "Releve dans la console de la page test-traduction-nllb.html (window.GROS_B). Le fichier a ete ecrit a la main parce que l'appel evaluate_script qui devait le sauver a depasse le protocolTimeout de 120 s ; la valeur est celle rendue par la page.",
+  "mots": 2493,
+  "morceaux": 54,
+  "msTotal": 1366060,
+  "caracteresSortie": 11597,
+  "debut": "The death of my first stars, supermassive black holes have been feeding for billions of years on matter, gas, stars sometimes, or even other black holes.",
+  "jalons": [
+    {"morceau": 1, "cumulMs": 17823}, {"morceau": 6, "cumulMs": 154084},
+    {"morceau": 11, "cumulMs": 278470}, {"morceau": 16, "cumulMs": 391291},
+    {"morceau": 21, "cumulMs": 544488}, {"morceau": 26, "cumulMs": 660018},
+    {"morceau": 31, "cumulMs": 786718}, {"morceau": 36, "cumulMs": 909199},
+    {"morceau": 41, "cumulMs": 1023062}, {"morceau": 46, "cumulMs": 1157176},
+    {"morceau": 51, "cumulMs": 1278010}
+  ]
+}

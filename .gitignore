@@ -15,3 +15,7 @@ vendor/
 # a ete supprime a l'etape 5 en meme temps que le mode direct, et
 # scripts/fetch-model.js qui le telechargeait n'a plus de raison de tourner.
 models/
+
+# Les poids du modele de traduction, telecharges pour les mesures (870 Mo).
+# Meme regle que models/ : hors de question de les versionner.
+test-nllb-model/

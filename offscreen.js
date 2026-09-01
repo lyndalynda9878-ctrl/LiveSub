@@ -301,6 +301,67 @@ const PREP_DIVERSITE_MIN = 0.35;
 // dire quoi que ce soit.
 const PREP_BOUCLE_MOTS_MIN = 10;
 
+// ---------------------------------------------------------------------------
+// LA TRADUCTION — API Translator de Chrome, DANS CE DOCUMENT
+// ---------------------------------------------------------------------------
+//
+// Mesure du 2026-08-31 (voir mesures-traduction/RESULTATS.md) : l'API Translator
+// fonctionne ICI, dans le document offscreen, SANS le moindre clic
+// (`navigator.userActivation.isActive` vaut false et ca passe quand meme), a une
+// condition et une seule : que la paire soit DEJA INSTALLEE. Une paire absente
+// leve `NotAllowedError: Requires a user gesture when availability is
+// "downloading" or "downloadable"`, et aucun geste n'arrivera jamais ici.
+//
+// D'ou le partage des roles, qui n'est pas un choix de style :
+//   - le POPUP telecharge la paire, au clic sur Demarrer (le seul endroit ou
+//     l'activation existe) ;
+//   - l'OFFSCREEN traduit, sans jamais telecharger quoi que ce soit.
+//
+// ⚠️ ON NE TRADUIT PAS MOT A MOT, ET C'EST LA CONTRAINTE CENTRALE. Les instants
+// de Parakeet sont PAR MOT ; une traduction n'a ni le meme nombre de mots ni le
+// meme ordre. Aligner les mots traduits sur les instants d'origine reviendrait a
+// INVENTER des horodatages. On traduit donc par SEGMENT DE PHRASE, et le segment
+// traduit herite des heures du segment d'origine — la premiere et la derniere,
+// mesurees, pas calculees.
+//
+// ⚠️ LE TEXTE D'ORIGINE N'EST JAMAIS ECRASE. `prepMots` continue de recevoir les
+// mots de Parakeet avec leurs instants, exactement comme avant ; les segments
+// traduits vivent A COTE, dans `prepSegments`, et portent les DEUX textes.
+
+// Les bornes du decoupage en segments. Elles reprennent l'esprit de celles de
+// content.js (BLOC_MOTS_MAX, BLOC_CARACTERES_MAX...) mais sont VOLONTAIREMENT
+// PLUS SERREES sur les caracteres : 70 ici contre 84 la-bas.
+//
+// Pourquoi : content.js peut re-couper un bloc trop long, il a les instants de
+// chaque mot. Sur du texte traduit, PERSONNE ne peut le faire — il n'y a plus
+// d'instant a l'interieur du segment. La seule marge disponible est donc en
+// amont, sur la longueur de la SOURCE, et il en faut : de l'anglais vers le
+// francais le texte s'allonge. Le debordement reste MESURE, pas suppose :
+// content.js le compte (`nbDebordent`, `debordementsVus`) et le dit.
+const TRAD_SEG_MOTS = 10;
+const TRAD_SEG_CARACTERES = 70;
+const TRAD_SEG_MOTS_ABSOLU = 14;
+const TRAD_SEG_CARACTERES_ABSOLU = 84;
+const TRAD_SEG_VIRGULE_MOTS = 6;
+
+const TRAD_FERMETURES = ['"', '»', ')', ']'];
+const TRAD_FORTE = '.!?…';
+const TRAD_FAIBLE = ',;:';
+
+// Combien de mots avant de verifier que la langue declaree est bien celle qu'on
+// entend. En dessous, la detection n'est pas fiable : mesure le 2026-08-31,
+// `chrome.i18n.detectLanguage` rend `isReliable: false` sur une phrase de 8 mots
+// et `true` sur 30.
+const TRAD_VERIF_MOTS_MIN = 20;
+
+let prepTraduction = null;    // { source, cible }, ou null : pas de traduction
+let prepTraducteur = null;    // l'objet Translator, cree une fois au demarrage
+let prepSegments = [];        // [{ instant, finParole, nbMots, texteOrigine, texteTraduit }]
+let prepTradMs = 0;           // temps total passe a traduire
+let prepTradAppels = 0;
+let prepTradEchecs = [];      // les segments qui n'ont PAS pu etre traduits
+let prepTradVerif = null;     // { declaree, entendue, fiable, accord }
+
 let prepActif = false;
 let prepContext = null;
 let prepStream = null;
@@ -439,6 +500,30 @@ let prepChargement = null;
 // a chaque bloc, de combien la transcription est en retard sur le defilement.
 let prepDepartHorloge = 0;
 
+// ---------------------------------------------------------------------------
+// LE SIGNE DE VIE — ce qui distingue « c'est long » de « c'est bloque »
+// ---------------------------------------------------------------------------
+//
+// ⚠️ Le chien de garde de content.js surveillait LE TEMPS QUI PASSE. Sur une
+// video de 8 minutes la file met normalement plusieurs minutes a se vider, et
+// il tuait une preparation en bonne sante. Une file longue n'est pas une panne.
+//
+// Ce qu'il faut surveiller, c'est le TRAVAIL QUI AVANCE. Ces deux marqueurs
+// sont la matiere de cette surveillance, et rien d'autre ne les remplace :
+// `prepBlocsVus` bouge quand un bloc PART, `prepTemoins.length` quand un bloc
+// REVIENT. Un moteur bloque laisse les deux immobiles.
+let prepDernierBlocFini = 0;   // Date.now() du dernier bloc transcrit
+let prepDernierBlocDebut = 0;  // Date.now() du dernier bloc pris dans la file
+
+// ⚠️ DEUX COMPTEURS DE CONTENU, ET IL FAUT LES DEUX.
+//
+// `prepConsommes` avance quand un bloc PART vers le moteur ; ce compteur-ci
+// n'avance que quand il EN REVIENT. Les rapporter l'un a l'autre au meme
+// `msMoteur` donnerait un debit faux d'un bloc entier -- mesure du
+// 2026-08-31 : 2,456 au lieu de ~1,2 apres un seul bloc, parce que deux blocs
+// etaient comptes comme contenu pour un seul compte comme travail.
+let prepContenuTranscritS = 0;
+
 function prepStatut(texte) {
   console.log("💬 Preparation :", texte);
   chrome.runtime.sendMessage({ type: "PREPARATION_STATUT", texte }).catch(() => {});
@@ -459,12 +544,22 @@ function prepReinitialiser() {
   prepMemoireWasmMo = null;
   prepBlocsVus = 0;
   prepDepartHorloge = 0;
+  prepDernierBlocFini = 0;
+  prepDernierBlocDebut = 0;
+  prepContenuTranscritS = 0;
   prepArretDemande = false;
   prepDepartConfirme = false;
   prepPositionDepart = 0;
   prepAncres = [];
   prepContexteAudio = new Float32Array(0);
   prepAttentes.clear();
+  // La traduction : le traducteur lui-meme est referme par arreterPreparation.
+  prepTraduction = null;
+  prepSegments = [];
+  prepTradMs = 0;
+  prepTradAppels = 0;
+  prepTradEchecs = [];
+  prepTradVerif = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1133,163 @@ function prepEstSilence(brut) {
   return rms < PREP_SILENCE_RMS && crete < PREP_SILENCE_CRETE;
 }
 
+// ---------------------------------------------------------------------------
+// Du stock de mots aux SEGMENTS DE PHRASE a traduire
+// ---------------------------------------------------------------------------
+//
+// Une seule passe, gloutonne, sur les mots NEUFS d'un bloc. L'ordre des
+// questions est la regle, comme dans content.js :
+//   1. la borne dure (un segment trop long deborderait la boite, et sur du
+//      texte traduit personne ne pourra le recouper) ;
+//   2. la ponctuation forte (une phrase finie est une unite de traduction --
+//      et c'est aussi ce qui donne au traducteur une phrase entiere) ;
+//   3. la virgule, si le segment est deja long ;
+//   4. les bornes hautes.
+//
+// ⚠️ Le decoupage se fait par BLOC AUDIO, pas sur le stock complet. C'est sans
+// danger ici : un bloc plein est coupe DANS UN SILENCE (prepTailleJusquAuSilence),
+// donc une phrase ne le traverse quasiment jamais.
+function prepFinitPar(mot, signes) {
+  let i = mot.length - 1;
+  if (i >= 0 && TRAD_FERMETURES.indexOf(mot.charAt(i)) !== -1) i--;
+  return i >= 0 && signes.indexOf(mot.charAt(i)) !== -1;
+}
+
+function prepDecouperEnPhrases(mots) {
+  const segments = [];
+  if (!Array.isArray(mots) || !mots.length) return segments;
+
+  let debut = 0;
+  let caracteres = 0;
+
+  for (let i = 0; i < mots.length; i++) {
+    const texte = String(mots[i].mot || "");
+    caracteres += (i > debut ? 1 : 0) + texte.length; // le +1 est l'espace
+    const nb = i - debut + 1;
+
+    let couper;
+    if (nb >= TRAD_SEG_MOTS_ABSOLU || caracteres >= TRAD_SEG_CARACTERES_ABSOLU) {
+      couper = true;
+    } else if (prepFinitPar(texte, TRAD_FORTE)) {
+      couper = true;
+    } else if (prepFinitPar(texte, TRAD_FAIBLE) && nb >= TRAD_SEG_VIRGULE_MOTS) {
+      couper = true;
+    } else {
+      couper = nb >= TRAD_SEG_MOTS || caracteres >= TRAD_SEG_CARACTERES;
+    }
+
+    if (couper || i === mots.length - 1) {
+      segments.push({
+        // ⚠️ LES DEUX HEURES VIENNENT DES MOTS D'ORIGINE, ET DE NULLE PART
+        // AILLEURS. Le segment traduit les herite tels quels : c'est tout le
+        // contrat, et c'est ce qui interdit d'inventer un instant par mot
+        // traduit.
+        instant: mots[debut].instant,
+        finParole: mots[i].instant,
+        nbMots: nb,
+        texteOrigine: mots.slice(debut, i + 1).map((m) => m.mot).join(" "),
+        texteTraduit: null,
+      });
+      debut = i + 1;
+      caracteres = 0;
+    }
+  }
+  return segments;
+}
+
+// ---------------------------------------------------------------------------
+// Traduire les segments d'un bloc
+// ---------------------------------------------------------------------------
+//
+// ⚠️ AUCUN REPLI SILENCIEUX. Un segment qui ne se traduit pas garde
+// `texteTraduit: null` -- content.js affichera donc son texte D'ORIGINE, ce qui
+// est la seule chose honnete a faire -- mais l'echec est ECRIT trois fois : dans
+// la console, dans le bandeau de statut, et dans le resume que lit la popup.
+// « Ca s'affiche quand meme » ne doit jamais pouvoir passer pour « ca marche ».
+async function prepTraduireSegments(nouveaux) {
+  if (!prepTraducteur || !nouveaux.length) return;
+
+  const segments = prepDecouperEnPhrases(nouveaux);
+  const t0 = performance.now();
+
+  for (const seg of segments) {
+    try {
+      seg.texteTraduit = await prepTraducteur.translate(seg.texteOrigine);
+      prepTradAppels++;
+    } catch (err) {
+      seg.texteTraduit = null;
+      prepTradEchecs.push({
+        instant: seg.instant,
+        texteOrigine: seg.texteOrigine,
+        erreur: `${err && err.name}: ${err && err.message}`,
+      });
+      console.error(
+        `❌ Preparation : traduction ECHOUEE a ${seg.instant.toFixed(1)} s — ` +
+          `${err && err.name}: ${err && err.message}\n   texte non traduit : « ${seg.texteOrigine} »`
+      );
+      prepStatut(`❌ ${prepTradEchecs.length} segment(s) non traduits`);
+    }
+  }
+
+  prepTradMs += Math.round(performance.now() - t0);
+  prepSegments.push(...segments);
+}
+
+// ---------------------------------------------------------------------------
+// La langue declaree est-elle celle qu'on entend ?
+// ---------------------------------------------------------------------------
+//
+// ⚠️ `chrome.i18n` N'EXISTE PAS DANS UN DOCUMENT OFFSCREEN. Verifie le
+// 2026-08-31 : `typeof chrome.i18n === "undefined"` ici, exactement comme
+// `chrome.storage`. La detection se fait donc dans le service worker, qui l'a,
+// et le resultat revient par message.
+//
+// On ne corrige RIEN tout seul : la paire a ete choisie dans la popup, c'est
+// elle qui fait foi. On constate, et on le dit.
+async function prepVerifierLangue() {
+  if (!prepTraduction || prepTradVerif) return;
+  if (prepMots.length < TRAD_VERIF_MOTS_MIN) return;
+
+  const texte = prepMots.map((m) => m.mot).join(" ");
+  let reponse = null;
+  try {
+    reponse = await chrome.runtime.sendMessage({
+      type: "PREPARATION_DETECTER_LANGUE",
+      texte,
+    });
+  } catch (err) {
+    console.warn("⚠️ Preparation : detection de langue injoignable —", err && err.message);
+    return;
+  }
+  if (!reponse || !reponse.success) return;
+
+  const entendue = reponse.langue || null;
+  const accord = entendue === prepTraduction.source;
+  prepTradVerif = {
+    declaree: prepTraduction.source,
+    entendue,
+    fiable: Boolean(reponse.fiable),
+    accord,
+    surMots: prepMots.length,
+  };
+
+  if (accord) {
+    console.log(
+      `🗣️ Preparation : langue declaree « ${prepTraduction.source} » CONFIRMEE ` +
+        `sur ${prepMots.length} mots (detectee « ${entendue} », fiable ${reponse.fiable}).`
+    );
+    return;
+  }
+
+  console.error(
+    `❌ Preparation : LANGUE DECLAREE FAUSSE. Tu as choisi « ${prepTraduction.source} », ` +
+      `on entend « ${entendue} » (fiable ${reponse.fiable}, sur ${prepMots.length} mots). ` +
+      `La traduction ${prepTraduction.source} → ${prepTraduction.cible} continue avec la paire choisie, ` +
+      `et son texte sera faux.`
+  );
+  prepStatut(`❌ Langue déclarée « ${prepTraduction.source} », entendue « ${entendue} »`);
+}
+
 async function prepTraiterBloc(taille) {
   // Les deux bornes du bloc, EN ECHANTILLONS CAPTES depuis le debut : c'est le
   // repere de la table des ancres. On les releve avant de consommer.
@@ -1055,6 +1307,7 @@ async function prepTraiterBloc(taille) {
   if (!brut.length) return;
 
   prepBlocsVus++;
+  prepDernierBlocDebut = Date.now();
   prepConsommes += brut.length;
   const dureeBloc = prepSecondesContenu(brut.length);
 
@@ -1130,6 +1383,8 @@ async function prepTraiterBloc(taille) {
   const enBoucle = prepEstBoucle(nouveaux);
 
   prepTemoins.push(ms);
+  prepDernierBlocFini = Date.now();
+  prepContenuTranscritS += dureeBloc;
 
   // ⚠️ GARDE-FOU 2 sur 2 : LE RADOTAGE (prepEstBoucle). C'est le seul endroit
   // de ce fichier ou du texte est jete.
@@ -1216,6 +1471,24 @@ async function prepTraiterBloc(taille) {
       `| reech ${msReech} ms | video +${avanceVideo.toFixed(1)} s ` +
       `| file ${fileS.toFixed(1)} s | retard ${retard >= 0 ? "+" : ""}${retard.toFixed(1)} s`
   );
+
+  // ⚠️ LA TRADUCTION EST FAITE ICI, ET APRES LE JOURNAL DU BLOC. Ce n'est pas
+  // cosmetique : le journal ci-dessus garde ainsi exactement le meme sens
+  // qu'avant la traduction (`ms` reste le temps de TRANSCRIPTION seul), et le
+  // cout de la traduction se lit sur sa propre ligne. Deux chiffres separes se
+  // comparent ; un seul chiffre melange ne se compare a rien.
+  if (prepTraducteur) {
+    const t0 = performance.now();
+    const avant = prepSegments.length;
+    await prepTraduireSegments(nouveaux);
+    await prepVerifierLangue();
+    console.log(
+      `🌍 Preparation : bloc ${prepBlocsVus} traduit — ` +
+        `${prepSegments.length - avant} segment(s), ${Math.round(performance.now() - t0)} ms ` +
+        `(${prepTraduction.source} → ${prepTraduction.cible}) ` +
+        `| cumul ${(prepTradMs / 1000).toFixed(1)} s | echecs ${prepTradEchecs.length}`
+    );
+  }
 
   // Aucun filtre anti-hallucination ici, et c'est deliberé : un filtre qui
   // jette un bloc de 30 s rendrait faux le seul controle simple dont on
@@ -1325,6 +1598,17 @@ async function prepViderFile() {
 // deroulant de la popup, retire a l'etape 5 en meme temps que le mode direct.
 //
 // `options` ne porte plus que `streamId`.
+// Rendre le traducteur. Il vit dans le processus de TranslateKit, pas dans
+// celui-ci : mesure du 2026-08-31, un traducteur en service coute ~97 Mio dans
+// un processus a part. Le laisser ouvert ne ferait pas tomber l'extension, mais
+// il n'y a aucune raison de le garder entre deux preparations.
+function prepFermerTraducteur() {
+  if (prepTraducteur) {
+    try { if (prepTraducteur.destroy) prepTraducteur.destroy(); } catch (e) { /* deja ferme */ }
+    prepTraducteur = null;
+  }
+}
+
 async function demarrerPreparation(options) {
   if (prepActif) {
     console.log("ℹ️ Preparation deja en cours");
@@ -1353,6 +1637,58 @@ async function demarrerPreparation(options) {
     const erreur = new Error(prepMessageModeleManquant(soucisModele));
     erreur.modeleIncomplet = true;
     throw erreur;
+  }
+
+  // ---------------------------------------------------------------------
+  // LE TRADUCTEUR, AVANT TOUT LE RESTE — et il a le droit de tout arreter
+  // ---------------------------------------------------------------------
+  //
+  // Meme regle que pour les cinq fichiers du modele : on echoue AVANT d'ouvrir
+  // un flux, AVANT d'instancier un worker, et surtout avant que la moindre
+  // barre de progression ait pu demarrer.
+  //
+  // ⚠️ AUCUN REPLI VERS « pas de traduction ». Si la paire n'est pas la, la
+  // preparation ne demarre pas. Une preparation qui tourne dix minutes pour
+  // rendre du texte non traduit, alors qu'on a demande une traduction, serait
+  // le pire des resultats : celui qui a l'air de marcher.
+  const demande = options && options.traduction;
+  if (demande && demande.cible) {
+    if (!("Translator" in self)) {
+      const e = new Error(
+        "La traduction est impossible : ce Chrome n'a pas l'API Translator." +
+          "\n" +
+          "Il faut Chrome 138 ou plus recent."
+      );
+      e.traductionImpossible = true;
+      throw e;
+    }
+    const t0 = performance.now();
+    try {
+      prepTraducteur = await Translator.create({
+        sourceLanguage: demande.source,
+        targetLanguage: demande.cible,
+      });
+    } catch (err) {
+      // L'erreur ENTIERE, pas un resume : c'est elle qui distingue « la paire
+      // n'est pas installee » (NotAllowedError) de « Chrome ne sait pas
+      // traduire cette paire » (NotSupportedError), et les deux ne se reglent
+      // pas pareil.
+      const e = new Error(
+        `La traduction ${demande.source} → ${demande.cible} n'a pas pu démarrer.\n` +
+          `${(err && err.name) || "Erreur"} : ${(err && err.message) || err}\n` +
+          `Relance depuis la popup : c'est le clic sur Démarrer qui installe la paire.`
+      );
+      e.traductionImpossible = true;
+      throw e;
+    }
+    prepTraduction = { source: demande.source, cible: demande.cible };
+    console.log(
+      `🌍 Preparation : traducteur ${demande.source} → ${demande.cible} pret en ` +
+        `${Math.round(performance.now() - t0)} ms ` +
+        `(activation utilisateur : ${navigator.userActivation ? navigator.userActivation.isActive : "?"})`
+    );
+  } else {
+    console.log("🌍 Preparation : aucune traduction demandée — texte d'origine seul.");
   }
 
   // Le modele d'abord : il met du temps a charger, autant qu'il commence
@@ -1449,6 +1785,7 @@ async function demarrerPreparation(options) {
     prepSource = null;
     prepNoeud = null;
     prepActif = false;
+    prepFermerTraducteur();
     throw err; // -> background.js -> PREPARATION_RESTAURER { erreur } -> « ❌ » a l'ecran
   }
 
@@ -1520,6 +1857,7 @@ async function arreterPreparation() {
   prepSource = null;
   prepNoeud = null;
   prepActif = false;
+  prepFermerTraducteur();
 
   const apres = Math.round((Date.now() - heureFinVideo) / 1000);
   console.log(
@@ -1549,6 +1887,31 @@ async function arreterPreparation() {
         ? "Aucun filtre de texte n'a mordu."
         : "⚠️ Au moins un filtre a mordu : lire les lignes 🔁 / ⚠️ ci-dessus.")
   );
+  // ⚠️ LE BILAN DE LA TRADUCTION, ET IL DIT AUSSI CE QUI N'A PAS MARCHE. Un
+  // compte d'echecs a zero est une MESURE ; pas de ligne du tout ne prouverait
+  // rien.
+  if (prepTraduction) {
+    console.log(
+      `🌍 Preparation, traduction ${prepTraduction.source} → ${prepTraduction.cible} : ` +
+        `${prepSegments.length} segment(s), ${prepTradAppels} traduits, ` +
+        `${prepTradEchecs.length} en echec, ${(prepTradMs / 1000).toFixed(1)} s au total ` +
+        `(${prepSegments.length ? Math.round(prepTradMs / prepSegments.length) : 0} ms par segment).`
+    );
+    if (prepTradEchecs.length) {
+      console.error(
+        `❌ Preparation : ${prepTradEchecs.length} segment(s) NON TRADUITS — ` +
+          `ils s'afficheront dans la langue d'origine :\n` +
+          prepTradEchecs.map((e) => `   ${e.instant.toFixed(1)} s — ${e.erreur} — « ${e.texteOrigine} »`).join("\n")
+      );
+    }
+    if (prepTradVerif && !prepTradVerif.accord) {
+      console.error(
+        `❌ Preparation : la langue declaree (« ${prepTradVerif.declaree} ») n'est PAS celle ` +
+          `qu'on entend (« ${prepTradVerif.entendue} », fiable ${prepTradVerif.fiable}).`
+      );
+    }
+  }
+
   console.log(
     `✅ Preparation terminee : ${resume.nbMots} mots, ` +
       `${resume.dureeCouverteS.toFixed(1)} s couvertes, ` +
@@ -1612,6 +1975,24 @@ function prepResume() {
     premiersMots: prepMots.slice(0, 30),
     // Temoin de seance : au-dela de 15 % de derive, la mesure est a jeter.
     temoins: { premierMs: premier, dernierMs: dernier, derivePourcent: derive, tous: prepTemoins },
+    // La traduction. `null` quand aucune n'a ete demandee -- et c'est ce `null`
+    // qui prouve, au critere 3, qu'aucune traduction ne s'est declenchee.
+    traduction: prepTraduction
+      ? {
+          source: prepTraduction.source,
+          cible: prepTraduction.cible,
+          nbSegments: prepSegments.length,
+          nbTraduits: prepTradAppels,
+          nbEchecs: prepTradEchecs.length,
+          msTotal: prepTradMs,
+          msParSegment: prepSegments.length ? Math.round(prepTradMs / prepSegments.length) : 0,
+          echecs: prepTradEchecs.slice(0, 20),
+          verification: prepTradVerif,
+          // Contre-preuve lisible sans la console de l'offscreen : les trois
+          // premiers segments, avec LEURS DEUX TEXTES.
+          premiersSegments: prepSegments.slice(0, 3),
+        }
+      : null,
   };
 }
 
@@ -1639,7 +2020,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           // echoue » decrit bien les autres pannes, mais pas celle-la : la
           // capture n'a pas echoue, on ne l'a jamais demarree. Et le prefixe
           // couterait 35 caracteres au message qui doit, lui, dire trois choses.
-          error: err && err.modeleIncomplet ? brut : "La capture silencieuse a echoue : " + brut,
+          error:
+            err && (err.modeleIncomplet || err.traductionImpossible)
+              ? brut
+              : "La capture silencieuse a echoue : " + brut,
         });
       });
     return true;
@@ -1692,11 +2076,77 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // les bornes de la zone preparee (c'est elle, et pas l'instant du dernier mot,
 // qui dit jusqu'ou l'affichage peut promettre quelque chose : une fin de video
 // silencieuse est preparee sans porter un seul mot).
+// ---------------------------------------------------------------------------
+// L'AVANCEMENT — l'instrument, et la matiere du chien de garde
+// ---------------------------------------------------------------------------
+//
+// ⚠️ CE N'EST PAS UNE BARRE DE PROGRESSION. Une barre ne prouve que l'ecoulement
+// du temps (CLAUDE.md, et ca a deja menti une fois : la pompe se tuait
+// elle-meme et la barre avancait normalement jusqu'au bout). Ce message rend
+// des COMPTEURS DE TRAVAIL : combien de blocs sont partis, combien sont
+// revenus, combien de contenu attend encore, et depuis quand rien n'a bouge.
+//
+// C'est ce que content.js interroge pour repondre a la seule question qui
+// compte : « ca avance, ou c'est bloque ? » — les deux appellent des reactions
+// opposees, et le temps ecoule ne permet pas de les distinguer.
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "PREPARATION_PROGRES_OFFSCREEN") {
+    const maintenant = Date.now();
+    const contenuTraiteS = prepSecondesContenu(prepConsommes);
+    const horlogeS = prepDepartHorloge ? (maintenant - prepDepartHorloge) / 1000 : 0;
+    // Le temps ou le moteur a REELLEMENT travaille : la somme des durees de
+    // transcription, plus celle des traductions. Les blocs silencieux n'y
+    // figurent pas, et c'est juste : ils ne lui ont rien coute.
+    const msMoteur = prepTemoins.reduce((a, b) => a + b, 0) + prepTradMs;
+    sendResponse({
+      success: true,
+      actif: prepActif,
+      arretDemande: prepArretDemande,
+      workerVivant: prepWorker !== null,
+      workerPret: prepWorkerPret,
+      // Les deux compteurs de travail. C'est leur IMMOBILITE, et elle seule,
+      // qui vaut panne.
+      blocsPartis: prepBlocsVus,
+      blocsTermines: prepTemoins.length,
+      // Le contenu, en secondes de video.
+      contenuTraiteS: Number(contenuTraiteS.toFixed(2)),
+      fileS: Number(prepSecondesContenu(prepEnAttente).toFixed(2)),
+      // ⚠️ DEUX DEBITS, ET ILS NE MESURENT PAS LA MEME CHOSE.
+      //
+      // `debitHorlogeS` = contenu consomme / temps d'horloge. C'est la vitesse
+      // a laquelle le contenu DEFILE. Au demarrage la file est vide et le
+      // moteur attend la video : ce rapport vaut alors ~2 (la vitesse du
+      // defilement) et ne dit RIEN de ce que le moteur sait faire. Mesure du
+      // 2026-08-31 : il annoncait 251 s de travail restant la ou il en restait
+      // 480. Il est garde parce qu'il decrit le defilement, pas pour estimer.
+      //
+      // `debitMoteurS` = contenu consomme / temps ou le MOTEUR a reellement
+      // travaille. C'est la capacite du moteur, et c'est elle qui borne la
+      // vidange de la file. C'est celui-la qu'il faut pour estimer.
+      debitHorlogeS: horlogeS > 0 ? Number((contenuTraiteS / horlogeS).toFixed(3)) : null,
+      msMoteur: msMoteur,
+      contenuTranscritS: Number(prepContenuTranscritS.toFixed(2)),
+      debitS: msMoteur > 0 ? Number((prepContenuTranscritS / (msMoteur / 1000)).toFixed(3)) : null,
+      msDepuisDernierBlocFini: prepDernierBlocFini ? maintenant - prepDernierBlocFini : null,
+      msDepuisDernierBlocDebut: prepDernierBlocDebut ? maintenant - prepDernierBlocDebut : null,
+      // De quoi voir, depuis n'importe quelle console, que le stock se remplit.
+      nbMots: prepMots.length,
+      nbSegments: prepSegments.length,
+      positionDepart: prepPositionDepart,
+    });
+    return;
+  }
+
   if (request.type === "PREPARATION_STOCK_OFFSCREEN") {
     sendResponse({
       success: true,
+      // ⚠️ `mots` EST INCHANGE : les mots de Parakeet, avec leurs instants par
+      // mot. La traduction ne le remplace pas, elle s'ajoute a cote.
       mots: prepMots,
+      // Vide quand aucune traduction n'a ete demandee -- content.js retombe
+      // alors sur son propre decoupage, exactement comme avant.
+      segments: prepSegments,
+      traduction: prepTraduction,
       positionDepart: prepPositionDepart,
       dureeCouverteS: Math.max(0, prepPositionDe(prepConsommes) - prepPositionDepart),
     });

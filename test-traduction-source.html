@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>LiveSub - texte source pour la mesure de traduction</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 20px; }
+    pre { background: #f8f9fa; border: 1px solid #e5e7eb; padding: 12px; white-space: pre-wrap; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Texte source — transcription reelle de test/extrait-fr-dur.wav</h1>
+  <p>Cette page ne fait que RELIRE le moteur de production (parakeet.worker.js)
+     pour obtenir le texte qui servira de matiere aux deux candidats a la
+     traduction. Elle ne modifie rien.</p>
+  <div id="etat">demarrage...</div>
+  <h2>Texte (derive de res.words, jamais de utterance_text)</h2>
+  <pre id="texte">—</pre>
+  <h2>Journal</h2>
+  <pre id="log">—</pre>
+  <script type="module" src="test-traduction-source.js"></script>
+</body>
+</html>

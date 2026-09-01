@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>LiveSub - candidat A : API Translator (page d'extension, clic garanti)</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1000px; margin: 30px auto; padding: 0 20px; color: #1f2937; }
+    h1 { font-size: 19px; color: #4f46e5; }
+    h2 { font-size: 14px; color: #4f46e5; margin-top: 22px; }
+    button { font-size: 15px; padding: 10px 16px; margin: 4px 6px 4px 0; cursor: pointer; }
+    pre { background: #f8f9fa; border: 1px solid #e5e7eb; padding: 12px; white-space: pre-wrap;
+          font-family: Consolas, monospace; font-size: 12px; line-height: 1.5; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <h1>Candidat A — API Translator de Chrome, contexte A3 : page d'extension a bouton</h1>
+  <p>Le clic sur les boutons ci-dessous est un vrai clic : l'activation utilisateur est donc GARANTIE.</p>
+
+  <button id="btnSonde">1. Sonde (presence + availability des 3 paires)</button>
+  <button id="btnTraduire">2. create() + traduire mon texte (3 paires)</button>
+  <br>
+  <button id="btnP0">2a. fr-&gt;en (clic propre)</button>
+  <button id="btnP1">2b. en-&gt;fr (clic propre)</button>
+  <button id="btnP2">2c. fr-&gt;ar (clic propre)</button>
+  <button id="btnDetecteur">3. LanguageDetector</button>
+  <button id="btnGros">4. Traduire l'equivalent de 2493 mots</button>
+  <br>
+  <button id="btnVoletA1">Volet A — create() IMMEDIATEMENT apres ce clic (en-&gt;es, downloadable)</button>
+  <button id="btnVoletA2">Volet A — create() 10 s APRES ce clic, sans nouveau clic (en-&gt;nl, downloadable)</button>
+  <button id="btnVoletA3">Volet A — 10 s apres, mais paire DEJA installee (en-&gt;fr)</button>
+  <button id="btnJa">Premier telechargement REEL — create() en-&gt;ja (jamais installe ici)</button>
+  <br>
+  <button id="btnHorsLigne">Volet B — retraduire (reseau coupe par l'outil)</button>
+
+  <h2>Journal</h2>
+  <pre id="log">pret.</pre>
+
+  <script type="module" src="test-traduction-a3.js"></script>
+</body>
+</html>

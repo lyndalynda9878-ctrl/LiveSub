@@ -187,7 +187,7 @@ async function prepEtatReel() {
 // Sans l'etape 4 en dernier, la seconde ou deux captees entre 2 et 3 (video
 // encore a x1, ou a l'arret) seraient traitees comme du x2 et decaleraient
 // tous les instants du stock.
-async function doPreparationDemarrer() {
+async function doPreparationDemarrer(traduction) {
   const deja = await prepEtatReel();
   if (deja.active) {
     console.log("ℹ️ Preparation deja en cours sur l'onglet", deja.tabId);
@@ -223,9 +223,15 @@ async function doPreparationDemarrer() {
     // Parakeet la detecte seul, son vocabulaire ne contient aucun jeton de
     // langue. Et plus de verdict de backend : c'etait la mesure GPU/CPU de
     // Whisper.
+    // ⚠️ LA PAIRE VIENT DE LA POPUP, ET DE NULLE PART AILLEURS. Elle n'est pas
+    // relue dans le storage ici : c'est la popup qui vient de l'INSTALLER, au
+    // clic, dans le seul contexte ou l'activation utilisateur existe. Relire le
+    // storage rendrait possible un decalage entre la paire installee et la
+    // paire demandee -- exactement le genre d'ecart qui ne se voit pas.
     const reponse = await chrome.runtime.sendMessage({
       type: "START_PREPARATION",
       streamId,
+      traduction: traduction || null,
     });
     if (!reponse || !reponse.success) {
       throw new Error((reponse && reponse.error) || "Le module audio n'a pas confirme la capture");
@@ -253,12 +259,18 @@ async function doPreparationDemarrer() {
       })
       .catch(() => {});
 
-    console.log(`✅ Preparation lancee sur l'onglet ${tabId} a x${PREP_VITESSE}`);
+    console.log(
+      `✅ Preparation lancee sur l'onglet ${tabId} a x${PREP_VITESSE}` +
+        (traduction && traduction.cible
+          ? ` — traduction ${traduction.source} → ${traduction.cible}`
+          : " — sans traduction")
+    );
     return prepEcrireEtat({
       active: true,
       tabId,
       depart: pilote.position,
       duree: pilote.duree,
+      traduction: traduction || null,
     });
   } catch (error) {
     console.error("❌ Preparation :", error);
@@ -333,8 +345,8 @@ async function doPreparationArreter() {
 
 // Les deux operations passent par la file : deux demarrages lances coup sur
 // coup ne peuvent pas se croiser et ouvrir deux captures sur le meme onglet.
-function preparationDemarrer() {
-  return serializeCapture(doPreparationDemarrer);
+function preparationDemarrer(traduction) {
+  return serializeCapture(() => doPreparationDemarrer(traduction));
 }
 
 function preparationArreter() {
@@ -360,7 +372,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 // deux ; les types ne se recouvrent pas, donc un seul repond.
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "PREPARATION_DEMARRER") {
-    preparationDemarrer().then(sendResponse);
+    preparationDemarrer(request.traduction || null).then(sendResponse);
     return true;
   }
 
@@ -394,6 +406,34 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return; // pas de reponse attendue
   }
 
+  // ---------------------------------------------------------------------
+  // Le detecteur de langue, prete au document offscreen
+  // ---------------------------------------------------------------------
+  //
+  // ⚠️ `chrome.i18n` N'EXISTE PAS dans un document offscreen. Verifie dans
+  // Chrome le 2026-08-31 : `typeof chrome.i18n === "undefined"` la-bas, comme
+  // `chrome.storage`. C'est la MEME famille de piege, et elle a deja tout casse
+  // une fois. Le service worker, lui, l'a : il fait donc le travail et renvoie
+  // la reponse.
+  //
+  // 100 % local : `chrome.i18n.detectLanguage` est le detecteur compact
+  // embarque dans Chrome. Aucune requete ne sort.
+  if (request.type === "PREPARATION_DETECTER_LANGUE") {
+    chrome.i18n
+      .detectLanguage(String(request.texte || ""))
+      .then((r) => {
+        const premier = r && r.languages && r.languages[0];
+        sendResponse({
+          success: true,
+          langue: premier ? premier.language : null,
+          pourcentage: premier ? premier.percentage : null,
+          fiable: Boolean(r && r.isReliable),
+        });
+      })
+      .catch((err) => sendResponse({ success: false, error: String((err && err.message) || err) }));
+    return true;
+  }
+
   // Lecture du stock prepare (verification maintenant, etape B plus tard).
   if (request.type === "PREPARATION_STOCK") {
     chrome.runtime
@@ -415,6 +455,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // celui qui repart ne doivent pas pouvoir etre confondus si un jour un autre
 // contexte ecoute.
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // L'avancement, demande par content.js. Meme chemin que le stock : un content
+  // script n'a aucun canal direct vers un document offscreen, le service worker
+  // relaie.
+  if (request.type === "PREPARATION_PROGRES") {
+    chrome.runtime
+      .sendMessage({ type: "PREPARATION_PROGRES_OFFSCREEN" })
+      .then(sendResponse)
+      // ⚠️ Un `.catch` qui REPOND, toujours. Ici il porte en plus une
+      // information : si l'offscreen ne repond plus, c'est un fait, et c'est
+      // exactement ce que le chien de garde a besoin de savoir.
+      .catch((err) =>
+        sendResponse({ success: false, injoignable: true, error: String((err && err.message) || err) })
+      );
+    return true;
+  }
+
   if (request.type === "PREPARATION_STOCK_COMPLET") {
     chrome.runtime
       .sendMessage({ type: "PREPARATION_STOCK_OFFSCREEN" })

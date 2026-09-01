@@ -92,6 +92,15 @@
          plancher, pas un plafond : la popup s'agrandit pour le message. */
       white-space: pre-line;
     }
+    /* La devinette de langue de depart : on DIT qu'elle est une devinette, et
+       d'ou elle vient. Un menu pre-rempli sans explication passe pour un fait. */
+    #tradAide {
+      font-size: 11px;
+      color: #999;
+      margin: -8px 0 12px 0;
+      line-height: 1.35;
+      min-height: 1.2em;
+    }
     #status {
       margin-top: 10px;
       font-size: 12px;
@@ -127,6 +136,25 @@
        - la case AFFICHER LA FIN PROVISOIRE : elle decrivait LocalAgreement-2
          (texte stable confirme par deux passes / fin encore incertaine), un
          mecanisme du moteur en flux qui n'existe plus. -->
+  <!-- ⚠️ LE MENU PORTE LA PAIRE, PAS SEULEMENT LA CIBLE, et ce n'est pas un
+       reglage de plus : c'est une CONTRAINTE DE L'API, mesuree le 2026-08-31.
+       `Translator.create()` exige une langue source valide --
+       `sourceLanguage: "auto"` leve `RangeError: Invalid language tag: auto`,
+       une source omise leve `TypeError: Required member is undefined`. Et
+       Parakeet, lui, ne dit JAMAIS quelle langue il a entendue : son
+       vocabulaire ne contient aucun jeton de langue.
+
+       La langue de depart est donc PRE-REMPLIE PAR UNE DEVINETTE (le titre de
+       l'onglet passe a chrome.i18n.detectLanguage, 100 % local), et verifiee
+       APRES coup sur la vraie transcription. La devinette ne decide rien : elle
+       remplit une case que tu peux corriger. -->
+  <label for="tradSource">Langue parlée dans la vidéo</label>
+  <select id="tradSource"></select>
+
+  <label for="tradCible">Langue des sous-titres</label>
+  <select id="tradCible"></select>
+  <div id="tradAide"></div>
+
   <button id="prepBtn">▶️ Demarrer</button>
   <div id="prepStatus">⏸️ Pret a demarrer</div>
 

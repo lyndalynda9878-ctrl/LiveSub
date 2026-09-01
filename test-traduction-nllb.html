@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>LiveSub - candidat B : NLLB-200 dans un Web Worker</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1000px; margin: 30px auto; padding: 0 20px; color: #1f2937; }
+    h1 { font-size: 19px; color: #4f46e5; }
+    h2 { font-size: 14px; color: #4f46e5; margin-top: 22px; }
+    button { font-size: 15px; padding: 10px 16px; margin: 4px 6px 4px 0; cursor: pointer; }
+    pre { background: #f8f9fa; border: 1px solid #e5e7eb; padding: 12px; white-space: pre-wrap;
+          font-family: Consolas, monospace; font-size: 12px; line-height: 1.5; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <h1>Candidat B — NLLB-200 distilled 600M (q8), dans un <em>Web Worker</em></h1>
+  <p>Pas de document requis, pas d'activation utilisateur, aucune requete vers internet.
+     Le modele est lu dans <code>test-nllb-model/</code> — jamais dans <code>models/</code>.</p>
+
+  <button id="btnCharger">1. Charger le modele</button>
+  <button id="btnTraduire">2. Traduire mon texte (3 paires)</button>
+  <button id="btnGros">3. Traduire l'equivalent de 2493 mots</button>
+  <button id="btnFin">4. Terminer le worker</button>
+
+  <h2>Journal</h2>
+  <pre id="log">pret.</pre>
+
+  <script type="module" src="test-traduction-nllb.js"></script>
+</body>
+</html>
