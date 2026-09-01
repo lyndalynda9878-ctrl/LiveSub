@@ -1930,6 +1930,91 @@ function prepLectArreter() {
   prepLectHauteur(LIGNES_VISIBLES);
 }
 
+// Les segments traduits tels qu'ils sont arrives, AVANT la fusion en blocs.
+// Ils sont gardes parce qu'ils sont la SORTIE BRUTE du traducteur ; les blocs,
+// eux, sont le resultat d'une fusion qui depend de la boite. Ranger les deux,
+// c'est pouvoir re-decouper un jour sans retraduire.
+let prepLectSegments = [];
+
+// D'ou vient ce qui est a l'ecran : null = d'une preparation qui vient de
+// tourner, un objet = de la memoire. Un affichage qui vient de la memoire doit
+// pouvoir le DIRE -- sinon « ca s'affiche » ne prouve rien sur la memoire.
+let prepLectVientDeLaMemoire = null;
+
+// ---------------------------------------------------------------------------
+// Poser le stock et lancer l'affichage — LE SEUL CHEMIN D'ENTREE
+// ---------------------------------------------------------------------------
+//
+// ⚠️ UNE PREPARATION QUI VIENT DE FINIR ET UNE PREPARATION RELUE DEPUIS LA
+// MEMOIRE PASSENT PAR EXACTEMENT LES MEMES LIGNES. Deux chemins paralleles
+// finiraient par diverger, et la difference ne se verrait que sur la mediane du
+// critere 3 -- c'est-a-dire bien trop tard pour comprendre d'ou elle vient.
+//
+// La seule difference entre les deux appels est `blocs` :
+//   - null   -> on decoupe, exactement comme avant ;
+//   - fourni -> on REPREND le decoupage d'origine, tel quel.
+function prepLectInstaller(source) {
+  prepLectStock = source.mots;
+  prepLectZone = {
+    debut: Number(source.debut) || 0,
+    fin: (Number(source.debut) || 0) + (Number(source.dureeCouverteS) || 0),
+  };
+  prepLectSegments = Array.isArray(source.segments) ? source.segments : [];
+
+  // Le decoupage en phrases se fait UNE fois, ici, sur le stock complet. C'est
+  // la seule facon d'avoir la duree d'un bloc : elle depend du premier mot du
+  // bloc SUIVANT, donc de texte qui n'existe pas encore en direct.
+  // ⚠️ `prepLectStock` reste TOUJOURS les mots de Parakeet, avec leurs
+  // instants par mot : la traduction ne le remplace pas. C'est lui qui sert au
+  // mode « mots », a la mesure par mot, et c'est le texte d'origine que je
+  // veux garder.
+  //
+  // Les segments traduits, eux, arrivent DEJA decoupes (voir
+  // prepBlocsDepuisSegments). Quand il n'y en a pas -- « Langue d'origine » --
+  // on retombe exactement sur le chemin d'avant, sans une ligne de difference.
+  //
+  // ⚠️ ET LES BLOCS RELUS NE SONT PAS RECALCULES. Le decoupage MESURE une
+  // hauteur reelle dans la boite (stTientDansLaBoite) : le refaire sur une page
+  // dont la police ou la largeur a change rendrait d'autres blocs, en silence.
+  // Reprendre ceux qui ont ete ranges, c'est reafficher ce qui a ete affiche.
+  if (Array.isArray(source.blocs) && source.blocs.length) {
+    prepLectBlocs = PREP_LECT_STYLE !== "blocs" ? [] : source.blocs;
+  } else {
+    prepLectBlocs =
+      PREP_LECT_STYLE !== "blocs"
+        ? []
+        : prepLectSegments.length
+          ? prepBlocsDepuisSegments(prepLectSegments, prepLectZone.fin)
+          : prepBlocsDepuisMots(prepLectStock, prepLectZone.fin);
+  }
+  prepLectTraduction = source.traduction || null;
+  prepLectPoserDirections(prepLectTraduction);
+
+  // ⚠️ LE COMPTE DES BLOCS SANS TRADUCTION, ET IL DOIT SE VOIR. Un bloc qui
+  // s'affiche en grand dans sa langue d'origine a exactement l'air de
+  // fonctionner : sans ce chiffre, une traduction a moitie tombee en panne
+  // passerait inapercue.
+  prepBlocsSansTraduction = prepLectTraduction
+    ? prepLectBlocs.filter((b) => !b.texteTraduit).length
+    : 0;
+  if (prepBlocsSansTraduction) {
+    console.warn(
+      "⚠️ LiveSub : " + prepBlocsSansTraduction + " bloc(s) sur " + prepLectBlocs.length +
+        " sans traduction — ils s'affichent dans la langue d'origine."
+    );
+  }
+  const resume = source.resume;
+  if (resume && typeof resume.nbMots === "number") {
+    prepLectResume =
+      `✅ Prêt — ${resume.nbMots} mots préparés, ` +
+      `${prepFormaterDuree(resume.dureeCouverteS)} couvertes` +
+      (prepBlocsSansTraduction
+        ? ` — ⚠️ ${prepBlocsSansTraduction} bloc(s) sans traduction`
+        : "");
+  }
+  prepLectDemarrer();
+}
+
 // Va chercher le stock aupres du service worker, qui le demande a l'offscreen.
 async function prepLectCharger(resume) {
   try {
@@ -1939,54 +2024,23 @@ async function prepLectCharger(resume) {
       return;
     }
 
-    prepLectStock = reponse.mots;
-    prepLectZone = {
+    prepLectInstaller({
+      mots: reponse.mots,
+      // Preparation NEUVE : personne n'a encore decoupe ces mots en blocs.
+      blocs: null,
+      segments: Array.isArray(reponse.segments) ? reponse.segments : [],
+      traduction: reponse.traduction || null,
       debut: Number(reponse.positionDepart) || 0,
-      fin: (Number(reponse.positionDepart) || 0) + (Number(reponse.dureeCouverteS) || 0),
-    };
-    // Le decoupage en phrases se fait UNE fois, ici, sur le stock complet. C'est
-    // la seule facon d'avoir la duree d'un bloc : elle depend du premier mot du
-    // bloc SUIVANT, donc de texte qui n'existe pas encore en direct.
-    // ⚠️ `prepLectStock` reste TOUJOURS les mots de Parakeet, avec leurs
-    // instants par mot : la traduction ne le remplace pas. C'est lui qui sert au
-    // mode « mots », a la mesure par mot, et c'est le texte d'origine que je
-    // veux garder.
-    //
-    // Les segments traduits, eux, arrivent DEJA decoupes (voir
-    // prepBlocsDepuisSegments). Quand il n'y en a pas -- « Langue d'origine » --
-    // on retombe exactement sur le chemin d'avant, sans une ligne de difference.
-    const segments = Array.isArray(reponse.segments) ? reponse.segments : [];
-    prepLectBlocs =
-      PREP_LECT_STYLE !== "blocs"
-        ? []
-        : segments.length
-          ? prepBlocsDepuisSegments(segments, prepLectZone.fin)
-          : prepBlocsDepuisMots(prepLectStock, prepLectZone.fin);
-    prepLectTraduction = reponse.traduction || null;
-    prepLectPoserDirections(prepLectTraduction);
+      dureeCouverteS: Number(reponse.dureeCouverteS) || 0,
+      resume,
+    });
+    prepLectVientDeLaMemoire = null;
 
-    // ⚠️ LE COMPTE DES BLOCS SANS TRADUCTION, ET IL DOIT SE VOIR. Un bloc qui
-    // s'affiche en grand dans sa langue d'origine a exactement l'air de
-    // fonctionner : sans ce chiffre, une traduction a moitie tombee en panne
-    // passerait inapercue.
-    prepBlocsSansTraduction = prepLectTraduction
-      ? prepLectBlocs.filter((b) => !b.texteTraduit).length
-      : 0;
-    if (prepBlocsSansTraduction) {
-      console.warn(
-        "⚠️ LiveSub : " + prepBlocsSansTraduction + " bloc(s) sur " + prepLectBlocs.length +
-          " sans traduction — ils s'affichent dans la langue d'origine."
-      );
-    }
-    if (resume && typeof resume.nbMots === "number") {
-      prepLectResume =
-        `✅ Prêt — ${resume.nbMots} mots préparés, ` +
-        `${prepFormaterDuree(resume.dureeCouverteS)} couvertes` +
-        (prepBlocsSansTraduction
-          ? ` — ⚠️ ${prepBlocsSansTraduction} bloc(s) sans traduction`
-          : "");
-    }
-    prepLectDemarrer();
+    // ⚠️ ET SEULEMENT MAINTENANT ON RANGE. La preparation vient de couter des
+    // minutes ; l'enregistrer ICI, une fois les blocs reellement construits,
+    // c'est ranger EXACTEMENT ce qui est a l'ecran -- pas une version
+    // reconstituee qui pourrait en differer sans que rien ne le dise.
+    memEnregistrer("preparation");
   } catch (err) {
     prepAfficher("⚠️ Stock illisible : " + (err && err.message ? err.message : err));
   }
@@ -2189,6 +2243,282 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "PREPARATION_MESURES_RAZ") {
     prepRazMesures();
     sendResponse({ success: true });
+    return;
+  }
+});
+
+
+// ===========================================================================
+// LA MEMOIRE — reconnaitre la video, ranger ce qu'on a prepare, le relire
+// ===========================================================================
+//
+// Une preparation coute des minutes. Elle disparaissait a la fermeture de
+// l'onglet : rouvrir la meme video la faisait repayer entierement. Elle est
+// desormais rangee dans chrome.storage.local, et relue au clic.
+//
+// ⚠️ LA REGLE DE STRUCTURE, ET ELLE COMMANDE TOUT LE RESTE :
+//
+//     la TRANSCRIPTION ne depend pas de la langue d'arrivee.
+//     la TRADUCTION, si.
+//
+// Elles sont donc rangees SEPAREMENT -- la transcription une fois par video,
+// les traductions une par langue d'arrivee. Changer de langue de sous-titres
+// sur une video deja preparee ne retranscrit rien : ca retraduit, et c'est
+// tout.
+//
+// ⚠️ CE FICHIER N'ECRIT RIEN DANS LE STORAGE LUI-MEME. Un content script y a
+// pourtant acces -- mais alors la memoire serait ecrite depuis deux endroits
+// (ici et background.js pour la retraduction), avec deux idees de ce qu'elle
+// contient. C'est background.js qui range, toujours, et lui seul : il est le
+// seul a voir toutes les entrees, donc le seul a pouvoir faire de la place.
+
+// ---------------------------------------------------------------------------
+// Reconnaitre la video
+// ---------------------------------------------------------------------------
+//
+// ⚠️ PAS L'URL ENTIERE. Sur YouTube elle porte `&t=120` (l'instant ou on en
+// etait), `&list=...` (la playlist), `&pp=...`, `&si=...` : autant de choses qui
+// changent d'une ouverture a l'autre SANS QUE LA VIDEO CHANGE. Une cle fondee
+// sur l'URL complete ne retrouverait donc a peu pres jamais une preparation.
+//
+// L'identifiant `v=` suffit, et il est stable. Ailleurs on tombe sur
+// origine + chemin, sans parametres ni ancre -- meme raisonnement, en moins
+// precis faute de mieux.
+//
+// ⚠️ ET LA CLE NE SUFFIT PAS : LA DUREE EST VERIFIEE AUSSI (dans
+// background.js). Deux pages differentes peuvent partager un chemin ; une video
+// peut etre remplacee derriere la meme adresse. Une duree qui ne correspond pas
+// veut dire « ce n'est pas la meme video » : on ignore alors la memoire au lieu
+// d'afficher les sous-titres d'autre chose.
+function memCleVideo() {
+  let u;
+  try {
+    u = new URL(location.href);
+  } catch (err) {
+    return null;
+  }
+  const hote = u.hostname.replace(/^www\./, "");
+
+  if (hote === "youtu.be") {
+    const id = u.pathname.split("/").filter(Boolean)[0];
+    if (id) return "yt:" + id;
+  }
+  if (hote === "youtube.com" || hote === "m.youtube.com" || hote === "youtube-nocookie.com") {
+    const v = u.searchParams.get("v");
+    if (v) return "yt:" + v;
+    // /shorts/ID, /embed/ID, /live/ID : le meme identifiant, un autre chemin.
+    const m = u.pathname.match(/^\/(?:shorts|embed|live|v)\/([^/?#]+)/);
+    if (m) return "yt:" + m[1];
+  }
+
+  // Partout ailleurs : l'adresse SANS ses parametres ni son ancre.
+  return "url:" + u.origin + u.pathname;
+}
+
+// La carte d'identite de ce qui est ouvert ici. `duree` est LUE sur l'element
+// <video>, pas devinee : c'est elle qui tranche « meme video ou pas ».
+function memIdentite() {
+  const v = prepTrouverVideo();
+  return {
+    cle: memCleVideo(),
+    url: location.href,
+    titre: (document.title || "").slice(0, 200),
+    duree: v && Number.isFinite(v.duration) ? v.duration : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// La forme rangee d'un bloc
+// ---------------------------------------------------------------------------
+//
+// ⚠️ LE CHAMP S'APPELLE `texteOrigine` DANS LA MEMOIRE ET `texte` DANS
+// L'AFFICHAGE, et c'est voulu : dans le stock range, « texte » tout court ne
+// dirait pas s'il s'agit de l'original ou de la traduction, alors que les deux
+// y sont cote a cote. Les deux fonctions ci-dessous sont la traduction d'un nom
+// vers l'autre, et rien d'autre -- aucune valeur n'est arrondie, aucun champ
+// n'est laisse de cote.
+function memBlocVersMemoire(b) {
+  return {
+    instant: b.instant,
+    fin: b.fin,
+    finParole: b.finParole,
+    disparition: b.disparition,
+    nbMots: b.nbMots,
+    texteOrigine: b.texte,
+    texteTraduit: b.texteTraduit || null,
+  };
+}
+
+function memBlocDepuisMemoire(b) {
+  return {
+    instant: b.instant,
+    fin: b.fin,
+    finParole: b.finParole,
+    disparition: b.disparition,
+    nbMots: b.nbMots,
+    texte: b.texteOrigine,
+    texteTraduit: b.texteTraduit || null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Ranger ce qui est a l'ecran
+// ---------------------------------------------------------------------------
+//
+// ⚠️ ON RANGE LES BLOCS SANS TRADUCTION *AUSSI*, MEME QUAND ON VIENT DE
+// PREPARER AVEC UNE TRADUCTION. Ils ne dependent que de la transcription : les
+// calculer maintenant, c'est garantir que « Langue d'origine » s'affichera plus
+// tard sans rien recalculer -- et surtout que le decoupage aura ete fait avec la
+// boite de CETTE page, mesuree, au lieu d'une autre.
+function memEnregistrer(origine) {
+  const identite = memIdentite();
+  if (!identite.cle) return;
+  if (!prepLectStock.length || !prepLectZone) return;
+
+  const blocsOrigine =
+    PREP_LECT_STYLE === "blocs" ? prepBlocsDepuisMots(prepLectStock, prepLectZone.fin) : [];
+
+  const charge = {
+    cle: identite.cle,
+    url: identite.url,
+    titre: identite.titre,
+    dureeVideo: identite.duree,
+    positionDepart: prepLectZone.debut,
+    dureeCouverteS: prepLectZone.fin - prepLectZone.debut,
+    // ⭐ LES MOTS AVEC LEUR INSTANT, TELS QUELS. Aucun arrondi, aucune coupe :
+    // c'est d'eux que depend la mediane de 12 ms.
+    mots: prepLectStock,
+    blocs: blocsOrigine.map(memBlocVersMemoire),
+    traduction: prepLectTraduction || null,
+    segments: prepLectTraduction ? prepLectSegments : [],
+    blocsTraduits: prepLectTraduction ? prepLectBlocs.map(memBlocVersMemoire) : null,
+    origine: origine || "inconnue",
+  };
+
+  chrome.runtime
+    .sendMessage({ type: "MEMOIRE_ENREGISTRER", charge })
+    .then((r) => {
+      if (!r || !r.ok) {
+        // ⚠️ UN ECHEC D'ENREGISTREMENT SE DIT. Sans ca, la seule chose qu'on
+        // verrait serait « il refait la preparation demain », sans savoir
+        // pourquoi.
+        console.warn("⚠️ LiveSub : preparation NON rangee — " + ((r && r.erreur) || "raison inconnue"));
+        return;
+      }
+      // ⚠️ LA DESCRIPTION EST FIGEE MAINTENANT, PAS DANS LE `.then`. Lue plus
+      // tard, elle decrirait l ETAT COURANT et non ce qui vient d etre range :
+      // au banc, un enregistrement de la traduction espagnole s est journalise
+      // « sans traduction » parce que l affichage etait repasse a la langue
+      // d origine entre-temps. Un journal qui decrit autre chose que son sujet
+      // est pire que pas de journal.
+      const decrit =
+        `${charge.mots.length} mots, ${charge.blocs.length} blocs` +
+        (charge.traduction ? `, ${charge.segments.length} segments ${charge.traduction.cible}` : "");
+      console.log(
+        `💾 LiveSub : preparation rangee (${identite.cle}) — ${decrit}` +
+          ` — ${Math.round(r.octets / 1024)} Ko ` +
+          `(memoire : ${Math.round(r.place.octets / 1024)} Ko sur ${Math.round(r.place.quota / 1024)} Ko, ` +
+          `${r.place.pourcent} %)` +
+          (r.evincees && r.evincees.length
+            ? ` — ${r.evincees.length} preparation(s) plus ancienne(s) supprimee(s) pour faire de la place`
+            : "")
+      );
+      if (r.evincees && r.evincees.length) {
+        console.warn(
+          "🗑️ LiveSub : supprimee(s) faute de place — " +
+            r.evincees.map((e) => `${e.cle} (${e.titre || "sans titre"})`).join(", ")
+        );
+      }
+    })
+    .catch((err) => console.warn("⚠️ LiveSub : enregistrement impossible —", err));
+}
+
+// ---------------------------------------------------------------------------
+// Messages — un listener A PART
+// ---------------------------------------------------------------------------
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "MEMOIRE_IDENTITE") {
+    sendResponse({ success: true, ...memIdentite() });
+    return;
+  }
+
+  // Afficher un stock qui vient de la memoire. C'est le meme
+  // `prepLectInstaller` que pour une preparation qui vient de finir : aucune
+  // ligne d'affichage n'est doublee.
+  if (request.type === "MEMOIRE_AFFICHER") {
+    try {
+      const mots = Array.isArray(request.mots) ? request.mots : [];
+      if (!mots.length) {
+        sendResponse({ success: false, erreur: "La memoire ne contient aucun mot" });
+        return;
+      }
+
+      // Une lecture peut deja etre en cours (on rejoue la meme video) : on
+      // arrete proprement avant de reposer, sinon deux boucles se disputeraient
+      // la boite.
+      prepLectArreter();
+      prepRazMesures();
+      prepBoiteNormale();
+
+      const blocs = Array.isArray(request.blocs) && request.blocs.length
+        ? request.blocs.map(memBlocDepuisMemoire)
+        : null;
+
+      prepLectInstaller({
+        mots,
+        blocs,
+        segments: Array.isArray(request.segments) ? request.segments : [],
+        traduction: request.traduction || null,
+        debut: request.positionDepart,
+        dureeCouverteS: request.dureeCouverteS,
+        resume: { nbMots: mots.length, dureeCouverteS: request.dureeCouverteS },
+      });
+      prepLectVientDeLaMemoire = {
+        cle: request.cle,
+        quand: request.quand,
+        blocsRepris: Boolean(blocs),
+      };
+
+      console.log(
+        `📼 LiveSub : sous-titres relus DEPUIS LA MEMOIRE — ${mots.length} mots, ` +
+          `${prepLectBlocs.length} blocs ` +
+          (blocs ? "(decoupage repris tel quel)" : "(decoupage refait : la memoire n'en portait pas)") +
+          (request.traduction ? ` — ${request.traduction.source} → ${request.traduction.cible}` : " — sans traduction")
+      );
+
+      // Le decoupage vient d'etre refait (traduction toute neuve) : on le range,
+      // pour que la prochaine fois n'ait plus rien a recalculer.
+      if (!blocs && request.aRanger) memEnregistrer("memoire");
+
+      sendResponse({
+        success: true,
+        nbMots: mots.length,
+        nbBlocs: prepLectBlocs.length,
+        blocsRepris: Boolean(blocs),
+      });
+    } catch (err) {
+      sendResponse({ success: false, erreur: String((err && err.message) || err) });
+    }
+    return;
+  }
+
+  // Contre-preuve, volet B : d'ou vient ce qui est a l'ecran, et avec quels
+  // instants EXACTS. Sans ce message, « les instants sont identiques » ne
+  // serait qu'une affirmation.
+  if (request.type === "MEMOIRE_EMPREINTE") {
+    sendResponse({
+      success: true,
+      vientDeLaMemoire: prepLectVientDeLaMemoire,
+      nbMots: prepLectStock.length,
+      nbBlocs: prepLectBlocs.length,
+      nbSegments: prepLectSegments.length,
+      traduction: prepLectTraduction,
+      zone: prepLectZone,
+      // TOUS les mots, avec leurs instants bruts. C'est ce qui se compare mot a
+      // mot entre la premiere preparation et la relecture.
+      mots: prepLectStock,
+      blocs: prepLectBlocs.map(memBlocVersMemoire),
+    });
     return;
   }
 });

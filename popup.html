@@ -78,6 +78,44 @@
       color: #999;
       font-size: 11px;
     }
+    /* Le second bouton : refaire une preparation qu'on a deja en memoire.
+       Il est SECONDAIRE et il en a l'air -- l'action normale, sur une video
+       connue, est de relire la memoire, pas de repayer quatre minutes. */
+    button.secondaire {
+      background: #fff;
+      color: #4f46e5;
+      border: 1px solid #c7d2fe;
+      font-size: 13px;
+      padding: 7px;
+      margin-top: 8px;
+      font-weight: normal;
+    }
+    button.secondaire:hover {
+      background: #eef2ff;
+    }
+    /* Une video deja en memoire : le bouton principal change de sens, il doit
+       donc changer de couleur. Le vert dit « il n'y a rien a attendre ». */
+    button.memoire {
+      background: #0f9d63;
+      font-size: 13px;
+      line-height: 1.3;
+    }
+    button.memoire:hover {
+      background: #0c7d4f;
+    }
+    /* Ce que la memoire contient, et la place qu'elle prend. La place est
+       affichee TOUJOURS, meme quand la video est inconnue : c'est la seule
+       facon de voir venir le moment ou il faudra supprimer quelque chose. */
+    #memInfo {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid #e5e7eb;
+      font-size: 11px;
+      color: #666;
+      line-height: 1.45;
+      white-space: pre-line;
+      overflow-wrap: break-word;
+    }
     #prepStatus {
       margin-top: 10px;
       font-size: 12px;
@@ -156,7 +194,12 @@
   <div id="tradAide"></div>
 
   <button id="prepBtn">▶️ Demarrer</button>
+  <!-- ⚠️ « Refaire » n'est visible QUE si la video est deja en memoire. Un
+       bouton « refaire » sur une video jamais preparee ne voudrait rien dire,
+       et un bouton qui ne veut rien dire finit par etre clique. -->
+  <button id="refaireBtn" class="secondaire" hidden>🔄 Refaire la preparation</button>
   <div id="prepStatus">⏸️ Pret a demarrer</div>
+  <div id="memInfo"></div>
 
   <script src="popup.js"></script>
 </body>

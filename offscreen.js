@@ -2153,3 +2153,143 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return;
   }
 });
+
+
+// ===========================================================================
+// RETRADUIRE UN STOCK DEJA TRANSCRIT — sans toucher au moteur
+// ===========================================================================
+//
+// ⚠️ LA REGLE DE STRUCTURE, VUE D'ICI. La transcription ne depend pas de la
+// langue d'arrivee ; la traduction, si. Changer de langue de sous-titres sur une
+// video deja preparee n'a donc aucune raison de faire retourner Parakeet.
+//
+// ⛔ CE QUE CETTE FONCTION NE FAIT PAS, ET C'EST LE POINT :
+//   - elle n'appelle PAS `prepDemarrerParakeet()` : aucun worker, aucun modele,
+//     pas un octet des 640 Mo touche ;
+//   - elle n'appelle PAS `prepReinitialiser()` : elle ne peut donc pas effacer
+//     une preparation en cours ;
+//   - elle ne touche NI `prepMots`, NI `prepSegments`, NI `prepTraducteur` :
+//     tout ce qu'elle produit est rendu a l'appelant, et rien n'est garde ici ;
+//   - elle ne touche PAS `chrome.storage` -- il n'existe pas dans ce document.
+//
+// C'est ce qui rend la contre-preuve honnete : le dossier du modele peut etre
+// renomme, ce chemin-la fonctionne quand meme.
+//
+// ⚠️ ET LE DECOUPAGE EST LE MEME. `prepDecouperEnPhrases` est celle de la
+// preparation, appelee telle quelle : les segments d'une retraduction ont donc
+// exactement les memes bornes -- et surtout LES MEMES INSTANTS, ceux des mots
+// d'origine -- que ceux d'une preparation complete. Un second decoupeur
+// finirait par ne plus dire la meme chose que le premier.
+async function prepRetraduire(request) {
+  if (prepActif) {
+    const e = new Error(
+      "Une preparation est en cours dans cet onglet : la retraduction attendra qu'elle finisse."
+    );
+    e.occupe = true;
+    throw e;
+  }
+
+  const mots = Array.isArray(request.mots) ? request.mots : [];
+  const demande = request.traduction || {};
+  if (!mots.length) throw new Error("La memoire ne contient aucun mot a traduire.");
+  if (!demande.cible) throw new Error("Aucune langue d'arrivee demandee.");
+  if (!("Translator" in self)) {
+    throw new Error(
+      "La traduction est impossible : ce Chrome n'a pas l'API Translator.\n" +
+        "Il faut Chrome 138 ou plus recent."
+    );
+  }
+
+  const t0 = performance.now();
+  let traducteur;
+  try {
+    // La paire doit DEJA etre installee : c'est le clic sur le bouton de la
+    // popup qui l'a fait, dans le seul contexte ou une activation utilisateur
+    // existe. Ici il n'y en a jamais.
+    traducteur = await Translator.create({
+      sourceLanguage: demande.source,
+      targetLanguage: demande.cible,
+    });
+  } catch (err) {
+    throw new Error(
+      `La traduction ${demande.source} → ${demande.cible} n'a pas pu demarrer.\n` +
+        `${(err && err.name) || "Erreur"} : ${(err && err.message) || err}\n` +
+        `Relance depuis la popup : c'est le clic qui installe la paire.`
+    );
+  }
+  const msCreation = Math.round(performance.now() - t0);
+
+  const segments = prepDecouperEnPhrases(mots);
+  const echecs = [];
+  const t1 = performance.now();
+  for (const seg of segments) {
+    try {
+      seg.texteTraduit = await traducteur.translate(seg.texteOrigine);
+    } catch (err) {
+      // ⚠️ AUCUN REPLI SILENCIEUX, exactement comme en preparation : le segment
+      // garde `texteTraduit: null` et s'affichera dans sa langue d'origine,
+      // mais l'echec est COMPTE et remonte.
+      seg.texteTraduit = null;
+      echecs.push({
+        instant: seg.instant,
+        texteOrigine: seg.texteOrigine,
+        erreur: `${err && err.name}: ${err && err.message}`,
+      });
+    }
+  }
+  const msTraduction = Math.round(performance.now() - t1);
+
+  try {
+    if (traducteur.destroy) traducteur.destroy();
+  } catch (e) {
+    /* deja ferme */
+  }
+
+  console.log(
+    `🌍 Retraduction ${demande.source} → ${demande.cible} : ${segments.length} segments, ` +
+      `${echecs.length} echec(s), ${msTraduction} ms de traduction ` +
+      `(+ ${msCreation} ms pour ouvrir le traducteur) — AUCUNE transcription, ` +
+      `worker Parakeet ${prepWorker ? "encore la" : "absent"}`
+  );
+  if (echecs.length) {
+    console.error(
+      `❌ Retraduction : ${echecs.length} segment(s) non traduits\n` +
+        echecs
+          .slice(0, 20)
+          .map((e) => `   ${e.instant.toFixed(1)} s — ${e.erreur} — « ${e.texteOrigine} »`)
+          .join("\n")
+    );
+  }
+
+  return {
+    success: true,
+    segments,
+    nbSegments: segments.length,
+    nbEchecs: echecs.length,
+    echecs: echecs.slice(0, 20),
+    msCreation,
+    msTraduction,
+    ms: msCreation + msTraduction,
+    // La preuve, lisible sans la console de l'offscreen : le moteur n'a pas
+    // bouge. `false` ici veut dire qu'aucun worker Parakeet n'a ete instancie.
+    workerParakeetVivant: prepWorker !== null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Messages — un listener A PART
+// ---------------------------------------------------------------------------
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "PREPARATION_RETRADUIRE") {
+    prepRetraduire(request)
+      .then(sendResponse)
+      // Tout `return true` a son `.catch` qui REPOND. Sans lui, le service
+      // worker attendrait indefiniment et le bouton ne repondrait plus, sans le
+      // moindre message : c'est exactement la panne muette de `chrome.storage`.
+      .catch((err) => {
+        console.error("❌ prepRetraduire a rejete :", err);
+        sendResponse({ success: false, error: String((err && err.message) || err) });
+      });
+    return true;
+  }
+});

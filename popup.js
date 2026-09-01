@@ -57,6 +57,8 @@ const prepStatus = document.getElementById("prepStatus");
 const tradSource = document.getElementById("tradSource");
 const tradCible = document.getElementById("tradCible");
 const tradAide = document.getElementById("tradAide");
+const refaireBtn = document.getElementById("refaireBtn");
+const memInfo = document.getElementById("memInfo");
 
 const TRAD_CLE = "traductionPaire";
 
@@ -196,6 +198,12 @@ function tradMemoriser() {
     .set({ [TRAD_CLE]: { source: tradSource.value, cible: tradCible.value } })
     .catch(() => {});
   tradMajAide();
+  // ⚠️ LE BOUTON CHANGE DE SENS AVEC LA LANGUE D'ARRIVEE, et il doit le dire
+  // TOUT DE SUITE. Sur une video deja preparee, choisir une langue deja en
+  // memoire donne « afficher » (instantane) et une langue absente donne
+  // « traduire » (quelques secondes) : ce sont deux actions differentes
+  // derriere le meme bouton, donc deux libelles differents.
+  prepMajUI();
 }
 
 tradSource.addEventListener("change", tradMemoriser);
@@ -283,15 +291,129 @@ function prepSetStatus(texte, couleur) {
   prepStatus.title = texte;
 }
 
+// ---------------------------------------------------------------------------
+// LA MEMOIRE, VUE DE LA POPUP
+// ---------------------------------------------------------------------------
+//
+// ⚠️ LA POPUP NE DEVINE RIEN, ICI NON PLUS. Elle demande au service worker
+// (`MEMOIRE_ETAT`) ce qu'il y a en memoire pour la video de l'onglet actif, et
+// elle affiche la reponse. C'est lui qui a le storage, et lui seul qui sait si
+// la duree correspond.
+let memEtat = null;
+
+// Ce que le bouton principal va faire, en un mot. C'est la SEULE fonction qui
+// en decide -- le libelle, l'action au clic et le bouton « Refaire » lisent tous
+// les trois celle-ci, donc ils ne peuvent pas se contredire.
+//
+//   "demarrer"  video inconnue        -> preparation complete (des minutes)
+//   "afficher"  tout est en memoire   -> rien a calculer (instantane)
+//   "traduire"  transcription en
+//               memoire, pas cette
+//               langue d'arrivee      -> retraduction seule (des secondes)
+function memModeBouton() {
+  if (!memEtat || !memEtat.connue || !memEtat.resume) return "demarrer";
+  const cible = tradCible.value;
+  if (!cible) return "afficher";
+  return (memEtat.resume.langues || []).includes(cible) ? "afficher" : "traduire";
+}
+
+function memDate(quand) {
+  if (!quand) return "date inconnue";
+  try {
+    return new Date(quand).toLocaleString("fr-FR", {
+      day: "2-digit",
+      month: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch (err) {
+    return String(quand);
+  }
+}
+
+function memKo(octets) {
+  return Math.round((Number(octets) || 0) / 1024).toLocaleString("fr-FR") + " Ko";
+}
+
+// ⚠️ LA PLACE EST AFFICHEE TOUJOURS, meme quand la video est inconnue. Le
+// storage est borne a ~10 Mo et il n'y a PAS de permission `unlimitedStorage` :
+// voir le compteur monter est la seule facon de ne pas etre surpris le jour ou
+// une preparation en chasse une autre.
+function memMajInfo() {
+  if (!memEtat) {
+    memInfo.textContent = "";
+    return;
+  }
+  const lignes = [];
+
+  if (memEtat.connue && memEtat.resume) {
+    const r = memEtat.resume;
+    lignes.push(
+      `✅ Déjà préparé — ${r.nbMots.toLocaleString("fr-FR")} mots, le ${memDate(r.quand)}`
+    );
+    const langues = r.langues || [];
+    lignes.push(
+      langues.length
+        ? `🌍 Traductions en mémoire : ${langues.map(nomDe).join(", ")}`
+        : "🌍 Aucune traduction en mémoire (texte d'origine seul)"
+    );
+    if (memModeBouton() === "traduire") {
+      lignes.push(
+        `↳ ${nomDe(tradCible.value)} n'y est pas : il TRADUIRA seulement, ` +
+          `sans retranscrire.`
+      );
+    }
+    lignes.push(`📦 Cette vidéo : ${memKo(r.octets)}`);
+  } else if (memEtat.raison) {
+    lignes.push("🆕 Pas en mémoire — " + memEtat.raison);
+  } else if (memEtat.erreur) {
+    lignes.push("⚠️ " + memEtat.erreur);
+  } else {
+    lignes.push("🆕 Vidéo inconnue — la préparation va tout transcrire.");
+  }
+
+  const place = memEtat.place;
+  if (place) {
+    const n = (memEtat.inventaire || []).length;
+    lignes.push(
+      `💾 Mémoire : ${memKo(place.octets)} / ${memKo(place.quota)} (${place.pourcent} %) — ` +
+        `${n} préparation${n > 1 ? "s" : ""}`
+    );
+  }
+
+  memInfo.textContent = lignes.join("\n");
+}
+
 function prepMajUI() {
   prepBtn.disabled = false;
-  prepBtn.textContent = prepActif ? "⏹️ Arreter" : "▶️ Demarrer";
-  prepBtn.className = prepActif ? "stop" : "";
+  const mode = memModeBouton();
+
+  if (prepActif) {
+    prepBtn.textContent = "⏹️ Arreter";
+    prepBtn.className = "stop";
+  } else if (mode === "afficher") {
+    prepBtn.textContent = "✅ Deja prepare — afficher les sous-titres";
+    prepBtn.className = "memoire";
+  } else if (mode === "traduire") {
+    prepBtn.textContent = "✅ Deja prepare — traduire vers " + nomDe(tradCible.value);
+    prepBtn.className = "memoire";
+  } else {
+    prepBtn.textContent = "▶️ Demarrer";
+    prepBtn.className = "";
+  }
+
+  // ⚠️ « Refaire » n'existe que s'il y a quelque chose a refaire.
+  refaireBtn.hidden = prepActif || mode === "demarrer";
+  memMajInfo();
 
   if (prepMessage) {
     prepSetStatus(prepMessage.texte, prepMessage.couleur);
   } else if (prepActif) {
     prepSetStatus("⏳ Preparation en cours — voir la video", "#4f46e5");
+  } else if (mode === "afficher") {
+    prepSetStatus("⏸️ Rien a preparer : clique pour afficher", "#0f9d63");
+  } else if (mode === "traduire") {
+    prepSetStatus("⏸️ Transcription en memoire : il ne reste qu'a traduire", "#0f9d63");
   } else {
     prepSetStatus("⏸️ Pret a demarrer", "#666");
   }
@@ -340,28 +462,17 @@ function prepAppliquerEtat(reponse) {
   prepMajUI();
 }
 
-prepBtn.addEventListener("click", async () => {
-  const voulu = !prepActif;
-  prepMessage = null;
-  prepBtn.disabled = true;
-
-  if (!voulu) {
-    prepSetStatus("⏳ Arret...", "#666");
-    try {
-      prepAppliquerEtat(await chrome.runtime.sendMessage({ type: "PREPARATION_ARRETER" }));
-    } catch (err) {
-      prepMessage = { texte: "❌ Echec : " + (err.message || err), couleur: "#dc2626" };
-      prepActif = false;
-      prepMajUI();
-    }
-    return;
-  }
-
+// Lancer une preparation complete. `refaire` vaut true quand on ecrase
+// volontairement une preparation deja en memoire.
+//
+// ⚠️ L'ORDRE DES DEUX PREMIERES LIGNES N'EST PAS NEGOCIABLE. L'installation de
+// la paire doit etre le PREMIER `await` -- pas de `sendMessage`, pas de
+// `storage.get` avant elle, sinon l'activation utilisateur (~5 s) expire et
+// `Translator.create` leve `NotAllowedError`. L'oubli de la memoire, lui, peut
+// attendre : il ne demande aucune activation.
+async function prepLancerPreparation(refaire) {
   const paire = { source: tradSource.value, cible: tradCible.value };
 
-  // ⚠️ L'INSTALLATION D'ABORD, ET SANS RIEN AVANT ELLE. Pas de `sendMessage`,
-  // pas de `storage.get` : le premier `await` de ce gestionnaire doit etre
-  // celui-la, sinon l'activation utilisateur a le temps d'expirer.
   prepSetStatus(
     paire.cible
       ? `⏳ Vérification ${nomDe(paire.source)} → ${nomDe(paire.cible)}...`
@@ -386,6 +497,20 @@ prepBtn.addEventListener("click", async () => {
     );
   }
 
+  // ⚠️ ON OUBLIE AVANT DE RELANCER. Sans ca, la nouvelle preparation serait
+  // FUSIONNEE avec l'ancienne (meme cle, meme duree) : les anciennes traductions
+  // survivraient a une transcription refaite, et decriraient un texte qui
+  // n'existe plus. « Refaire » doit vouloir dire refaire.
+  if (refaire) {
+    try {
+      const oubli = await chrome.runtime.sendMessage({ type: "MEMOIRE_OUBLIER" });
+      console.log("🗑️ LiveSub : memoire oubliee avant de refaire —", JSON.stringify(oubli));
+    } catch (err) {
+      console.warn("⚠️ LiveSub : impossible d'oublier la memoire —", err);
+    }
+    memEtat = null;
+  }
+
   prepSetStatus("⏳ Demarrage...", "#666");
   try {
     prepAppliquerEtat(
@@ -399,7 +524,138 @@ prepBtn.addEventListener("click", async () => {
     prepActif = false;
     prepMajUI();
   }
+}
+
+// Relire la memoire. C'est l'action normale sur une video connue.
+//
+// ⚠️ QUAND LA TRADUCTION DEMANDEE EST DEJA EN MEMOIRE, IL N'Y A AUCUN `await`
+// AVANT L'ENVOI : pas de `Translator.create`, donc aucune activation
+// utilisateur necessaire, donc rien a installer. C'est ce chemin-la qui doit
+// fonctionner meme si le dossier du modele a disparu -- il ne touche ni le
+// modele, ni le traducteur.
+async function memLancerAffichage() {
+  const paire = { source: tradSource.value, cible: tradCible.value };
+  const dejaTraduit =
+    !paire.cible || ((memEtat && memEtat.resume && memEtat.resume.langues) || []).includes(paire.cible);
+
+  if (!dejaTraduit) {
+    // Nouvelle langue d'arrivee : la paire doit etre installee, et c'est ici le
+    // seul instant ou l'activation utilisateur existe.
+    prepSetStatus(`⏳ Vérification ${nomDe(paire.source)} → ${nomDe(paire.cible)}...`, "#666");
+    const installation = await tradInstallerPaire(paire.source, paire.cible);
+    if (!installation.ok) {
+      prepMessage = { texte: "❌ " + installation.message, couleur: "#dc2626" };
+      prepMajUI();
+      return;
+    }
+  }
+
+  prepSetStatus(
+    dejaTraduit ? "⏳ Lecture de la mémoire..." : `⏳ Traduction vers ${nomDe(paire.cible)}...`,
+    "#4f46e5"
+  );
+
+  const t0 = performance.now();
+  let r;
+  try {
+    r = await chrome.runtime.sendMessage({
+      type: "MEMOIRE_AFFICHER",
+      traduction: paire.cible ? paire : null,
+    });
+  } catch (err) {
+    r = { ok: false, erreur: String((err && err.message) || err) };
+  }
+  const ms = Math.round(performance.now() - t0);
+
+  if (!r || !r.ok) {
+    prepMessage = {
+      texte: "❌ " + ((r && r.erreur) || "La mémoire n'a rien rendu"),
+      couleur: "#dc2626",
+    };
+    prepMajUI();
+    return;
+  }
+
+  // ⚠️ LE CHIFFRE QUI COMPTE EST AFFICHE, PAS SEULEMENT LE SUCCES. « Ça
+  // s'affiche » ne dit pas si ça a coûté 40 ms ou quatre minutes -- et c'est
+  // toute la question.
+  let texte = `✅ Depuis la mémoire — ${r.nbMots.toLocaleString("fr-FR")} mots, ${r.nbBlocs} blocs, ${ms} ms`;
+  if (r.traductionNeuve) {
+    texte += `\n🌍 Traduit vers ${nomDe(paire.cible)} en ${r.msTraduction} ms — AUCUNE retranscription`;
+    if (r.echecsTraduction) texte += `\n❌ ${r.echecsTraduction} segment(s) non traduits`;
+  }
+  if (!r.blocsRepris) texte += "\n(découpage refait : la mémoire n'en portait pas)";
+  prepMessage = {
+    texte,
+    couleur: r.echecsTraduction ? "#dc2626" : "#0f9d63",
+  };
+  console.log(`📼 LiveSub : affichage depuis la memoire en ${ms} ms —`, JSON.stringify(r));
+
+  // La memoire vient peut-etre de changer (nouvelle langue rangee) : on la relit
+  // pour que le bouton et le compteur de place disent la verite.
+  await memCharger();
+}
+
+prepBtn.addEventListener("click", async () => {
+  prepMessage = null;
+  prepBtn.disabled = true;
+  refaireBtn.disabled = true;
+
+  if (prepActif) {
+    prepSetStatus("⏳ Arret...", "#666");
+    try {
+      prepAppliquerEtat(await chrome.runtime.sendMessage({ type: "PREPARATION_ARRETER" }));
+    } catch (err) {
+      prepMessage = { texte: "❌ Echec : " + (err.message || err), couleur: "#dc2626" };
+      prepActif = false;
+      prepMajUI();
+    }
+    refaireBtn.disabled = false;
+    return;
+  }
+
+  // ⚠️ `memModeBouton()` est SYNCHRONE et lue AVANT le moindre `await` :
+  // l'activation utilisateur est intacte quand `tradInstallerPaire` s'execute,
+  // dans les deux branches.
+  const mode = memModeBouton();
+  if (mode === "demarrer") {
+    await prepLancerPreparation(false);
+  } else {
+    await memLancerAffichage();
+  }
+  refaireBtn.disabled = false;
 });
+
+// « Refaire la preparation » : on repaie volontairement les minutes, parce que
+// la transcription rangee etait mauvaise.
+refaireBtn.addEventListener("click", async () => {
+  prepMessage = null;
+  prepBtn.disabled = true;
+  refaireBtn.disabled = true;
+  await prepLancerPreparation(true);
+  refaireBtn.disabled = false;
+});
+
+// ---------------------------------------------------------------------------
+// Demander a la memoire ce qu'elle a
+// ---------------------------------------------------------------------------
+async function memCharger() {
+  try {
+    memEtat = await chrome.runtime.sendMessage({ type: "MEMOIRE_ETAT" });
+  } catch (err) {
+    memEtat = { connue: false, erreur: String((err && err.message) || err) };
+  }
+  // ⚠️ LA LANGUE DE DEPART DE LA PREPARATION RANGEE L'EMPORTE SUR LA DEVINETTE.
+  // Retraduire un texte francais en declarant « anglais » donnerait du charabia,
+  // et la devinette sur le titre de l'onglet se trompe. Ce qui est en memoire a
+  // ete utilise pour de vrai : il vaut mieux que la devinette.
+  if (memEtat && memEtat.connue && memEtat.resume && memEtat.resume.langueSource) {
+    const code = memEtat.resume.langueSource;
+    if (LANGUES_DEPART.some(([c]) => c === code)) tradSource.value = code;
+  }
+  console.log("💾 LiveSub : etat de la memoire —", JSON.stringify(memEtat && memEtat.resume ? memEtat.resume : memEtat));
+  prepMajUI();
+}
 
 async function prepCharger() {
   // On demande l'etat au background, on ne le devine pas : le service worker
@@ -424,12 +680,28 @@ chrome.storage.session.onChanged.addListener((changes) => {
   if (etaitActif && !prepActif) {
     chrome.runtime
       .sendMessage({ type: "PREPARATION_STOCK" })
-      .then((resume) => prepAppliquerEtat({ active: false, resume }))
+      .then((resume) => {
+        prepAppliquerEtat({ active: false, resume });
+        // La preparation qui vient de finir est en train de se ranger : on relit
+        // la memoire pour que le bouton change de sens tout de suite.
+        // ⚠️ C EST UNE COURSE, ET ELLE EST ASSUMEE : content.js range apres avoir
+        // construit ses blocs. Si on arrive avant lui, la popup montre l etat
+        // d avant -- elle ne ment pas, elle est juste en avance. La prochaine
+        // ouverture montrera la verite.
+        memCharger();
+      })
       .catch(() => prepMajUI());
     return;
   }
   prepMajUI();
 });
 
-tradCharger();
-prepCharger();
+// ⚠️ DANS CET ORDRE. `tradCharger` pose la langue d'arrivee, `prepCharger` dit
+// si une preparation tourne, et `memCharger` a besoin des deux pour choisir le
+// libelle du bouton. Les lancer en parallele ferait clignoter le bouton entre
+// deux sens differents.
+(async () => {
+  await tradCharger();
+  await prepCharger();
+  await memCharger();
+})();

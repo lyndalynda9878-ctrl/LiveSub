@@ -1,0 +1,232 @@
+{
+  "premiere": {
+    "mes": {
+      "ecartBlocs": {
+        "n": 69,
+        "medianeMs": 10,
+        "minMs": 0,
+        "maxMs": 19
+      },
+      "dureeBlocs": {
+        "n": 69,
+        "medianeMs": 3540,
+        "minMs": 1760,
+        "maxMs": 5040
+      },
+      "nbBlocs": 169,
+      "nbMots": 1400,
+      "debordements": 0,
+      "etat": "bloc",
+      "vientDeLaMemoire": null
+    }
+  },
+  "octets1": 76164,
+  "affichage": {
+    "ok": true,
+    "retranscrit": false,
+    "nbMots": 1400,
+    "nbBlocs": 169,
+    "blocsRepris": true,
+    "traductionNeuve": false,
+    "msTraduction": 0,
+    "echecsTraduction": 0,
+    "langues": [],
+    "quand": 1000000,
+    "place": {
+      "octets": 76424,
+      "quota": 10485760,
+      "pourcent": 0.7,
+      "libreOctets": 10409336
+    }
+  },
+  "contrepreuveB": {
+    "avant": 1400,
+    "apres": 1400,
+    "differents": 0,
+    "ecartMax": 0,
+    "motsDifferents": 0,
+    "blocsDifferents": 0
+  },
+  "critere3": {
+    "premiere": {
+      "n": 69,
+      "medianeMs": 10,
+      "minMs": 0,
+      "maxMs": 19
+    },
+    "memoire": {
+      "n": 69,
+      "medianeMs": 10,
+      "minMs": 0,
+      "maxMs": 19
+    }
+  },
+  "critere4": {
+    "reponse": {
+      "ok": true,
+      "retranscrit": false,
+      "nbMots": 1400,
+      "nbBlocs": 184,
+      "blocsRepris": false,
+      "traductionNeuve": true,
+      "msTraduction": 0,
+      "echecsTraduction": 0,
+      "langues": [
+        "en"
+      ],
+      "quand": 1480000,
+      "place": {
+        "octets": 109297,
+        "quota": 10485760,
+        "pourcent": 1,
+        "libreOctets": 10376463
+      }
+    },
+    "ms": 6,
+    "tradAppels": 184,
+    "motsIntacts": true
+  },
+  "octets2": 148401,
+  "memeLangue2eFois": {
+    "blocsRepris": true,
+    "traductionNeuve": false,
+    "memesBlocsEn": true
+  },
+  "deuxiemeLangue": {
+    "langues": [
+      "en",
+      "es"
+    ],
+    "nbMots": 1400,
+    "en": 184
+  },
+  "retourOrigine": {
+    "nbBlocs": 169,
+    "blocsRepris": true
+  },
+  "cles": [
+    [
+      "https://www.youtube.com/watch?v=aBcDeF12345",
+      "yt:aBcDeF12345"
+    ],
+    [
+      "https://www.youtube.com/watch?v=aBcDeF12345&t=120s",
+      "yt:aBcDeF12345"
+    ],
+    [
+      "https://www.youtube.com/watch?v=aBcDeF12345&list=PLabc&index=3",
+      "yt:aBcDeF12345"
+    ],
+    [
+      "https://m.youtube.com/watch?v=aBcDeF12345&t=42",
+      "yt:aBcDeF12345"
+    ],
+    [
+      "https://youtu.be/aBcDeF12345?t=120",
+      "yt:aBcDeF12345"
+    ],
+    [
+      "https://www.youtube.com/shorts/aBcDeF12345",
+      "yt:aBcDeF12345"
+    ],
+    [
+      "https://www.youtube.com/watch?v=AUTREVIDEO1",
+      "yt:AUTREVIDEO1"
+    ],
+    [
+      "https://exemple.fr/cours/lecon-3?autoplay=1#t=10",
+      "url:https://exemple.fr/cours/lecon-3"
+    ],
+    [
+      "https://exemple.fr/cours/lecon-3",
+      "url:https://exemple.fr/cours/lecon-3"
+    ],
+    [
+      "https://exemple.fr/cours/lecon-4",
+      "url:https://exemple.fr/cours/lecon-4"
+    ]
+  ],
+  "dureeDifferente": {
+    "etat": {
+      "connue": false,
+      "identite": {
+        "tabId": 7,
+        "success": true,
+        "cle": "yt:aBcDeF12345",
+        "url": "https://www.youtube.com/watch?v=aBcDeF12345&t=99",
+        "titre": "Une video de demonstration — LiveSub",
+        "duree": 635.826
+      },
+      "place": {
+        "octets": 220889,
+        "quota": 10485760,
+        "pourcent": 2.1,
+        "libreOctets": 10264871
+      },
+      "inventaire": [
+        {
+          "cle": "yt:aBcDeF12345",
+          "titre": "Une video de demonstration — LiveSub",
+          "url": "https://www.youtube.com/watch?v=aBcDeF12345&t=120s&list=PLxxxxxxxx&pp=ygUJdGVzdA%3D%3D",
+          "quand": 1480000,
+          "dureeVideo": 590.826,
+          "dureeCouverteS": 590.826,
+          "nbMots": 1400,
+          "langueSource": "fr",
+          "langues": [
+            "en",
+            "es"
+          ],
+          "octets": 220576
+        }
+      ],
+      "raison": "duree differente (memoire 591 s, page 636 s) : ce n'est pas la meme video"
+    },
+    "affichage": {
+      "ok": false,
+      "erreur": "La video n'a pas la meme duree qu'en memoire (591 s contre 636 s)."
+    }
+  },
+  "tolerance": true,
+  "critere5": {
+    "octetsParVideo": 220576,
+    "combien": 47
+  },
+  "eviction": {
+    "posees": 138,
+    "enMemoire": 137,
+    "place": {
+      "octets": 10466191,
+      "quota": 10485760,
+      "pourcent": 99.8,
+      "libreOctets": 19569
+    },
+    "journalEviction": [
+      {
+        "posees": 135,
+        "enMemoire": 135,
+        "octets": 10313393,
+        "pourcent": 98.4
+      },
+      {
+        "posees": 136,
+        "enMemoire": 136,
+        "octets": 10389790,
+        "pourcent": 99.1
+      },
+      {
+        "posees": 137,
+        "enMemoire": 137,
+        "octets": 10466187,
+        "pourcent": 99.8
+      },
+      {
+        "posees": 138,
+        "enMemoire": 137,
+        "octets": 10466191,
+        "pourcent": 99.8
+      }
+    ],
+    "premiereEncoreLa": false
+  }
+}

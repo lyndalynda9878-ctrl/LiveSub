@@ -481,3 +481,489 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; // reponse asynchrone
   }
 });
+
+
+// ===========================================================================
+// LA MEMOIRE DES PREPARATIONS — chrome.storage.local, ET ICI SEULEMENT
+// ===========================================================================
+//
+// ⚠️ POURQUOI TOUT LE STORAGE EST DANS CE FICHIER. `chrome.storage` est
+// INDISPONIBLE dans le document offscreen (verifie dans Chrome : `chrome` est
+// bien un objet, `chrome.storage` est `undefined`). Y toucher la-bas leve un
+// TypeError AU CHARGEMENT, le fichier meurt a cette ligne, et plus rien ne
+// repond -- sans erreur, sans echec, sans delai. C'est deja arrive une fois.
+//
+// L'offscreen ENVOIE donc, et c'est le service worker qui RANGE. content.js
+// aurait pu ecrire lui-meme (un content script a bien acces au storage), mais
+// alors la memoire serait ecrite depuis deux endroits, avec deux idees de ce
+// qu'elle contient et deux facons de faire de la place. Un seul ecrivain.
+//
+// ⚠️ AUCUNE PERMISSION AJOUTEE. `storage` etait deja la, et il n'y a PAS de
+// `unlimitedStorage` : on tient dans les ~10 Mo de `chrome.storage.local`, et
+// quand ils sont pleins on supprime la preparation la plus ancienne en le
+// disant. Ajouter `unlimitedStorage` serait une decision, pas un detail.
+
+const MEM_PREFIXE = "prep:";
+const MEM_INDEX = "preparationsIndex";
+const MEM_VERSION = 1;
+
+// 10 485 760 octets. `QUOTA_BYTES` est lu sur l'API quand elle l'expose, pour
+// que la valeur ne puisse pas mentir si Chrome la change un jour.
+const MEM_QUOTA = chrome.storage.local.QUOTA_BYTES || 10485760;
+
+// ⚠️ LA DUREE NE SE COMPARE PAS AU MILLIEME. `video.duration` d'un flux adaptatif
+// bouge de quelques dizaines de millisecondes d'une session a l'autre (le dernier
+// segment n'a pas toujours la meme longueur). Une egalite stricte ferait donc
+// rater la memoire a peu pres a chaque fois. Une seconde de tolerance : c'est
+// large devant ce bruit-la, et tres serre devant « ce n'est pas la meme video ».
+const MEM_TOLERANCE_DUREE_S = 1.0;
+
+function memCleRangee(cle) {
+  return MEM_PREFIXE + cle;
+}
+
+// L'INDEX : un petit resume par preparation, dans une seule cle.
+//
+// ⚠️ POURQUOI UN INDEX PLUTOT QUE DE TOUT RELIRE. La popup a besoin de savoir,
+// a chaque ouverture, ce qui est en memoire. Sans index il faudrait charger et
+// analyser jusqu'a 10 Mo de JSON pour afficher deux lignes -- a chaque clic sur
+// l'icone. L'index fait quelques centaines d'octets.
+//
+// Il est ecrit DANS LE MEME `set` que l'entree qu'il decrit : les deux arrivent
+// ensemble ou pas du tout, donc il ne peut pas annoncer une preparation qui
+// n'existe pas.
+async function memIndex() {
+  const r = await chrome.storage.local.get(MEM_INDEX);
+  const i = r[MEM_INDEX];
+  return i && typeof i === "object" ? i : {};
+}
+
+function memResumeIndex(entree, octets) {
+  return {
+    titre: entree.titre || "",
+    url: entree.url || "",
+    quand: entree.quand || 0,
+    dureeVideo: entree.dureeVideo,
+    dureeCouverteS: entree.dureeCouverteS,
+    nbMots: Array.isArray(entree.mots) ? entree.mots.length : 0,
+    langueSource: entree.langueSource || null,
+    langues: Object.keys(entree.traductions || {}),
+    octets: octets || 0,
+  };
+}
+
+async function memPlace() {
+  const octets = await chrome.storage.local.getBytesInUse(null);
+  return {
+    octets,
+    quota: MEM_QUOTA,
+    pourcent: Math.round((octets / MEM_QUOTA) * 1000) / 10,
+    libreOctets: Math.max(0, MEM_QUOTA - octets),
+  };
+}
+
+async function memLireEntree(cle) {
+  if (!cle) return null;
+  const r = await chrome.storage.local.get(memCleRangee(cle));
+  const e = r[memCleRangee(cle)];
+  if (!e || typeof e !== "object") return null;
+  // ⚠️ Une entree ecrite par une generation precedente est FAUSSE pour
+  // celle-ci, et comme elle est memorisee pour de bon elle ne serait jamais
+  // refaite. La protection n'est pas le menage, c'est ce test : on ne lit que
+  // la version courante. (Meme lecon que les trois generations de
+  // `retardCalibre` de l'ere Whisper.)
+  if (e.version !== MEM_VERSION) return null;
+  if (!Array.isArray(e.mots) || !e.mots.length) return null;
+  return e;
+}
+
+// « Est-ce bien la meme video ? » — la cle NE SUFFIT PAS.
+function memMemeVideo(entree, duree) {
+  if (!entree) return false;
+  if (!Number.isFinite(duree) || duree <= 0) return false;
+  if (!Number.isFinite(entree.dureeVideo)) return false;
+  return Math.abs(entree.dureeVideo - duree) <= MEM_TOLERANCE_DUREE_S;
+}
+
+// ---------------------------------------------------------------------------
+// Ecrire, et faire de la place quand il n'y en a plus
+// ---------------------------------------------------------------------------
+//
+// ⚠️ ON N'ESTIME PAS LA PLACE, ON LA CONSTATE. Un calcul « taille du JSON contre
+// place libre » se tromperait : le storage a son propre encodage, et une
+// estimation trop optimiste laisserait passer une ecriture qui echoue, une
+// estimation trop prudente supprimerait des preparations pour rien. On ECRIT,
+// et si Chrome refuse pour cause de quota, on supprime la plus ancienne et on
+// recommence.
+//
+// ⚠️ ET ON NE SIMPLIFIE JAMAIS LES DONNEES POUR LES FAIRE RENTRER. Si une seule
+// preparation ne tient pas dans un storage vide, on le DIT au lieu de rogner
+// les instants ou de jeter des mots.
+async function memRanger(cle, entree) {
+  const clePleine = memCleRangee(cle);
+  entree.version = MEM_VERSION;
+  entree.quand = Date.now();
+
+  let index = await memIndex();
+  const evincees = [];
+
+  for (;;) {
+    const nouvelIndex = { ...index, [cle]: memResumeIndex(entree) };
+    try {
+      await chrome.storage.local.set({ [clePleine]: entree, [MEM_INDEX]: nouvelIndex });
+      // La taille REELLE, lue apres coup : c'est la seule qui compte.
+      const octets = await chrome.storage.local.getBytesInUse(clePleine);
+      nouvelIndex[cle] = memResumeIndex(entree, octets);
+      await chrome.storage.local.set({ [MEM_INDEX]: nouvelIndex });
+      return { ok: true, octets, evincees, place: await memPlace() };
+    } catch (err) {
+      const brut = String((err && err.message) || err);
+      if (!/quota/i.test(brut)) throw err;
+
+      const victime = memPlusAncienne(index, cle);
+      if (!victime) {
+        return {
+          ok: false,
+          evincees,
+          erreur:
+            "Cette preparation ne tient pas dans les " +
+            Math.round(MEM_QUOTA / 1024) +
+            " Ko de chrome.storage.local, et il n'y a plus rien de plus ancien a supprimer.\n" +
+            "Rien n'a ete simplifie ni tronque : la preparation n'est simplement pas rangee.",
+        };
+      }
+      await chrome.storage.local.remove(memCleRangee(victime));
+      evincees.push({ cle: victime, ...index[victime] });
+      delete index[victime];
+      await chrome.storage.local.set({ [MEM_INDEX]: index });
+      console.warn(
+        `🗑️ Memoire pleine : preparation la plus ancienne supprimee — ${victime} ` +
+          `(${(evincees[evincees.length - 1].titre || "sans titre").slice(0, 60)}, ` +
+          `${Math.round((evincees[evincees.length - 1].octets || 0) / 1024)} Ko)`
+      );
+    }
+  }
+}
+
+// La plus ancienne, celle qu'on n'est pas en train d'ecrire.
+function memPlusAncienne(index, sauf) {
+  let choisie = null;
+  for (const [cle, r] of Object.entries(index)) {
+    if (cle === sauf) continue;
+    if (!choisie || (r.quand || 0) < (index[choisie].quand || 0)) choisie = cle;
+  }
+  return choisie;
+}
+
+// ---------------------------------------------------------------------------
+// Fusionner : la transcription d'un cote, les traductions de l'autre
+// ---------------------------------------------------------------------------
+//
+// ⚠️ C'EST ICI QUE VIT LA REGLE DE STRUCTURE. La transcription (`mots`,
+// `blocs`) est ecrite une fois par video ; chaque traduction se range sous SA
+// langue d'arrivee, a cote des autres. Ajouter une langue n'efface pas les
+// precedentes, et ne touche pas d'un octet a la transcription.
+function memFusionner(existante, charge) {
+  const entree =
+    existante && memMemeVideo(existante, charge.dureeVideo)
+      ? existante
+      : { version: MEM_VERSION, cle: charge.cle, traductions: {} };
+
+  if (!entree.traductions || typeof entree.traductions !== "object") entree.traductions = {};
+
+  if (Array.isArray(charge.mots) && charge.mots.length) {
+    entree.cle = charge.cle;
+    entree.url = charge.url;
+    entree.titre = charge.titre;
+    entree.dureeVideo = charge.dureeVideo;
+    entree.positionDepart = charge.positionDepart;
+    entree.dureeCouverteS = charge.dureeCouverteS;
+    entree.mots = charge.mots;
+    entree.blocs = Array.isArray(charge.blocs) ? charge.blocs : [];
+    if (charge.langueSource) entree.langueSource = charge.langueSource;
+    if (charge.langueEntendue) entree.langueEntendue = charge.langueEntendue;
+    if (!entree.quandTranscription) entree.quandTranscription = Date.now();
+  }
+
+  const t = charge.traduction;
+  if (t && t.cible) {
+    entree.traductions[t.cible] = {
+      source: t.source,
+      cible: t.cible,
+      quand: Date.now(),
+      // Les deux formes, et c'est voulu : les SEGMENTS sont la sortie brute du
+      // traducteur, les BLOCS le resultat de la fusion pour la lecture. Garder
+      // les deux, c'est pouvoir re-decouper sans jamais retraduire.
+      segments: Array.isArray(charge.segments) ? charge.segments : [],
+      blocs: Array.isArray(charge.blocsTraduits) ? charge.blocsTraduits : [],
+    };
+  }
+
+  return entree;
+}
+
+// ---------------------------------------------------------------------------
+// L'identite de l'onglet actif, demandee a content.js
+// ---------------------------------------------------------------------------
+async function memIdentiteOnglet() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) throw new Error("Aucun onglet actif");
+  let identite;
+  try {
+    identite = await chrome.tabs.sendMessage(tab.id, { type: "MEMOIRE_IDENTITE" });
+  } catch (err) {
+    throw new Error("LiveSub n'est pas charge sur cette page : recharge-la (F5) puis reessaie");
+  }
+  if (!identite || !identite.cle) throw new Error("Cette page n'a pas d'adresse exploitable");
+  return { tabId: tab.id, ...identite };
+}
+
+// ---------------------------------------------------------------------------
+// Ce que la popup demande a l'ouverture
+// ---------------------------------------------------------------------------
+async function memEtat() {
+  const place = await memPlace();
+  const index = await memIndex();
+  const inventaire = Object.entries(index)
+    .map(([cle, r]) => ({ cle, ...r }))
+    .sort((a, b) => (b.quand || 0) - (a.quand || 0));
+
+  let identite = null;
+  let erreur = null;
+  try {
+    identite = await memIdentiteOnglet();
+  } catch (err) {
+    erreur = String((err && err.message) || err);
+  }
+  if (!identite) return { connue: false, place, inventaire, erreur };
+
+  const entree = await memLireEntree(identite.cle);
+  if (!entree) {
+    return { connue: false, identite, place, inventaire, raison: "aucune preparation pour cette video" };
+  }
+  if (!memMemeVideo(entree, identite.duree)) {
+    // ⚠️ ON LE DIT. Une memoire ignoree en silence se lit comme « la memoire ne
+    // marche pas » ; ici elle a marche, c'est la video qui a change.
+    console.warn(
+      `⚠️ Memoire ignoree pour ${identite.cle} : duree en memoire ` +
+        `${entree.dureeVideo} s, duree de la page ${identite.duree} s`
+    );
+    return {
+      connue: false,
+      identite,
+      place,
+      inventaire,
+      raison: `duree differente (memoire ${Math.round(entree.dureeVideo)} s, page ${Math.round(identite.duree || 0)} s) : ce n'est pas la meme video`,
+    };
+  }
+
+  return {
+    connue: true,
+    identite,
+    place,
+    inventaire,
+    resume: {
+      cle: entree.cle,
+      titre: entree.titre,
+      quand: entree.quand,
+      quandTranscription: entree.quandTranscription || entree.quand,
+      nbMots: entree.mots.length,
+      nbBlocs: Array.isArray(entree.blocs) ? entree.blocs.length : 0,
+      dureeVideo: entree.dureeVideo,
+      dureeCouverteS: entree.dureeCouverteS,
+      langueSource: entree.langueSource || null,
+      langues: Object.keys(entree.traductions || {}),
+      octets: (index[entree.cle] && index[entree.cle].octets) || 0,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Afficher depuis la memoire
+// ---------------------------------------------------------------------------
+//
+// ⭐ LE POINT QUI DECIDE DE TOUT : QUAND AUCUNE TRADUCTION NEUVE N'EST
+// NECESSAIRE, ON NE CREE MEME PAS LE DOCUMENT OFFSCREEN. Pas d'offscreen, pas de
+// worker, pas de Parakeet, pas un octet du modele touche. C'est ce qui fait que
+// la contre-preuve (renommer models/) est une VRAIE contre-preuve : s'il
+// retranscrivait en douce, il echouerait.
+async function memAfficher(traduction) {
+  const identite = await memIdentiteOnglet();
+  const entree = await memLireEntree(identite.cle);
+  if (!entree) return { ok: false, erreur: "Aucune preparation en memoire pour cette video" };
+  if (!memMemeVideo(entree, identite.duree)) {
+    return {
+      ok: false,
+      erreur:
+        `La video n'a pas la meme duree qu'en memoire ` +
+        `(${Math.round(entree.dureeVideo)} s contre ${Math.round(identite.duree || 0)} s).`,
+    };
+  }
+
+  const cible = traduction && traduction.cible ? traduction.cible : null;
+  let rangee = cible ? entree.traductions[cible] : null;
+  let msTraduction = 0;
+  let traductionNeuve = false;
+  let echecsTraduction = 0;
+
+  if (cible && !rangee) {
+    // ⚠️ ON RETRADUIT, ON NE RETRANSCRIT PAS. Les mots et leurs instants sont
+    // deja la : seule la traduction depend de la langue d'arrivee. L'offscreen
+    // est cree UNIQUEMENT pour ca, et `PREPARATION_RETRADUIRE` ne charge aucun
+    // modele.
+    const t0 = Date.now();
+    await createOffscreen();
+    let r;
+    try {
+      r = await chrome.runtime.sendMessage({
+        type: "PREPARATION_RETRADUIRE",
+        mots: entree.mots,
+        traduction: { source: traduction.source, cible },
+      });
+    } catch (err) {
+      return { ok: false, erreur: "Le module de traduction n'a pas repondu : " + ((err && err.message) || err) };
+    }
+    if (!r || !r.success) {
+      return { ok: false, erreur: (r && r.error) || "La retraduction a echoue" };
+    }
+    msTraduction = Date.now() - t0;
+    traductionNeuve = true;
+    echecsTraduction = r.nbEchecs || 0;
+    rangee = {
+      source: traduction.source,
+      cible,
+      quand: Date.now(),
+      segments: r.segments,
+      // Le decoupage en blocs se fait dans la page (il mesure une hauteur
+      // reelle) : content.js le fera et nous le renverra pour rangement.
+      blocs: [],
+    };
+    entree.traductions[cible] = rangee;
+    const range = await memRanger(identite.cle, entree);
+    if (!range.ok) console.warn("⚠️ Traduction non rangee : " + range.erreur);
+    console.log(
+      `🌍 Retraduction ${traduction.source} → ${cible} : ${r.nbSegments} segments en ${msTraduction} ms ` +
+        `(${echecsTraduction} echec(s)) — AUCUNE retranscription`
+    );
+  }
+
+  const blocs = rangee ? rangee.blocs : entree.blocs;
+  const envoi = {
+    type: "MEMOIRE_AFFICHER",
+    cle: entree.cle,
+    quand: entree.quand,
+    mots: entree.mots,
+    blocs: Array.isArray(blocs) && blocs.length ? blocs : null,
+    segments: rangee ? rangee.segments : [],
+    traduction: rangee ? { source: rangee.source, cible: rangee.cible } : null,
+    positionDepart: entree.positionDepart,
+    dureeCouverteS: entree.dureeCouverteS,
+    // Le decoupage vient d'etre refait : content.js le rangera.
+    aRanger: traductionNeuve,
+  };
+
+  let reponse;
+  try {
+    reponse = await chrome.tabs.sendMessage(identite.tabId, envoi);
+  } catch (err) {
+    return { ok: false, erreur: "L'onglet n'a pas repondu : " + ((err && err.message) || err) };
+  }
+  if (!reponse || !reponse.success) {
+    return { ok: false, erreur: (reponse && reponse.erreur) || "L'affichage a refuse le stock" };
+  }
+
+  return {
+    ok: true,
+    // ⚠️ CE DRAPEAU EST LA PREUVE, ET IL VAUT `false` PAR CONSTRUCTION : aucune
+    // ligne de cette fonction ne demarre une capture ni ne charge un modele.
+    retranscrit: false,
+    nbMots: reponse.nbMots,
+    nbBlocs: reponse.nbBlocs,
+    blocsRepris: reponse.blocsRepris,
+    traductionNeuve,
+    msTraduction,
+    echecsTraduction,
+    langues: Object.keys(entree.traductions || {}),
+    quand: entree.quand,
+    place: await memPlace(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Messages — un listener A PART
+// ---------------------------------------------------------------------------
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "MEMOIRE_ETAT") {
+    memEtat()
+      .then(sendResponse)
+      // Tout `return true` a son `.catch` qui REPOND : sans lui, la popup
+      // resterait figee sans le moindre message.
+      .catch((err) => sendResponse({ connue: false, erreur: String((err && err.message) || err) }));
+    return true;
+  }
+
+  if (request.type === "MEMOIRE_ENREGISTRER") {
+    (async () => {
+      const charge = request.charge || {};
+      if (!charge.cle) return { ok: false, erreur: "Pas de cle video" };
+      if (!Number.isFinite(charge.dureeVideo) || charge.dureeVideo <= 0) {
+        return { ok: false, erreur: "Duree de la video inconnue : impossible de la reconnaitre plus tard" };
+      }
+      const existante = await memLireEntree(charge.cle);
+      // La langue de DEPART DECLAREE dans la popup, quand la preparation s'est
+      // faite sans traduction (aucune paire n'a alors ete transmise).
+      // ⚠️ Elle est DECLAREE, pas detectee : c'est pour ca qu'elle porte ce
+      // nom-la et pas « langue de la video ».
+      if (!charge.langueSource) {
+        const r = await chrome.storage.local.get("traductionPaire");
+        const paire = r.traductionPaire;
+        if (paire && paire.source) charge.langueSource = paire.source;
+      }
+      if (charge.traduction && charge.traduction.source) charge.langueSource = charge.traduction.source;
+      return memRanger(charge.cle, memFusionner(existante, charge));
+    })()
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, erreur: String((err && err.message) || err) }));
+    return true;
+  }
+
+  if (request.type === "MEMOIRE_AFFICHER") {
+    memAfficher(request.traduction || null)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, erreur: String((err && err.message) || err) }));
+    return true;
+  }
+
+  // « Refaire la preparation » : on oublie AVANT de relancer, pour que la
+  // nouvelle preparation ne se retrouve pas fusionnee avec l'ancienne.
+  if (request.type === "MEMOIRE_OUBLIER") {
+    (async () => {
+      const cle = request.cle || (await memIdentiteOnglet()).cle;
+      const index = await memIndex();
+      const avait = Boolean(index[cle]);
+      delete index[cle];
+      await chrome.storage.local.remove(memCleRangee(cle));
+      await chrome.storage.local.set({ [MEM_INDEX]: index });
+      console.log(`🗑️ Memoire : preparation oubliee (${cle})` + (avait ? "" : " — il n'y en avait pas"));
+      return { ok: true, avait, place: await memPlace() };
+    })()
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, erreur: String((err && err.message) || err) }));
+    return true;
+  }
+
+  // La place occupee, en clair. Sert a la popup ET a la mesure.
+  if (request.type === "MEMOIRE_PLACE") {
+    (async () => {
+      const place = await memPlace();
+      const index = await memIndex();
+      const inventaire = Object.entries(index)
+        .map(([cle, r]) => ({ cle, ...r }))
+        .sort((a, b) => (b.quand || 0) - (a.quand || 0));
+      return { ok: true, place, inventaire, nbPreparations: inventaire.length };
+    })()
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, erreur: String((err && err.message) || err) }));
+    return true;
+  }
+});
