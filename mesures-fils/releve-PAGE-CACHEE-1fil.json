@@ -1,0 +1,20 @@
+{
+ "visible": "visible",
+ "resultat": {
+  "fils": 1,
+  "filsPoses": 1,
+  "duree": 23,
+  "temps": [
+   27363.699999999255,
+   26790.099999999627,
+   25930.5
+  ],
+  "meilleur": 25930.5,
+  "rtf": 1.1274130434782608,
+  "seuil": 0.43478260869565216,
+  "mots": 41,
+  "texte": "La|mort|de|mes|premières|étoiles,|les|trous|noirs|supermassifs|se|sont|nourris|pendant|des|milliards|d'années|de|matière,|de|gaz,|d'étoiles|parfois,|ou|même|d'autres|trous|noirs.|La|surface|d'un|trou|noir|marque|l'espace,|à|l'intérieur|duquel|matière|et|lumière.",
+  "memoirePartagee": true,
+  "memoireWasmMo": 1335.1
+ }
+}

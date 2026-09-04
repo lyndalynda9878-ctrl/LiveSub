@@ -13,6 +13,18 @@
 >
 > ⛔ **AUCUNE RÈGLE tirée d'un bloc daté ne doit être appliquée aujourd'hui.** Les
 > mesures, elles, restent valables pour ce qu'elles mesuraient.
+>
+> ## ⚠️ DEUXIÈME MISE À JOUR — 2026-09-04 : LES FILS D'EXÉCUTION
+>
+> **Le moteur tourne désormais sur 4 fils WASM au lieu d'un seul, dans le document
+> offscreen comme ailleurs.** `SharedArrayBuffer` y est disponible ; la CSP de MV3 n'a
+> jamais bloqué le multithread. Gain **×1,95** (RTF **0,283 → 0,137–0,141**), pour un
+> **texte rigoureusement identique**.
+>
+> Il y a donc **deux dates de péremption** dans ce fichier, et la même convention pour
+> les deux : `⏳ VRAI JUSQU'AU 04/09/2026` marque ce que cette mesure-ci a périmé.
+> ⛔ **Tout chiffre de vitesse non daté « 4 fils » est un chiffre à 1 fil** — vrai pour
+> ce qu'il mesurait, faux comme description d'aujourd'hui.
 
 ## Vue d'ensemble
 LiveSub est une **extension de navigateur (Chrome, Manifest V3)** qui capte le son de
@@ -76,11 +88,14 @@ chaque mot avant que la lecture commence, donc elle n'a plus rien à estimer.
   (`prepAfficherErreur`).
 - `offscreen.html` / `offscreen.js` — capture audio (getUserMedia sur l'onglet),
   découpage en blocs, table des ancres, stock des mots. **Vérifie aussi les cinq
-  fichiers du modèle AVANT tout chargement** (`prepModeleManquant`).
+  fichiers du modèle AVANT tout chargement** (`prepModeleManquant`). C'est ici que vit
+  **`PREP_FILS = 4`**, le nombre de fils WASM du moteur — le seul endroit où il se règle.
 - `preparation.worklet.js` — AudioWorklet qui empile le son capté. Fait la **moyenne des
   deux canaux** (voir 5 bis).
 - `parakeet.worker.js` — **Web Worker** de transcription : c'est là que vivent
-  parakeet.js et ONNX Runtime, pour que le fil principal ne fige jamais.
+  parakeet.js et ONNX Runtime, pour que le fil principal ne fige jamais. Reçoit le
+  nombre de fils dans `init` et le pose sur `ort.env.wasm.numThreads` **juste avant la
+  première session** — ONNX Runtime ne le relit jamais après.
 - `models/parakeet-tdt-0.6b-v3/` — les 5 fichiers de poids, 640 Mo. Gitignoré,
   téléchargé par `npm run fetch-model` (`scripts/fetch-model.js`).
 - `vendor/` — librairies locales. Gitignoré, régénéré par `scripts/copy-assets.js`
@@ -88,6 +103,10 @@ chaque mot avant que la lecture commence, donc elle n'a plus rien à estimer.
 - `README.md` — installation, licences, attribution NVIDIA (condition CC-BY-4.0).
 - `test-parakeet.html` / `.js`, `test-parakeet-worker.html` / `.js` — pages de mesure du
   moteur actuel.
+- `test-fils.html` / `.js` (page d'extension) et `test-fils-offscreen.html` / `.js`
+  (**dans le document offscreen**) — bancs des fils WASM : relèvent `SharedArrayBuffer`,
+  `crossOriginIsolated`, les fils demandés **et** les fils réellement posés, puis
+  chronomètrent. Relevés dans `mesures-fils/`.
 
 ⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — les fichiers du mode direct.**
 
@@ -195,6 +214,23 @@ plus pour la production, mais l'erreur de méthode, elle, est à retenir.
 | RTF (facteur temps réel) | 0,31 (tiny) | **0,283** |
 | requêtes externes | 0 | **0** |
 
+⚠️ **La ligne RTF ci-dessus est celle du 30/08/2026, à `numThreads = 1`. Elle reste vraie
+pour ce qu'elle mesurait — mais ce n'est plus le réglage de production.** Depuis le
+04/09/2026 le moteur tourne à **4 fils** (`PREP_FILS`, `offscreen.js`). Même bloc de 23 s,
+meilleur de 3 passes, relevés dans `mesures-fils/` :
+
+| RTF du moteur seul | 1 fil | **4 fils** |
+|---|---|---|
+| mesuré le 30/08/2026 | **0,283** | — |
+| mesuré le 03/09/2026 (page d'extension) | 0,268 à 0,309 | **0,137 à 0,141** |
+| rapport | — | **×1,95** |
+
+⚠️ **Le texte rendu est RIGOUREUSEMENT IDENTIQUE à 1 et à 4 fils** — mot pour mot,
+ponctuation comprise, vérifié sur les relevés `D-1fil-texte` et `E-4fils-texte`. **Ce
+n'est donc pas le piège de WebGPU**, qui lui, rendait un texte faux (section suivante).
+Le relevé complet, la mesure dans l'offscreen et la raison de ne pas monter au-delà de 4
+sont dans « Contraintes techniques connues ».
+
 ---
 
 ## WebGPU : plus lent, ET il ne rend pas le même texte
@@ -212,6 +248,13 @@ plus pour la production, mais l'erreur de méthode, elle, est à retenir.
 
 **La signature à reconnaître : une confiance de 0,6234.** Quand cette valeur apparaît,
 c'est WebGPU qui calcule, quoi qu'on croie avoir configuré.
+
+⛔ **Le verdict est le même au 04/09/2026 : NON, on n'active pas WebGPU.** Le passage du
+CPU à 4 fils ne rouvre pas la question — il accélère le camp qui gagnait déjà, et le
+second reproche (un texte faux) n'a jamais eu de rapport avec la vitesse. Le rapport
+exact GPU / CPU-à-4-fils est **NON MESURÉ**, et il n'y a aucune raison de le mesurer :
+un moteur qui rend « d'étoil » au lieu de « d'étoiles » est écarté quel que soit son
+chrono.
 
 ### ⚠️ Ce n'est pas le bundle, c'est le PROVIDER — mais la consigne ne change pas
 
@@ -1052,6 +1095,15 @@ problème**, pas deux : régler les blocs lents règle l'attente finale.
 aucun incident. Le système n'avait aucune capacité de récupération. C'est ça qu'on
 corrige, pas seulement l'incident.
 
+✅ **CE QUI A FINI PAR RENDRE LA MARGE (04/09/2026) : les 4 fils WASM.** Le raisonnement
+« dette » de cette section est resté vrai sous Parakeet — un run réel de 9 min à **1 fil**
+(28 blocs, `mesures-traduction/9min-valide.json`) a payé **237 s de déficit d'un coup à la
+fin**, les « environ 5 minutes » d'attente rapportées. Le passage à 4 fils double la
+vitesse du moteur, donc double la marge par bloc, et cette attente est réglée (mesuré le
+04/09/2026). ⚠️ **Le chiffre à surveiller reste celui de cette section, pas le nombre de
+fils** : le temps par bloc (ligne `📦 bloc N`) doit rester sous la moitié de la durée de
+contenu du bloc.
+
 ⏳ **CE QUI SUIT REPOSE ENTIÈREMENT SUR UNE PROPRIÉTÉ DE WHISPER (noté le 30/08/2026).**
 « L'encodeur coûte pareil pour 10 s ou 27 s » et « les 30 s sont un mur » sont vrais de
 **Whisper**, qui complète tout extrait à 30 s. **Parakeet est un transducteur : il n'a ni
@@ -1265,19 +1317,88 @@ total sans aucun sous-titre — et c'est cette mesure-là qu'il faut regarder, p
   D'où deux règles : *(1)* l'offscreen ne touche jamais `chrome.storage` ; *(2)* tout
   `return true` dans un `onMessage` doit avoir un `.catch` qui répond — sinon la moindre
   erreur devient un blocage muet.
-- CSP MV3 : `wasm-unsafe-eval` requis pour le WASM ; les workers `blob:` sont bloqués
-  → `proxy = false`.
-- ⚠️ **`numThreads = 1` N'EST PLUS UNE FATALITÉ — ET C'EST UNE QUESTION OUVERTE, PAS UN
-  ACQUIS.** Il était écrit ici que « la CSP de MV3 bloque le multithread ». **C'est faux.**
-  Mesuré le 30/08/2026 : **4 fils ont fonctionné dans une page d'extension**,
-  `SharedArrayBuffer` était disponible, et le gain était de **2,4×**.
+- CSP MV3 : `wasm-unsafe-eval` requis pour le WASM. `proxy = false` reste posé.
 
-  ❓ **CE QUI N'EST PAS VÉRIFIÉ : le document offscreen.** Toute la production tourne là,
-  et une page d'extension n'est pas un document offscreen — l'isolation d'origine croisée
-  peut y différer. Tant que ce n'est pas mesuré **dans l'offscreen**, on reste à
-  `numThreads = 1` en production. Ce qui trancherait : lire `crossOriginIsolated` et
-  `typeof SharedArrayBuffer` depuis `offscreen.js`, puis chronométrer 1 fil contre 4 sur
-  le même bloc.
+  ⏳ **VRAI JUSQU'AU 04/09/2026 — la seconde moitié de cette ligne.** Texte d'origine,
+  intact :
+
+  > CSP MV3 : `wasm-unsafe-eval` requis pour le WASM ; les workers `blob:` sont bloqués
+  > → `proxy = false`.
+
+  → **Ce qui a changé** : la phrase n'est pas fausse sur les workers `blob:` — mais elle
+  **ne dit rien des fils d'ONNX Runtime**, et c'est pourtant à ça qu'elle a servi pendant
+  des mois. Vérifié le 04/09/2026 dans
+  `node_modules/parakeet.js/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs`
+  (ONNX Runtime **1.24.1**) : **zéro occurrence de `blob:`** dans tout le fichier, et les
+  fils démarrent par `new Worker(new URL(import.meta.url))` — une URL
+  `chrome-extension://` ordinaire, que la CSP ne bloque pas. `proxy = false` est gardé,
+  mais **il n'a jamais eu le moindre rapport avec le nombre de fils**.
+- ⛔ **RÈGLE (04/09/2026) — LA PRODUCTION TOURNE À 4 FILS WASM.** Le réglage est
+  `PREP_FILS = 4` dans `offscreen.js` ; le worker le reçoit dans `init` et le pose juste
+  avant la première session (`ort.env.wasm.numThreads`). **Ne pas revenir à 1 « par
+  prudence » : 1 fil est le réglage qui ne tenait pas le ×2.**
+
+  Mesuré le 04/09/2026 **dans le document offscreen** — l'endroit qui manquait, et le
+  seul qui compte pour la production (relevés `mesures-fils/releve-OFF-*.json`) :
+
+  | dans l'offscreen | relevé |
+  |---|---|
+  | `SharedArrayBuffer`, document **et** worker | **présent** |
+  | `crossOriginIsolated` | **false** |
+  | 4 fils demandés | **4 posés** |
+  | texte rendu à 1, 2, 3, 4, 6 et 8 fils | **rigoureusement identique** |
+  | fils matériels de la machine | 12 |
+
+  ⚠️ **`crossOriginIsolated` vaut `false` ET les fils marchent quand même.** C'est
+  contre-intuitif : sur le Web ouvert, `SharedArrayBuffer` exige l'isolation d'origine
+  croisée. Dans un contexte d'extension, non. ⛔ **Ne pas aller poser des en-têtes
+  COOP/COEP pour « réparer » ce `false`** — il n'y a rien à réparer, et c'est
+  précisément la crainte qui avait laissé la question ouverte.
+
+  **Le gain, et lequel citer** (même bloc de 23 s, meilleur de 3 passes) :
+
+  | séance | 1 fil | 4 fils | rapport |
+  |---|---|---|---|
+  | page d'extension, 03/09/2026 | RTF **0,268 à 0,309** | RTF **0,137 à 0,141** | **×1,95** |
+  | offscreen, 04/09/2026 | 26,9 s | 9,9 s | ×2,72 |
+
+  ⛔ **Citer ×1,95, jamais ×2,72.** La séance du 04/09 tournait ~4× moins vite que celle
+  du 03/09 (27 s pour un bloc que la veille faisait en 6,2 s), et ses chiffres
+  **absolus** ne valent rien — voir « Comment tester ». Ses **rapports**, eux, valent, et
+  c'est d'eux que vient le point suivant.
+
+  ⚠️ **4 EST UN OPTIMUM, PAS UN PLANCHER — AU-DELÀ, ÇA REPART EN ARRIÈRE.** Même bloc,
+  même séance offscreen, machine à 12 fils matériels :
+
+  | fils demandés | 1 | 2 | 3 | **4** | 6 | 8 |
+  |---|---|---|---|---|---|---|
+  | temps du bloc | 26,9 s | 14,2 s | 11,7 s | **9,9 s** | 12,2 s | 15,3 s |
+
+  À 8 fils on est déjà **1,5× plus lent** qu'à 4. À 12 (tous les fils matériels) :
+  **NON MESURÉ**, et il n'y a aucune raison d'espérer mieux. Prendre
+  `hardwareConcurrency` serait donc un mauvais réflexe — d'autant que pendant la
+  préparation la même machine décode aussi la vidéo à ×2 et fait tourner la capture.
+- ⏳ **VRAI JUSQU'AU 04/09/2026, PLUS D'ACTUALITÉ — « on reste à `numThreads = 1` en
+  production ».** Texte d'origine, intact :
+
+  > ⚠️ **`numThreads = 1` N'EST PLUS UNE FATALITÉ — ET C'EST UNE QUESTION OUVERTE, PAS UN
+  > ACQUIS.** Il était écrit ici que « la CSP de MV3 bloque le multithread ». **C'est faux.**
+  > Mesuré le 30/08/2026 : **4 fils ont fonctionné dans une page d'extension**,
+  > `SharedArrayBuffer` était disponible, et le gain était de **2,4×**.
+  >
+  > ❓ **CE QUI N'EST PAS VÉRIFIÉ : le document offscreen.** Toute la production tourne là,
+  > et une page d'extension n'est pas un document offscreen — l'isolation d'origine croisée
+  > peut y différer. Tant que ce n'est pas mesuré **dans l'offscreen**, on reste à
+  > `numThreads = 1` en production. Ce qui trancherait : lire `crossOriginIsolated` et
+  > `typeof SharedArrayBuffer` depuis `offscreen.js`, puis chronométrer 1 fil contre 4 sur
+  > le même bloc.
+
+  → **Ce qui a changé** : la mesure demandée a été faite, **exactement comme prescrite**
+  (`crossOriginIsolated` et `typeof SharedArrayBuffer` lus depuis l'offscreen, puis 1 fil
+  contre 4 sur le même bloc), et elle répond **oui**. **Pourquoi ça comptait** : ce
+  n'était pas un constat, c'était une **RÈGLE** — elle a maintenu la production à 1 fil
+  pendant que la préparation accumulait du retard à chaque bloc (voir le point 6 bis).
+  L'estimation « ×2,4 » de la page d'extension était du bon ordre : ×1,95 mesuré.
 - **Parakeet : les poids `int8` du dépôt `ysdede/parakeet-tdt-0.6b-v3-onnx`**, exécutés
   sur le CPU (`executionProviders: ["wasm"]`). Pas de choix de dtype à faire : le dépôt
   publie l'export int8 et c'est celui qu'on prend. 640 Mo pour les 5 fichiers.
@@ -1317,6 +1438,10 @@ total sans aucun sous-titre — et c'est cette mesure-là qu'il faut regarder, p
   Parakeet charge ONNX Runtime depuis
   `node_modules/parakeet.js/node_modules/onnxruntime-web/dist/`, et **n'active jamais
   WebGPU** — voir « WebGPU : plus lent, ET il ne rend pas le même texte ».
+  ⚠️ **Deux versions d'ONNX Runtime cohabitent, et « 1.26 » ci-dessus n'est pas celle de
+  la production** : `vendor/` porte la 1.26 (ère Whisper), le moteur actuel tourne sur la
+  **1.24.1** livrée par `parakeet.js`. C'est cette 1.24.1 qui démarre ses fils par
+  `new Worker(new URL(import.meta.url))`, sans `blob:`.
 - `chrome.*` est **indisponible dans un worker dédié** : dériver les URL de
   `self.location`, et laisser la page faire ce qui touche à `chrome.storage`.
 - ⚠️ **Une réponse `chrome-extension://` ne porte PAS de `content-length`.** Mesuré le
@@ -1339,6 +1464,12 @@ service worker : « Inspecter les vues → service worker ». Console de la capt
 « Inspecter les vues → **offscreen.html** ». Test du moteur isolé : ouvrir
 `chrome-extension://<ID>/test-parakeet-worker.html`. (Voir la skill `tester-extension`.)
 ⏳ *`test-whisper.html` existe encore mais ne mesure plus le moteur de production.*
+
+**Mesurer les fils** : `test-fils.html?fils=N&passes=P&duree=S` chronomètre le moteur dans
+une **page** d'extension, `test-fils-offscreen.html` fait la même chose **dans le document
+offscreen** — c'est celle-là qui compte pour la production, et c'est celle qui manquait
+jusqu'au 04/09/2026. Les deux relèvent `SharedArrayBuffer`, `crossOriginIsolated`, les fils
+demandés **et** les fils réellement posés. Les relevés sont dans `mesures-fils/`.
 
 ⚠️ **UNE SÉANCE DE MESURE S'USE QUATRE FOIS PLUS VITE QU'AVANT.** Un worker Whisper
 pesait 147 Mo ; un worker Parakeet en pèse **652**, et occupe **~1 335 Mo** de mémoire
@@ -1366,6 +1497,23 @@ deux variantes **alternées fragment par fragment** et ne conclure que sur le **
 Si le témoin lui-même a dérivé, la séance est finie — redémarrer avant de mesurer autre
 chose.
 
+⚠️ **UN TÉMOIN PEUT AUSSI DÉRIVER VERS LE HAUT — et une séance entière peut être lente
+d'un bout à l'autre. Deux pièges de plus, mesurés le 03 et le 04/09/2026.**
+
+- **La machine chauffe autant qu'elle s'use.** Séance des fils du 03/09 : le témoin à
+  1 fil valait **7,11 s** au début et **6,16 s** à la fin, sur le même bloc de 23 s. La
+  séance n'était donc pas usée — elle s'était *accélérée*. La règle ne change pas (« si le
+  témoin a bougé, ne conclure que sur le rapport »), mais elle vaut **dans les deux
+  sens** : un témoin qui s'améliore gonfle artificiellement le gain de la variante mesurée
+  en premier, exactement comme un témoin qui s'use le gonfle pour la dernière.
+- **Une séance peut être lente EN ENTIER, et alors c'est le rapport qui sauve tout.** La
+  séance du 04/09 (offscreen) a rendu **27 s** pour le bloc que la veille faisait en
+  **6,2 s** — un facteur ~4. Ce n'est pas l'offscreen qui est lent : le témoin est le
+  relevé `PAGE-CACHEE`, la **même page** que la veille, qui a rendu **25,9 s** dans cette
+  séance-là. ⛔ **Aucun chiffre absolu de cette séance ne doit sortir du fichier
+  `mesures-fils/`** ; ses rapports 1/2/3/4/6/8 fils, eux, sont bons. Voir aussi la mémoire
+  `chrome-pilote-3x-plus-lent`.
+
 ⚠️ **Un banc Node ne prouve rien sur ce que le navigateur rend disponible.** Le bouchon
 `chrome` du banc est écrit à la main : s'il offre `chrome.storage` à `offscreen.js`, le
 banc passe au vert sur du code que Chrome refuse. C'est exactement comme ça que le bug
@@ -1387,16 +1535,33 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
 
 ## Avancement
 
+### Depuis le 04/09/2026 — les fils
+- ✅ **4 FILS WASM, Y COMPRIS DANS L'OFFSCREEN. La question la plus vieille du fichier est
+  fermée, et du bon côté.** `SharedArrayBuffer` est présent dans le document offscreen
+  **et** dans le worker, `crossOriginIsolated` vaut pourtant `false`, 4 fils demandés →
+  4 posés. Gain **×1,95** (RTF **0,283 → 0,137–0,141**), **texte rigoureusement
+  identique** — ce n'est pas le piège de WebGPU. 4 est un **optimum** : à 6 et à 8 fils
+  c'est plus lent. La production est passée à `PREP_FILS = 4`.
+- ✅ **L'attente de fin de préparation est réglée** : le déficit de **237 s** payé d'un
+  coup à la fin d'un run de 9 min à 1 fil (`mesures-traduction/9min-valide.json`) ne se
+  forme plus, la marge par bloc ayant doublé. Voir le point 6 bis.
+
 ### Depuis le 30/08/2026 — changement de moteur
 - ✅ **Parakeet TDT 0.6B v3 remplace whisper-tiny.** 1 faute sur 2 493 mots contre 29,
   RTF 0,283 contre 0,31, médiane mot prononcé → affiché **12 ms**, 0 requête externe.
+  ⚠️ *Le RTF de 0,283 est celui du moteur à **1 fil**, réglage de production jusqu'au
+  04/09/2026 ; il est de **0,137 à 0,141** à 4 fils. Voir « Les résultats du nouveau
+  moteur ».*
 - ✅ **Mode direct supprimé**, et le sélecteur de langue avec lui (Parakeet détecte seul,
   25 langues européennes).
 - ✅ **Installation livrable** : `npm run fetch-model` (5 fichiers, tailles exactes
   vérifiées, progression qui ne recule jamais) et `README.md` avec l'attribution NVIDIA.
 - ✅ **Modèle manquant : message clair au lieu d'une barre infinie**, en moins de 700 ms.
-- ⬜ **Multithread WASM dans l'OFFSCREEN : question ouverte.** 4 fils ont marché dans une
-  page d'extension (×2,4), **jamais vérifié dans le document offscreen**.
+- ⏳ **RÉPONDU LE 04/09/2026 — le texte d'origine était :** « ⬜ **Multithread WASM dans
+  l'OFFSCREEN : question ouverte.** 4 fils ont marché dans une page d'extension (×2,4),
+  **jamais vérifié dans le document offscreen**. »
+  → **Ce qui a changé** : vérifié dans l'offscreen, ça marche. Le dossier n'est pas
+  *clos*, il est **gagnant** — voir la première ligne de « Depuis le 04/09/2026 ».
 - ⬜ **Fin de vidéo courte et silence : NON MESURÉ sur Parakeet.** Les garde-fous hérités
   de Whisper (`PREP_RESERVE_FIN`, `prepEstSilence`) sont gardés par prudence.
 - ⬜ Traduction, personnalisation de l'overlay, historique/export.
@@ -1471,6 +1636,9 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
   ❓ **Reste ouvert** : rien de tout cela n'a été vérifié **dans le document offscreen**,
   qui est le seul endroit qui compte pour la production. Voir « Contraintes techniques
   connues ».
+  ✅ **FERMÉ LE 04/09/2026** : vérifié dans le document offscreen, `SharedArrayBuffer` y
+  est présent et 4 fils s'y posent. La production tourne à 4 fils, gain **×1,95** mesuré.
+  Il ne reste plus rien d'ouvert dans ce point.
 
 ## Débogage — les trois consoles
 

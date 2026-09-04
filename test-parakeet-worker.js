@@ -111,14 +111,25 @@ async function decoder16k(arrayBuffer) {
 // Le worker
 // ---------------------------------------------------------------------------
 //
-// ⚠️ `chrome.runtime.getURL`, PAS une URL blob:. La CSP d'une extension MV3
-// bloque `worker-src blob:` -- c'est la meme contrainte qui force
-// `numThreads = 1` dans tout le projet (ONNX Runtime demarre ses fils par des
-// blob:). C'est comme ca que whisper.worker.js est cree, on ne fait pas
-// autrement.
+// ⚠️ `chrome.runtime.getURL`, PAS une URL blob:. C'est comme ca que le worker
+// de production est cree, on ne fait pas autrement.
+//
+// ⚠️ CE QUI ETAIT ECRIT ICI ETAIT FAUX, ET LE CORRIGER EST TOUT L'INTERET DE
+// CETTE PAGE. Il etait dit que « la CSP de MV3 bloque worker-src blob:, c'est
+// la meme contrainte qui force numThreads = 1 dans tout le projet ». ONNX
+// Runtime 1.24 ne demarre PAS ses fils par un blob: -- verifie dans
+// `ort-wasm-simd-threaded.mjs` : `new Worker(new URL(import.meta.url))`, une URL
+// chrome-extension:// ordinaire, et zero occurrence de « blob: » dans le
+// fichier. Il n'y avait donc rien a bloquer.
+//
+// Le nombre de fils se regle par l'URL : `?fils=4`. Il part dans le message
+// `init`, exactement comme en production. Un fil par defaut, pour que la mesure
+// de reference reste celle d'avant.
 //
 // `type: "module"` pour que le worker puisse faire ses `import`.
+const FILS = Math.max(1, Math.min(16, parseInt(new URLSearchParams(location.search).get("fils"), 10) || 1));
 const urlWorker = chrome.runtime.getURL("parakeet.worker.js");
+log(`Fils demandes : ${FILS} (regle par ?fils=N dans l'URL)`);
 log("Worker : " + urlWorker);
 
 const worker = new Worker(urlWorker, { type: "module" });
@@ -351,4 +362,4 @@ fichierInput.addEventListener("change", async (e) => {
 });
 
 demarrerIndicateur("Chargement du modele dans le worker (652 Mo d'encodeur)");
-worker.postMessage({ type: "init", urls: urlsModele });
+worker.postMessage({ type: "init", urls: urlsModele, fils: FILS });

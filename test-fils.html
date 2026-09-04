@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>LiveSub — combien de fils pour le moteur ?</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; max-width: 900px; }
+  h1 { font-size: 18px; }
+  pre { background: #111; color: #eee; padding: 12px; border-radius: 6px;
+        white-space: pre-wrap; word-break: break-word; }
+  .rappel { background: #fff8e1; border-left: 4px solid #f0ad4e; padding: 10px 14px; }
+</style>
+</head>
+<body>
+<h1>Combien de fils pour le moteur ?</h1>
+
+<p class="rappel">
+  Cette page fait tourner <strong>le worker de production</strong>
+  (<code>parakeet.worker.js</code>, pas une copie) sur un bloc de la
+  <strong>taille exacte de ceux de la préparation</strong> : 20 s de contenu
+  + 3 s de contexte = 23 s d'audio. Le seul réglage est le nombre de fils.
+</p>
+
+<p>
+  Réglages par l'URL :
+  <code>?fils=4&amp;passes=3&amp;duree=23</code>.
+  Un fil par défaut — la mesure de référence est celle d'avant.
+</p>
+
+<p class="rappel">
+  ⚠️ Ne comparer que des chiffres pris dans <strong>la même séance</strong>, et
+  seulement des <strong>rapports</strong>. Un Chrome piloté est plus lent qu'un
+  Chrome ordinaire, et une séance de mesure s'use (voir CLAUDE.md).
+</p>
+
+<pre id="log">…</pre>
+
+<script type="module" src="test-fils.js"></script>
+</body>
+</html>

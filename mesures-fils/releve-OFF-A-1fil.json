@@ -1,0 +1,26 @@
+{
+ "type": "MESURE_FILS_OFFSCREEN",
+ "fils": 1,
+ "journal": [
+  "document offscreen : SharedArrayBuffer present, crossOriginIsolated false, 12 fil(s) materiel",
+  "moteur : 1 fil(s) demande(s), 1 pose(s), SharedArrayBuffer dans le WORKER present"
+ ],
+ "ok": true,
+ "memoirePartageeDocument": true,
+ "crossOriginIsolated": false,
+ "filsMateriel": 12,
+ "filsPoses": 1,
+ "memoirePartageeWorker": true,
+ "msChargement": 8774.5,
+ "memoireWasmMo": 1335.1,
+ "temps": [
+  30330.800000000745,
+  27165.200000001118,
+  27143.199999999255
+ ],
+ "meilleur": 27143.199999999255,
+ "rtf": 1.1801391304347502,
+ "seuil": 0.43478260869565216,
+ "mots": 41,
+ "texte": "La|mort|de|mes|premières|étoiles,|les|trous|noirs|supermassifs|se|sont|nourris|pendant|des|milliards|d'années|de|matière,|de|gaz,|d'étoiles|parfois,|ou|même|d'autres|trous|noirs.|La|surface|d'un|trou|noir|marque|l'espace,|à|l'intérieur|duquel|matière|et|lumière."
+}

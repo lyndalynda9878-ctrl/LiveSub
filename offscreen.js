@@ -454,6 +454,11 @@ let prepBlocsEnBoucle = 0;
 // taille reelle (voir parakeet.worker.js).
 let prepMemoireWasmMo = null;
 
+// Le nombre de fils que ONNX Runtime a reellement pose. Releve ici pour qu'il
+// figure dans le resume : « ca tourne a 4 fils » doit etre verifiable apres coup,
+// pas seulement lisible dans la console au moment du chargement.
+let prepFilsMoteur = null;
+
 // Combien de fois chaque garde-fou anti-hallucination s'est declenche. Ils sont
 // GARDES pour l'instant, mais on veut savoir s'ils servent encore avec un
 // transducteur : chaque declenchement est journalise avec son texte, et le
@@ -771,17 +776,64 @@ function prepMessageModeleManquant(soucis) {
 // ⚠️ AUCUN REPLI, NULLE PART. Si Parakeet ne charge pas, la preparation echoue
 // et le DIT. Il n'y a plus d'autre moteur vers lequel se rabattre de toute
 // facon : whisper.worker.js a ete supprime a l'etape 5.
+// ---------------------------------------------------------------------------
+// COMBIEN DE FILS POUR LE MOTEUR
+// ---------------------------------------------------------------------------
+//
+// ⚠️ C'EST LE REGLAGE QUI DECIDE SI LA PREPARATION TIENT LE x2 OU PAS.
+//
+// Mesure sur un vrai run de 9 min a 1 fil (28 blocs, `9min-valide.json`) :
+// 17,7 s de calcul par bloc de ~22 s d'audio, soit un RTF de 0,82. Pour suivre
+// une video qui defile a x2, il faut transcrire 20 s de contenu + 3 s de
+// contexte dans les 10 s que la video met a les livrer : RTF < 0,44. A 0,82 on
+// prend ~8 s de retard PAR BLOC, personne ne les rembourse, et la file les
+// rend d'un coup a la fin -- 237 s sur ce run.
+//
+// 4 et pas 12 : pendant la preparation la meme machine decode aussi la video a
+// x2 et fait tourner la capture. Au-dela, les fils se disputent les memes
+// coeurs et le gain se retourne. C'est la valeur pour laquelle un gain de x2,4
+// a ete mesure dans une page d'extension (CLAUDE.md, 30/08/2026).
+//
+// ⚠️ CE CHIFFRE EST UN REGLAGE A MESURER, PAS UNE VERITE. Ce qui dit s'il est
+// bon, c'est la ligne « 📦 bloc N » : le temps par bloc doit passer sous la
+// moitie de la duree de contenu du bloc. Si ce n'est pas le cas, le probleme
+// n'est pas regle, quoi qu'annonce le message de chargement.
+const PREP_FILS = 4;
+
 function prepDemarrerParakeet() {
   if (prepWorker) return prepChargement;
 
-  console.log("⏳ Preparation : chargement de Parakeet dans son worker...");
+  // ⚠️ LE REPLI EST EXPLICITE ET IL SE VOIT. Les fils WASM demandent
+  // SharedArrayBuffer ; le worker verifie sa presence et retombe a 1 tout seul
+  // si besoin. Mais un chargement peut aussi echouer POUR une autre raison liee
+  // aux fils, et un moteur WASM ne se reconfigure pas apres coup : la seule
+  // facon de reessayer a 1 fil est de repartir d'un worker neuf.
+  prepChargement = (async () => {
+    try {
+      return await prepLancerWorker(PREP_FILS, PREP_FILS === 1);
+    } catch (err) {
+      if (PREP_FILS === 1) throw err;
+      console.warn(
+        `⚠️ Preparation : le chargement a ${PREP_FILS} fils a echoue (${err && err.message}) — ` +
+          `on repart a 1 fil. La preparation sera plus lente, et c'est dit ici plutot qu'ailleurs.`
+      );
+      prepTerminerWorker();
+      return await prepLancerWorker(1, true);
+    }
+  })();
+
+  return prepChargement;
+}
+
+function prepLancerWorker(fils, dernierEssai) {
+  console.log(`⏳ Preparation : chargement de Parakeet dans son worker (${fils} fil(s))...`);
   prepStatut("⏳ Chargement du modèle de transcription…");
 
   prepWorker = new Worker(chrome.runtime.getURL("parakeet.worker.js"), { type: "module" });
 
   let charge;
   let echoue;
-  prepChargement = new Promise((resolve, reject) => { charge = resolve; echoue = reject; });
+  const chargement = new Promise((resolve, reject) => { charge = resolve; echoue = reject; });
 
   prepWorker.onmessage = (evenement) => {
     const m = evenement.data;
@@ -789,10 +841,21 @@ function prepDemarrerParakeet() {
       case "ready":
         prepWorkerPret = true;
         prepMemoireWasmMo = m.memoireWasmMo ?? null;
+        prepFilsMoteur = m.fils ?? null;
         console.log(
           `✅ Preparation : Parakeet pret en ${(m.msChargement / 1000).toFixed(1)} s ` +
             `(ONNX Runtime ${m.versionOrt || "?"}, bundle ${m.bundle}, ${m.fils} fil(s), ` +
             `memoire WASM ${prepMemoireWasmMo === null ? "non mesuree" : prepMemoireWasmMo + " Mo"})`
+        );
+        // ⚠️ LE RELEVE DES FILS, A PART, ET IL DIT AUSSI CE QUI MANQUE. Un
+        // « 4 fils » annonce alors que SharedArrayBuffer est absent voudrait
+        // dire « 1 fil en realite » : les deux chiffres doivent etre lus
+        // ensemble, jamais separement.
+        console.log(
+          `🧵 Preparation, fils du moteur : ${m.filsDemandes} demande(s), ${m.fils} pose(s), ` +
+            `${m.filsMateriel} fil(s) materiel | SharedArrayBuffer ` +
+            `${m.memoirePartagee ? "present" : "ABSENT — le moteur tournera a 1 fil"}. ` +
+            `La preuve reste le temps par bloc, pas ce message.`
         );
         charge();
         prepLancerPompe();
@@ -814,7 +877,9 @@ function prepDemarrerParakeet() {
           a.reject(new Error(m.message));
         } else {
           console.error("❌ Preparation, Parakeet :", m.message);
-          prepStatut("❌ Transcription impossible : " + m.message);
+          // Pas de message d'echec a l'ecran s'il reste un essai a 1 fil : il
+          // serait dementi trois secondes plus tard par un chargement reussi.
+          if (dernierEssai) prepStatut("❌ Transcription impossible : " + m.message);
           echoue(new Error("Parakeet n'a pas pu charger : " + m.message));
         }
         break;
@@ -833,7 +898,7 @@ function prepDemarrerParakeet() {
     for (const a of prepAttentes.values()) a.reject(err);
     prepAttentes.clear();
     console.error("❌ Preparation, worker Parakeet :", err.message);
-    prepStatut("❌ Transcription impossible : " + err.message);
+    if (dernierEssai) prepStatut("❌ Transcription impossible : " + err.message);
     echoue(new Error("Parakeet n'a pas pu charger : " + err.message));
   };
 
@@ -846,9 +911,9 @@ function prepDemarrerParakeet() {
   // une autre dans le verificateur finiraient par diverger le jour ou un fichier
   // change de nom -- et le verificateur jurerait alors que tout va bien pendant
   // que le chargement echoue.
-  prepWorker.postMessage({ type: "init", urls: prepUrlsModele() });
+  prepWorker.postMessage({ type: "init", urls: prepUrlsModele(), fils });
 
-  return prepChargement;
+  return chargement;
 }
 
 // Termine le worker de la preparation et libere ses 1,3 Go. Appele a la fin de
@@ -1968,6 +2033,7 @@ function prepResume() {
     blocsAbandonnes: prepBlocsAbandonnes,
     blocsSilencieux: prepBlocsSilencieux,
     memoireWasmMo: prepMemoireWasmMo,
+    filsMoteur: prepFilsMoteur,
     workerVivant: prepWorker !== null,
     gardeFous: prepGardeFous,
     trous: prepTrousDuStock(),

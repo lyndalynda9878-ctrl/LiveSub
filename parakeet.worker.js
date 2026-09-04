@@ -162,9 +162,74 @@ globalThis.ort = ort;
 // Ou trouver le .wasm : sur le disque, jamais sur un CDN.
 ort.env.wasm.wasmPaths = DIST_ORT;
 
-// Un seul fil. La CSP de MV3 bloque les workers `blob:`, et c'est comme ca que
-// ONNX Runtime demarre les siens. Meme contrainte que pour Whisper et le VAD.
-ort.env.wasm.numThreads = 1;
+// ---------------------------------------------------------------------------
+// ⚠️ LES FILS D'EXECUTION -- UNE DES RAISONS POUR LESQUELLES LA PREPARATION NE
+// TENAIT PAS. PAS LA SEULE : lire l'attribution corrigee plus bas.
+// ---------------------------------------------------------------------------
+//
+// Il etait ecrit ici : « Un seul fil. La CSP de MV3 bloque les workers `blob:`,
+// et c'est comme ca que ONNX Runtime demarre les siens. » LES DEUX MOITIES DE
+// CETTE PHRASE SONT FAUSSES, et elles ont coute cher :
+//
+//   1. ONNX Runtime 1.24 ne demarre PAS ses fils par un `blob:`. Verifie dans
+//      `ort-wasm-simd-threaded.mjs` : `new Worker(new URL(import.meta.url))`,
+//      donc une URL `chrome-extension://` ordinaire. Zero occurrence de
+//      « blob: » dans tout le fichier. La CSP n'a rien a bloquer.
+//   2. Meme si elle bloquait, ce serait la CSP des PAGES d'extension ; ce
+//      fichier-ci est un worker dedie, qui a le droit d'en creer d'autres.
+//
+// CE QUE CE « 1 » COUTAIT -- ET CE QU'IL NE COUTAIT PAS.
+//
+// ⚠️ ATTRIBUTION CORRIGEE LE 04/09/2026. Il etait ecrit ici, sur les 17,7 s par
+// bloc, que « c'est le 1 fil qui coute ca ». LA MESURE DIT NON. Les deux
+// chiffres sont vrais tous les deux ; ils ne mesurent simplement pas la meme
+// chose :
+//
+//   - LA CHAINE COMPLETE, run reel de 9 min a 1 fil (28 blocs,
+//     mesures-traduction/9min-valide.json) : 17,7 s de calcul par bloc de ~22 s
+//     d'audio, soit un RTF de 0,82 sur une machine a 12 fils logiques. Il en
+//     faut moins de 0,44 pour suivre une video qui defile a x2. La preparation
+//     prenait donc du retard a CHAQUE bloc, et ce retard n'etait jamais
+//     rembourse : il s'accumulait dans la file et se payait d'un bloc a la
+//     toute fin -- 237 s de deficit sur ce run, soit les « environ 5 minutes »
+//     d'attente rapportees.
+//   - LE MOTEUR SEUL, meme machine, meme taille de bloc (23 s), toujours a
+//     1 fil : 6,1 a 7,1 s, soit un RTF de 0,27 a 0,31
+//     (mesures-fils/releve-A-1fil, -C-1fil-temoin, -D-1fil-texte).
+//
+// Le fil unique explique donc environ 7 s des 17,7, pas les 17,7. D'ou viennent
+// les ~11 s restantes -- la meme machine decode la video a x2, capte et
+// reechantillonne le son en meme temps -- est NON MESURE. Ne pas reecrire
+// « c'est le 1 fil » : c'etait un raccourci, et un raccourci sur une cause fait
+// chercher au mauvais endroit.
+//
+// CE QUI EST MESURE, en revanche : a 4 fils le moteur seul tombe a ~3,2 s
+// (RTF 0,137 a 0,141), soit x1,95, pour un texte RIGOUREUSEMENT IDENTIQUE.
+// Et 4 est un optimum, pas un plancher : a 6 et 8 fils c'est plus lent.
+//
+// ⚠️ ON NE SUPPOSE RIEN : on regarde d'abord si SharedArrayBuffer est la.
+// C'est LA condition des fils WASM (ils partagent la memoire lineaire du
+// module). Sans lui, demander 4 fils ne donne pas 4 fils -- au mieux un repli
+// silencieux, au pire un echec de chargement. Le releve part dans `ready`,
+// avec le nombre de fils REELLEMENT retenu par ONNX Runtime, pas celui demande.
+const FILS_POSSIBLES = typeof SharedArrayBuffer !== "undefined";
+const FILS_MATERIEL = (self.navigator && self.navigator.hardwareConcurrency) || 1;
+
+// Combien en prendre. Pas tous : pendant la preparation, la meme machine decode
+// aussi la video a x2 et fait tourner la capture audio. La valeur arrive de la
+// page (message `init`), qui est le seul endroit ou elle se regle.
+function filsRetenus(demandes) {
+  if (!FILS_POSSIBLES) return 1;
+  const n = Math.floor(Number(demandes));
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.max(1, Math.min(n, FILS_MATERIEL));
+}
+
+// ⚠️ La valeur n'est PAS posee ici. ONNX Runtime la lit quand il demarre son
+// moteur WASM, c'est-a-dire a la creation de la PREMIERE session -- l'ecrire
+// apres coup change le champ et rien d'autre (lecon deja payee dans
+// test-parakeet.js). On la pose donc au debut de `charger()`, qui est le seul
+// endroit ou des sessions sont creees, et jamais ailleurs.
 ort.env.wasm.proxy = false;
 
 noter(`portee = ${PREUVE_CONTEXTE.portee}, window = ${PREUVE_CONTEXTE.windowExiste}, `
@@ -211,9 +276,18 @@ function texteDepuisMots(mots) {
 // ---------------------------------------------------------------------------
 let modele = null;
 
-async function charger(urlsFournies) {
+async function charger(urlsFournies, filsDemandes) {
   const urls = { ...URLS_DEFAUT, ...(urlsFournies || {}) };
   noter(`urls ${urlsFournies ? "recues de la page" : "derivees de self.location"}`);
+
+  // Les fils, ICI et nulle part ailleurs : juste avant la premiere session.
+  ort.env.wasm.numThreads = filsRetenus(filsDemandes);
+  noter(
+    `fils : ${filsDemandes} demande(s), ${ort.env.wasm.numThreads} pose(s) ` +
+      `| SharedArrayBuffer ${FILS_POSSIBLES ? "present" : "ABSENT"} ` +
+      `| crossOriginIsolated ${typeof crossOriginIsolated === "undefined" ? "?" : crossOriginIsolated} ` +
+      `| ${FILS_MATERIEL} fil(s) materiel`
+  );
 
   const t0 = performance.now();
 
@@ -285,13 +359,20 @@ async function charger(urlsFournies) {
 function gererMessage(message) {
 
   if (message.type === "init") {
-    charger(message.urls)
+    charger(message.urls, message.fils)
       .then((msChargement) => {
         self.postMessage({
           type: "ready",
           msChargement,
           bundle: BUNDLE,
+          // ⚠️ `fils` est ce qui a ete POSE, pas une preuve que ONNX Runtime a
+          // vraiment demarre autant de fils. La seule preuve est le temps par
+          // bloc -- c'est lui qu'il faut lire, pas ce chiffre. Les deux champs
+          // suivants disent, eux, si les fils etaient seulement POSSIBLES.
           fils: ort.env.wasm.numThreads,
+          filsDemandes: message.fils ?? null,
+          filsMateriel: FILS_MATERIEL,
+          memoirePartagee: FILS_POSSIBLES,
           versionOrt: ort.env.versions ? ort.env.versions.common : null,
           contexte: PREUVE_CONTEXTE,
           memoireWasmMo: memoireWasmMo(),
