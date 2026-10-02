@@ -3,18 +3,6 @@
 **Une extension Chrome qui sous-titre et traduit les vidéos de n'importe quel site,
 100 % en local : le son ne quitte jamais votre ordinateur.**
 
-<!--
-  DÉMO À FILMER (GIF de 10 à 20 s, ~800 px de large, enregistré par ex. avec ScreenToGif) :
-  1. une vidéo YouTube en anglais ouverte, la popup LiveSub affichée,
-     « Anglais → Français » choisi, clic sur Démarrer ;
-  2. la barre « Préparation… » qui avance pendant que la vidéo défile en accéléré,
-     sans le son (2-3 s suffisent, couper au montage) ;
-  3. la lecture normale : la ligne d'origine et sa traduction qui apparaissent
-     pile au moment où la phrase est prononcée.
-  Enregistrer le fichier sous docs/demo.gif.
--->
-![Démo](docs/demo.gif)
-
 ## Ce que ça fait
 
 - **Sous-titre la vidéo de l'onglet** : YouTube, un cours en ligne, un site d'actualité…
