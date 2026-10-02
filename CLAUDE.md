@@ -1364,6 +1364,21 @@ C'est le seul chiffre qui dit si « l'overlay disparaît » est réglé, et il n
 d'aucune théorie sur la cause. **Si `secours` est élevé, l'amorce gêne plus qu'elle
 n'aide sur cette vidéo-là** — c'est le signal pour la couper.
 
+→ **Au 03/10/2026, la ligne existe toujours** (`offscreen.js`, fin de préparation), mais
+**sans le compteur `secours`**, parti avec la passe de secours et l'amorce :
+
+```
+🕳️ Preparation : N trou(s) de plus de 3 s dans le stock, le pire X s,
+   Y s d'ecran vide au total. (boucles N, tronques N)
+🛡️ Preparation, garde-fous : silence N bloc(s), radotage N bloc(s) jete(s),
+   troncature N bloc(s) signale(s) — sur N bloc(s) vus.
+```
+
+Le seuil de 3 s est `PREP_TROU_VISIBLE`, égal à `BLOC_APRES_PAROLE` de `content.js`.
+La ligne `🛡️` dit d'où viennent les trous : un `silence` élevé sur une vidéo qui
+parle signale une capture qui n'entendait plus rien, par exemple un lecteur remplacé
+(voir « Le chien de garde et le temps restant »).
+
 ### 7. Ce qui reste ouvert sur la fin de vidéo
 
 - `HYPOTHÈSE` — **le silence capté après la pause du lecteur étire le dernier bloc.**
@@ -1850,6 +1865,8 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
   elle, l'amorce faisait renoncer Whisper en plein bloc et revidait l'overlay (3 trous,
   9,4 s le pire). Avec, 0 trou et un gain net. Voir les points 6 ter et 6 quater.
   ⚠️ **Une seule chose à regarder dans Chrome** : la ligne `🕳️` de fin de préparation.
+  → *Au 03/10/2026 : toujours la bonne ligne à regarder (console de l'offscreen), sans
+  le compteur `secours`, et complétée par la ligne `🛡️` qui la suit. Voir 6 quater.*
 - ⬜ **La cause des blocs 4x plus lents** : instrumentée, pas encore élucidée. Le
   prochain run tranche avec `video +X s` et `reech`.
   → *Au 02/10/2026 : toujours pas élucidée, mais **l'attente qu'elle causait est
