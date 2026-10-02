@@ -30,9 +30,13 @@
 LiveSub est une **extension de navigateur (Chrome, Manifest V3)** qui capte le son de
 l'onglet, le transcrit (**Parakeet TDT 0.6B v3**, 100 % local) et affiche des
 sous-titres en overlay sur la page. Les sous-titres peuvent être **traduits**
-(API Translator de Chrome, locale, depuis le 31/08/2026) : l'original reste affiché mot
-à mot, la traduction phrase par phrase en dessous — mesures dans
-`docs/mesures/traduction/`.
+(API Translator de Chrome, locale, depuis le 31/08/2026) : le texte est traduit par
+**segment de phrase**, et l'overlay montre deux lignes — l'original en petit au-dessus,
+la traduction en dessous. Les mots d'origine gardent chacun leur instant ; le segment
+traduit hérite des heures de son segment d'origine. Voir « La traduction ».
+
+Une vidéo déjà préparée est **gardée en mémoire** (`chrome.storage.local`) : la relire ne
+demande ni modèle ni calcul. Voir « La mémoire des préparations ».
 
 Il n'y a **qu'un seul mode** : « préparer d'abord ». La vidéo défile en accéléré et en
 silence, tout est transcrit d'avance, puis le texte s'affiche à l'heure pendant la
@@ -47,6 +51,10 @@ un serveur tiers.** C'est l'argument central du projet.
   traduction. Le son ne quitte jamais la machine.
 - **Aucun CDN** : toute librairie est copiée dans `vendor/` et chargée localement
   (voir la skill `extension-vendor-lib`).
+  ⚠️ *Précision du 02/10/2026 : la règle « aucun CDN » tient toujours, mais le moteur de
+  production ne passe plus par `vendor/`. `parakeet.worker.js` importe `parakeet.js` et
+  son ONNX Runtime 1.24.1 **directement depuis `node_modules/`**, livré avec l'extension
+  chargée non empaquetée. `vendor/` ne sert plus qu'aux pages de `bancs/` (Whisper, NLLB).*
 - Chrome uniquement (MV3) ; audio d'un **onglet** (pas le système entier, pour la V1).
 - **Une tâche à la fois** : implémenter → tester → valider → committer. Expliquer les
   changements en français simple.
@@ -61,6 +69,18 @@ un serveur tiers.** C'est l'argument central du projet.
 transcrit un par un (Web Worker, CPU) → les mots **avec leur instant** s'empilent dans
 le stock de `offscreen.js` → à la fin, `background.js` rend le lecteur et livre le
 stock → `content.js` affiche chaque bloc quand `video.currentTime` atteint son heure.
+
+**Avec traduction** (depuis le 31/08/2026) : la popup télécharge la paire de langues au
+clic sur Démarrer (seul instant où une activation utilisateur existe) → `offscreen.js`
+découpe le stock en segments de phrase et les traduit **sur place** (`Translator`
+existe dans le document offscreen) → les segments portent les deux textes et les heures
+du segment d'origine → `content.js` affiche les deux lignes.
+
+**Avec la mémoire** (depuis le 01/09/2026) : à la fin d'une préparation, `background.js`
+range le stock dans `chrome.storage.local`. Sur une vidéo connue, la popup propose
+« Afficher » : `background.js` relit le stock et le livre à `content.js` **sans créer le
+document offscreen** — pas de worker, pas de modèle. Si seule la langue d'arrivée est
+nouvelle, l'offscreen ne fait que retraduire.
 
 ⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — l'architecture du mode direct.**
 
@@ -81,16 +101,31 @@ chaque mot avant que la lecture commence, donc elle n'a plus rien à estimer.
   CSP avec `wasm-unsafe-eval`.
 - `background.js` — service worker : orchestre la capture, gère l'offscreen, stocke
   l'état dans `chrome.storage.session`. ⚠️ Le SW est tué régulièrement → ne jamais
-  stocker l'état dans une simple variable mémoire.
-- `popup.html` / `popup.js` — bouton Démarrer/Arrêter ; demande l'état au background
-  (`GET_STATE`), ne le devine pas.
+  stocker l'état dans une simple variable mémoire. C'est aussi **le seul écrivain de
+  `chrome.storage.local`** (la mémoire des préparations, `MEMOIRE_*`) et lui qui fait la
+  détection de langue pour l'offscreen (`PREPARATION_DETECTER_LANGUE`, via
+  `chrome.i18n`, absent de l'offscreen).
+- `popup.html` / `popup.js` — un bouton principal et **un seul réglage, la paire de
+  langues** (départ : les 25 langues de Parakeet, pré-remplie par
+  `chrome.i18n.detectLanguage` sur le titre de l'onglet ; arrivée : 37 langues, ou
+  « Langue d'origine (pas de traduction) »). **Télécharge la paire au clic sur
+  Démarrer**, avec le pourcentage de `downloadprogress`. Selon la mémoire, le bouton
+  vaut « Démarrer », « Afficher » ou « Traduire » (`memModeBouton`, seule fonction qui en
+  décide) ; « Refaire la préparation » n'apparaît que sur une vidéo connue. Demande
+  l'état au background (`PREPARATION_ETAT`, `MEMOIRE_ETAT`), ne le devine pas.
 - `content.js` — pilote la vidéo pendant la préparation (×2, silence, restitution) et
   affiche le stock pendant la lecture : **un bloc apparaît quand `video.currentTime`
-  atteint l'instant de son premier mot**. Boîte de deux lignes de hauteur fixe ; un
-  message d'échec, lui, fait grandir la boîte pour ne jamais être coupé
-  (`prepAfficherErreur`).
+  atteint l'instant de son premier mot**. Pendant la lecture, une **zone à deux boîtes de
+  hauteur fixe en pixels** (`zoneLecture`) : l'original (18 px, boîte de 47 px) au-dessus
+  de la traduction (25 px, boîte de 65 px) — 143,6 px mesurés avec traduction, 90,6 px
+  sans. Chaque ligne s'écrit dans le sens de sa langue (arabe, hébreu… de droite à
+  gauche). Hors lecture, l'ancienne `zone` sert aux statuts ; un message d'échec, lui,
+  fait grandir la boîte pour ne jamais être coupé (`prepAfficherErreur`). Calcule aussi
+  la clé de la vidéo pour la mémoire (`memCleVideo`).
 - `offscreen.html` / `offscreen.js` — capture audio (getUserMedia sur l'onglet),
-  découpage en blocs, table des ancres, stock des mots. **Vérifie aussi les cinq
+  découpage en blocs, table des ancres, stock des mots, **découpage en segments de
+  phrase et traduction** (`prepDecouperEnPhrases`, `Translator`), retraduction d'un stock
+  déjà transcrit sans toucher au moteur. **Vérifie aussi les cinq
   fichiers du modèle AVANT tout chargement** (`prepModeleManquant`). C'est ici que vit
   **`PREP_FILS = 4`**, le nombre de fils WASM du moteur — le seul endroit où il se règle.
 - `preparation.worklet.js` — AudioWorklet qui empile le son capté. Fait la **moyenne des
@@ -102,14 +137,40 @@ chaque mot avant que la lecture commence, donc elle n'a plus rien à estimer.
 - `models/parakeet-tdt-0.6b-v3/` — les 5 fichiers de poids, 640 Mo. Gitignoré,
   téléchargé par `npm run fetch-model` (`scripts/fetch-model.js`).
 - `vendor/` — librairies locales. Gitignoré, régénéré par `scripts/copy-assets.js`
-  (postinstall).
-- `README.md` — installation, licences, attribution NVIDIA (condition CC-BY-4.0).
+  (postinstall). Ne sert plus qu'aux bancs (voir la précision sous « Règles »).
+- `README.md` — la vitrine du dépôt (réécrite le 02/10/2026) : ce que fait l'extension,
+  chiffres mesurés, choix techniques, installation, licences, attribution NVIDIA
+  (condition CC-BY-4.0). ⚠️ **N'y mettre que des chiffres mesurés et présents ici ou
+  dans `docs/mesures/`.** `LICENSE` : ISC.
+- `bancs/` — **toutes les pages de mesure** (anciennement `test-*` à la racine, rangées
+  le 02/10/2026), leurs serveurs Node et `bancs/audio/`. `bancs/README.md` dit ce que
+  mesure chaque page. ⚠️ Seul `bancs/audio/speech.wav` (JFK, domaine public) est
+  versionné : les extraits d'émissions (ARTE…) restent sur le disque, ignorés par Git,
+  et ont été **retirés de tout l'historique** pour une question de droits. Dans un clone
+  neuf, une page qui les attend ne les trouve pas : `bancs/README.md` dit comment fournir
+  les siens.
+- `docs/mesures/` — les relevés bruts (`fils/`, `memoire/`, `traduction/`) et l'état
+  de l'art ASR du 28/08/2026 (anciennement `mesures-*` à la racine).
 - `bancs/test-parakeet.html` / `.js`, `bancs/test-parakeet-worker.html` / `.js` — pages de mesure du
   moteur actuel.
 - `bancs/test-fils.html` / `.js` (page d'extension) et `bancs/test-fils-offscreen.html` / `.js`
   (**dans le document offscreen**) — bancs des fils WASM : relèvent `SharedArrayBuffer`,
   `crossOriginIsolated`, les fils demandés **et** les fils réellement posés, puis
   chronomètrent. Relevés dans `docs/mesures/fils/`.
+
+⏳ **VRAI JUSQU'AU 01/09/2026 — la popup et l'affichage avant la traduction et la
+mémoire.** Texte d'origine, intact :
+
+> - `popup.html` / `popup.js` — bouton Démarrer/Arrêter ; demande l'état au background
+>   (`GET_STATE`), ne le devine pas.
+> - `content.js` — […] Boîte de deux lignes de hauteur fixe ; un message d'échec, lui,
+>   fait grandir la boîte pour ne jamais être coupé (`prepAfficherErreur`).
+
+→ **Ce qui a changé** : `GET_STATE` n'existe plus (la popup interroge
+`PREPARATION_ETAT` et `MEMOIRE_ETAT`) ; la popup porte la paire de langues et les
+boutons de la mémoire ; la lecture passe par une zone à deux boîtes, original et
+traduction. **Le principe, lui, tient toujours** : la popup ne devine rien, elle
+demande. **Pourquoi** : la traduction et la mémoire des préparations (01/09/2026).
 
 ⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — les fichiers du mode direct.**
 
@@ -148,7 +209,15 @@ le moteur de production. **Pourquoi** : voir le bandeau en tête de fichier.
 - `@ricky0123/vad-web` — détection de parole. ⏳ **Plus utilisée en production** depuis le
   retrait du mode direct ; la dépendance reste installée.
 - `@huggingface/transformers` — Whisper. ⏳ **Plus utilisée en production** ; ne sert plus
-  qu'aux anciennes pages de mesure.
+  qu'aux anciennes pages de mesure (et au banc NLLB).
+- **API `Translator` de Chrome** — la traduction. **Pas une dépendance npm** : elle est
+  dans Chrome, **à partir de la version 138**. Les paquets de langue (~80 Mo par paire)
+  sont téléchargés **par Chrome lui-même**, une fois, puis tout est local.
+- `chrome.i18n.detectLanguage` — le petit détecteur intégré à Chrome, pour pré-remplir
+  la langue de départ et vérifier la paire choisie. `LanguageDetector` existe mais
+  rendait `unavailable` sur la machine de mesure.
+- **NLLB-200** (Meta, **CC-BY-NC-4.0**, non commercial) — candidat de traduction
+  **écarté**, présent uniquement dans `bancs/`. Ne jamais le livrer avec l'extension.
 
 ⚠️ **Le modèle n'est pas une dépendance npm.** `nvidia/parakeet-tdt-0.6b-v3` est sous
 **CC-BY-4.0** : l'attribution à NVIDIA est une **condition de la licence**, pas une
@@ -175,8 +244,15 @@ la porte pour des mois.
 
 - **25 langues européennes**, **détectées automatiquement**. Le vocabulaire de Parakeet ne
   contient **aucun jeton de langue** : il n'y a rien à lui indiquer.
-- Il n'y a donc **plus de sélecteur de langue** dans la popup, et c'est pour ça — pas par
-  simplification. Le menu était devenu un bouton débranché.
+- ⏳ **VRAI DU 30/08 AU 01/09/2026, PLUS D'ACTUALITÉ** — texte d'origine, intact :
+  « Il n'y a donc **plus de sélecteur de langue** dans la popup, et c'est pour ça — pas
+  par simplification. Le menu était devenu un bouton débranché. »
+  → **Ce qui a changé** : un menu « langue de départ » est **revenu**, pour une autre
+  raison. **Parakeet n'en a toujours aucun besoin** pour transcrire ; c'est **l'API
+  Translator qui l'exige** — `sourceLanguage: "auto"` lève `RangeError`, une source
+  omise lève `TypeError`, `"und"` lève `NotSupportedError`, et `LanguageDetector` rendait
+  `unavailable`. Le menu est donc pré-rempli par une devinette locale (titre de
+  l'onglet) et corrigé à l'œil. Un choix mémorisé l'emporte toujours sur la devinette.
 - ⛔ **Perdu au change, et c'est un vrai renoncement** : **plus d'arabe, de chinois, de
   japonais ni de turc** en transcription. Whisper les faisait.
 
@@ -1165,9 +1241,13 @@ est un mécanisme propre à Whisper, qui accepte un « contexte précédent » a
 de départ. **Parakeet n'a pas d'équivalent** : son décodeur ne prend pas de préfixe
 textuel. `content.js` relève encore le vocabulaire de la page et l'envoie (`prepAmorce`) —
 il n'est simplement plus utilisé.
+⏳ *Plus vrai au 02/10/2026 : le relevé du vocabulaire a été **retiré** de `content.js`
+(étape 5) et le message `PREPARATION_VOCABULAIRE` n'a plus de destinataire. Seul un
+commentaire d'`offscreen.js` mentionne encore `prepAmorce`.*
 
 Conséquence directe : `prepEstBoucle`, qui n'existait que parce que l'amorce provoquait
-des boucles, n'a plus de cause à traiter. Tout ce qui suit reste une mesure juste sur
+des boucles, n'a plus de cause à traiter. *(Au 02/10/2026 il est toujours appelé dans
+`prepTraiterBloc` : il reste en place comme garde-fou, sans cause connue à traiter.)* Tout ce qui suit reste une mesure juste sur
 Whisper.
 
 
@@ -1301,11 +1381,135 @@ n'aide sur cette vidéo-là** — c'est le signal pour la couper.
 c'est qu'il reste des trous dans le stock. `PREPARATION_BLOCS` rend `ecranVideS` — le temps
 total sans aucun sous-titre — et c'est cette mesure-là qu'il faut regarder, pas l'écran.
 
+## La traduction — API Translator de Chrome, par segment de phrase (31/08–01/09/2026)
+
+Relevés complets : `docs/mesures/traduction/` (`RESULTATS.md` pour le choix du moteur,
+`ETAPE-TRADUCTION.md` pour le branchement, `ETAPE-DEUX-LIGNES.md` pour l'affichage).
+Mesuré dans Chrome 151.
+
+### Le choix : l'API de Chrome contre NLLB-200
+
+| | API Translator | NLLB-200 600M q8 (écarté) |
+|---|---|---|
+| poids livré avec l'extension | **0 o** | 869,7 Mio |
+| 2 493 mots, fr→en | **2 099 ms** | 22 min 46 s |
+| hors ligne, paire installée | traduit | traduit |
+| licence | intégrée à Chrome | **CC-BY-NC-4.0** (non commercial) |
+
+NLLB reste dans `bancs/` pour la comparaison. ⛔ **Ne jamais le livrer.**
+
+### Les faits qui ont décidé de l'architecture
+
+- **L'API exige une langue source explicite** (`"auto"`, source omise et `"und"`
+  échouent), et Parakeet n'en donne aucune. D'où le menu « langue de départ » de la
+  popup — voir « Les langues ».
+- **Une paire absente ne se télécharge qu'avec un geste utilisateur** :
+  `NotAllowedError: Requires a user gesture when availability is "downloadable"`. Le seul
+  geste de tout LiveSub est le clic sur Démarrer : **le téléchargement se fait dans la
+  popup, et nulle part ailleurs.** Une paire **déjà installée**, elle, se crée sans geste,
+  y compris dans le document offscreen.
+- ⚠️ **`availability()` ment.** Le même `"downloadable"` a recouvert une création en
+  208 ms (paire présente) et un téléchargement de 20 533 ms (paire absente). On ne s'en
+  sert pas pour décider ; le seul témoin honnête est `downloadprogress`, et il donne une
+  **fraction**, pas des octets — d'où un pourcentage, jamais des mégaoctets.
+- **Dans le document offscreen** : `Translator` existe, `chrome.i18n` et `chrome.storage`
+  **n'existent pas**. La traduction se fait donc dans l'offscreen ; la détection de langue
+  passe par le service worker (`PREPARATION_DETECTER_LANGUE`).
+
+### ⛔ RÈGLE : on ne traduit PAS mot à mot
+
+Les instants de Parakeet sont **par mot** ; une traduction n'a ni le même nombre de mots
+ni le même ordre. Aligner des mots traduits sur des instants d'origine reviendrait à
+**inventer des horodatages**. On traduit donc par **segment de phrase**
+(`prepDecouperEnPhrases`), et le segment traduit hérite des heures **mesurées** de son
+segment d'origine. Les mots d'origine (`prepMots`) ne sont **jamais écrasés** : les
+segments vivent à côté (`prepSegments`) et portent les deux textes.
+
+Bornes : `TRAD_SEG_MOTS = 10`, `TRAD_SEG_CARACTERES = 70`, plafonds absolus 14 mots /
+84 caractères, coupure à la virgule à partir de 6 mots. Plus serrées que celles de
+`content.js` **exprès** : personne ne peut recouper un segment traduit (il n'a plus
+d'instant à l'intérieur), et l'anglais s'allonge en français.
+
+⛔ **AUCUN REPLI SILENCIEUX.** Un segment qui ne se traduit pas affiche son texte
+d'origine, mais l'échec est écrit trois fois : console, bandeau de statut, résumé lu par
+la popup. « Ça s'affiche quand même » ne doit jamais passer pour « ça marche ».
+
+### Les mesures (31/08/2026)
+
+| | résultat |
+|---|---|
+| médiane phrase prononcée → phrase affichée | **7 ms** (fr→en, n=21), **8 ms** (en→fr, n=24) |
+| temps ajouté à une préparation de 119 s | **+0,3 à +0,5 s** (61 à 66 ms par segment) — de l'ordre de l'écart entre deux essais identiques |
+| réseau, paire installée | **0 requête externe** |
+| réseau coupé | préparation complète, 21 segments sur 21 traduits |
+| contre-preuve « a-t-on vraiment traduit ? » | 6,3 % (fr→en) et 10,8 % (en→fr) des mots affichés identiques à l'original : cognats et chiffres |
+| contre-preuve de la mesure | décalage de test +3 000 ms → médiane **3 008 ms** |
+| hauteur de la boîte pendant toute la lecture | **une seule valeur** ; 0 débordement |
+
+⚠️ **Marge nulle, à surveiller** : en→fr, le segment le plus long (83 caractères) remplit
+la boîte traduite **exactement** (65 px sur 65). Sous la borne, mais sans marge.
+
+### Le chien de garde et le temps restant (31/08/2026)
+
+Relevés : `docs/mesures/traduction/ETAPE-CHIEN-DE-GARDE.md`.
+
+⏳ **VRAI JUSQU'AU 31/08/2026** — `PREP_VEILLE_MS = 60000`, un `setTimeout` armé à la
+fin du défilement, rendait le lecteur au bout de 60 s.
+→ **Ce qui a changé** : il mesurait le **temps qui passe**, pas le **travail qui
+avance**, et tuait des préparations saines (vidange mesurée à 3 min 45 s sur 9 min de
+vidéo). Remplacé par `PREP_PANNE_MS = 90000` dans `content.js` : 90 s **d'immobilité de
+quatre compteurs** (blocs partis, blocs terminés, contenu traité, mots) — un seul qui
+bouge, et ce n'est pas une panne. Le temps restant est calculé sur le **débit du
+moteur**, pas sur l'horloge, et ne remonte jamais : sur 9 et 18 min, écart final **2,8 %
+et 1,0 %**, **0 valeur qui augmente**.
+
+⬜ **OUVERT — signalé le 31/08/2026, NON VÉRIFIÉ depuis** : sur une vraie vidéo
+YouTube, la page a **démonté** la balise `<video>` à ~48 s (`readyState: 0`,
+`duration: null`, **en pause**). Le détecteur d'enlisement commence par `!v.paused` et ne
+le voit pas ; la préparation ne pouvait plus finir. Le code contient une re-résolution
+de l'élément quand il n'est plus connecté (`prepVideoResolue`), mais **aucune mesure ne
+dit si ce cas-là est réglé**. Ce qui trancherait : rejouer une préparation sur une vidéo
+YouTube de plus de 5 min et lire le journal (`video +X s`, fin détectée ou non).
+
+## La mémoire des préparations (01/09/2026)
+
+Banc : `docs/mesures/memoire/banc-memoire.js` (Node/vm, charge `content.js`,
+`background.js` et `offscreen.js` tels quels).
+
+- **Un seul écrivain : `background.js`.** L'offscreen n'a pas `chrome.storage`, et si
+  `content.js` écrivait aussi, la mémoire aurait deux idées de ce qu'elle contient.
+- **La clé n'est pas l'URL** : `&t=120`, `&list=…`, `&si=…` changent sans que la vidéo
+  change. YouTube → `yt:<identifiant>` (y compris `youtu.be`, `/shorts/`, `/embed/`) ;
+  ailleurs → origine + chemin, sans paramètres (`memCleVideo`, `content.js`).
+- **La clé ne suffit pas : la durée est vérifiée aussi**, à **1 s près**
+  (`MEM_TOLERANCE_DUREE_S`) — la durée d'un flux adaptatif bouge de quelques dizaines de
+  millisecondes d'une session à l'autre. Durée différente → la mémoire est ignorée.
+- **Pas de `unlimitedStorage`** : on tient dans les ~10 Mo de `chrome.storage.local`.
+  ⛔ **On ne calcule pas la place, on la constate** : on écrit, et si Chrome refuse pour
+  quota, on supprime la préparation **la plus ancienne** en le disant, puis on recommence.
+  ⛔ **On ne simplifie jamais les données pour les faire tenir.**
+- Un **index** (quelques centaines d'octets) résume ce qui est rangé, écrit dans le même
+  `set` que l'entrée : la popup n'a pas à relire 10 Mo à chaque ouverture.
+- ⭐ **Afficher depuis la mémoire ne crée même pas le document offscreen** : pas de
+  worker, pas de modèle. C'est ce qui rend la contre-preuve vraie — renommer `models/` ne
+  doit rien changer. Une **nouvelle langue d'arrivée** sur une vidéo connue ne fait que
+  retraduire (`PREPARATION_RETRADUIRE`), sans Parakeet.
+
+Mesuré au banc : 1 400 mots / 169 blocs occupent **76 Ko** ; les instants relus sont
+**identiques** mot à mot, et la médiane bloc → écran est la même (**10 ms**) qu'avant
+rangement.
+
 ## Contraintes techniques connues
 - ⚠️ **`chrome.storage` est indisponible dans un document offscreen.** Vérifié dans
   Chrome : `typeof chrome === "object"` mais `typeof chrome.storage === "undefined"`.
   Tout ce qui touche au storage passe donc par le service worker — c'est déjà le cas du
   backend, de la langue et du retard, et ça vaut aussi pour le mode d'affichage.
+  *(Au 02/10/2026 : backend, retard et mode d'affichage ont disparu avec le direct ;
+  la règle vaut aujourd'hui pour la **mémoire des préparations**, rangée par le seul
+  service worker.)*
+- ⚠️ **`chrome.i18n` est indisponible lui aussi dans le document offscreen** (vérifié le
+  31/08/2026 : `typeof chrome.i18n === "undefined"`, `bancs/test-i18n-offscreen.html`).
+  `Translator`, lui, y est. La détection de langue passe donc par le service worker.
 
   **Ce que ça coûte quand on l'oublie** (arrivé une fois, à ne pas refaire) : un
   `chrome.storage.onChanged.addListener` ajouté dans `offscreen.js` lève un `TypeError`
@@ -1538,6 +1742,31 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
 
 ## Avancement
 
+### Le 02/10/2026 — le dépôt rendu présentable
+- ✅ **Racine rangée** : pages de mesure dans `bancs/` (avec `bancs/README.md`), relevés
+  dans `docs/mesures/`, `server-tmp.js` supprimé (page de test du mode direct).
+- ✅ **README réécrit** pour un premier lecteur, `LICENSE` ISC, descriptions de
+  `package.json` et `manifest.json` à jour.
+- ✅ **Historique Git nettoyé** (réécrit, toutes branches et tous tags) : notes de travail
+  et extraits audio sous droits retirés, email remplacé par l'adresse noreply GitHub. Les
+  fichiers retirés restent sur le disque, ignorés par Git. `master` = la version finale.
+- ✅ **Vérifié depuis un clone neuf** : `npm install`, `npm run fetch-model` (5 fichiers,
+  tailles exactes), extension chargée, préparation de 2 min menée au bout (242 mots),
+  sous-titres à l'heure à la lecture.
+
+### Les 31/08 et 01/09/2026 — traduction et mémoire
+- ✅ **Traduction** par l'API Translator de Chrome, par segment de phrase, médiane
+  **7–8 ms**, **0 requête externe** paire installée, marche hors ligne. NLLB-200 mesuré
+  et écarté. Voir « La traduction ».
+- ✅ **Overlay à deux lignes** de hauteur fixe (original au-dessus, traduction en
+  dessous), sens d'écriture par langue (arabe de droite à gauche).
+- ✅ **Chien de garde** fondé sur le travail, plus sur le temps ; **temps restant** qui ne
+  remonte jamais (écart final 1 à 3 %).
+- ✅ **Mémoire des préparations** : une vidéo connue s'affiche sans modèle ; une nouvelle
+  langue d'arrivée ne fait que retraduire. Voir « La mémoire des préparations ».
+- ⬜ **Lecteur YouTube démonté en pleine préparation** : signalé le 31/08, non vérifié
+  depuis. Voir la fin de « La traduction ».
+
 ### Depuis le 04/09/2026 — les fils
 - ✅ **4 FILS WASM, Y COMPRIS DANS L'OFFSCREEN. La question la plus vieille du fichier est
   fermée, et du bon côté.** `SharedArrayBuffer` est présent dans le document offscreen
@@ -1567,7 +1796,11 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
   *clos*, il est **gagnant** — voir la première ligne de « Depuis le 04/09/2026 ».
 - ⬜ **Fin de vidéo courte et silence : NON MESURÉ sur Parakeet.** Les garde-fous hérités
   de Whisper (`PREP_RESERVE_FIN`, `prepEstSilence`) sont gardés par prudence.
-- ⬜ Traduction, personnalisation de l'overlay, historique/export.
+- ⏳ **VRAI JUSQU'AU 01/09/2026** — texte d'origine : « ⬜ Traduction, personnalisation
+  de l'overlay, historique/export. »
+  → **Ce qui a changé** : la **traduction est faite** (voir « Les 31/08 et 01/09/2026 »).
+- ⬜ Personnalisation de l'overlay (taille, couleur, position), historique/export
+  (`.txt` / `.srt`).
 
 ### Avant le 30/08/2026 — l'ère Whisper *(conservé)*
 - ✅ Structure de l'extension (popup, overlay, messages).
@@ -1619,11 +1852,17 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
   ⚠️ **Une seule chose à regarder dans Chrome** : la ligne `🕳️` de fin de préparation.
 - ⬜ **La cause des blocs 4x plus lents** : instrumentée, pas encore élucidée. Le
   prochain run tranche avec `video +X s` et `reech`.
+  → *Au 02/10/2026 : toujours pas élucidée, mais **l'attente qu'elle causait est
+  réglée** par les 4 fils (marge par bloc doublée, voir 6 bis).*
 - ⬜ **Étape 3 — retard du son à zéro par défaut** : garder les lèvres synchrones et
   laisser le texte suivre à ~2-3 s, comme les sous-titres du direct à la télé. L'option
   « Auto » reste pour qui préfère l'inverse.
+  → *Sans objet depuis le 30/08/2026 : le retard du son a disparu avec le mode direct.*
 - ⬜ Traduction, personnalisation de l'overlay, historique/export, hors-ligne complet
   (bundler le modèle).
+  → *Au 02/10/2026 : traduction **faite** ; hors-ligne **fait** pour la transcription
+  (modèle local via `npm run fetch-model`) et pour la traduction une fois la paire
+  installée. Restent la personnalisation de l'overlay et l'export.*
 - ⬜ **Qualité du texte sur son BRUITÉ** — le reproche qui reste. whisper-base a été écarté
   sur une mesure faite sur du son *propre* (WER 0 %, donc aucun gain à espérer), mais le
   problème se pose sur du son bruité (documentaire avec musique : « lourire » pour
@@ -1651,7 +1890,10 @@ Une extension MV3 n'a pas une console mais TROIS, et elles ne se voient pas entr
 |------------------|-----------------------------------------------------|
 | l'onglet         | `content.js` (l'overlay)                            |
 | service worker   | `background.js`                                     |
-| offscreen.html   | `offscreen.js`, le VAD, Whisper, la capture         |
+| offscreen.html   | `offscreen.js` : la capture, les blocs, la traduction ; le worker Parakeet y remonte ses messages `[PARAKEET-WORKER]` |
+
+*(Jusqu'au 30/08/2026, la ligne offscreen disait « `offscreen.js`, le VAD, Whisper, la
+capture » : VAD et Whisper ont disparu avec le mode direct.)*
 
 ⚠️ **Le document offscreen n'apparaît PAS comme cible DevTools** dans une session pilotée.
 C'est pourtant là que vivent les erreurs les plus graves — celle de `chrome.storage` avait
