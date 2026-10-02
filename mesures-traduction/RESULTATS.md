@@ -1,7 +1,7 @@
 # Traduction dans LiveSub — mesure des deux candidats (2026-08-31)
 
 Machine : Windows 11 26200, Intel Iris Xe / Wi-Fi 6E.
-Chrome **151.0.7922.174**, profil `C:\Users\Lynda\.cache\chrome-devtools-mcp\chrome-profile`.
+Chrome **151.0.7922.174**, profil `%USERPROFILE%\.cache\chrome-devtools-mcp\chrome-profile`.
 Extension chargee non empaquetee, ID `gahilnfeeoofbbokajafblpidjmbngjl`.
 
 Texte de mesure : la transcription REELLE de `test/extrait-fr-dur.wav` par Parakeet

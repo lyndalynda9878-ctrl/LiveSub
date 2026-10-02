@@ -1,4 +1,4 @@
-$out = "C:\Users\Lynda\Desktop\LiveSub\mesures-traduction\tcp-chrome.txt"
+$out = Join-Path $PSScriptRoot "tcp-chrome.txt"
 "# debut " + (Get-Date).ToString("HH:mm:ss") | Set-Content -Encoding utf8 $out
 $vus = @{}
 $fin = (Get-Date).AddSeconds(150)
