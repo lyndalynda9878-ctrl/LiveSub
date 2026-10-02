@@ -1,8 +1,8 @@
 # Traduction branchee — mesures dans Chrome (2026-08-31)
 
 Chrome 151.0.7922.174. Extension chargee non empaquetee.
-Video de test : `test-video-traduction.js` (port 8733), balise `<video>` reelle,
-`test/extrait-fr-dur.wav` (ARTE, francais) ou `test/extrait-en.wav` (anglais),
+Video de test : `bancs/test-video-traduction.js` (port 8733), balise `<video>` reelle,
+`bancs/audio/extrait-fr-dur.wav` (ARTE, francais) ou `bancs/audio/extrait-en.wav` (anglais),
 repetes jusqu'a 1 min 30.
 
 ---
@@ -74,7 +74,7 @@ essais identiques : la traduction ne se voit pas a l'echelle d'une preparation.
 ### Volet A — la traduction a-t-elle eu lieu ?
 
 Mots du texte AFFICHE presents tels quels dans le texte d'origine
-(`mesures-traduction/volet-a-recouvrement.js`, comparaison sans accents ni
+(`docs/mesures/traduction/volet-a-recouvrement.js`, comparaison sans accents ni
 ponctuation) :
 
 | paire | mots affiches | identiques a l'original | lesquels |

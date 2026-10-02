@@ -94,14 +94,14 @@ document.getElementById("charger").addEventListener("click", async () => {
 </body></html>`;
 
 const FICHIERS = {
-  "/speech.wav": ["test/speech.wav", "audio/wav"],
-  "/speech-fr.mp3": ["test/speech-fr.mp3", "audio/mpeg"],
+  "/speech.wav": ["audio/speech.wav", "audio/wav"],
+  "/speech-fr.mp3": ["audio/speech-fr.mp3", "audio/mpeg"],
   // Ajoute pour l etape 4 : l extrait ARTE francais (« trous noirs »), le seul
   // materiel qui permette de verifier que les fautes de whisper-tiny ont disparu.
-  "/extrait-fr-dur.wav": ["test/extrait-fr-dur.wav", "audio/wav"],
+  "/extrait-fr-dur.wav": ["audio/extrait-fr-dur.wav", "audio/wav"],
   // Volet B de l etape 5 : deux discours du Parlement europeen en ALLEMAND.
-  "/allemand-1.wav": ["test/allemand-1.wav", "audio/wav"],
-  "/allemand-2.wav": ["test/allemand-2.wav", "audio/wav"],
+  "/allemand-1.wav": ["audio/allemand-1.wav", "audio/wav"],
+  "/allemand-2.wav": ["audio/allemand-2.wav", "audio/wav"],
 };
 
 http

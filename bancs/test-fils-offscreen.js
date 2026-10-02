@@ -20,7 +20,7 @@ const params = new URLSearchParams(location.search);
 const FILS = Math.max(1, Math.min(32, parseInt(params.get("fils"), 10) || 1));
 const PASSES = Math.max(1, Math.min(10, parseInt(params.get("passes"), 10) || 3));
 const DUREE = 23; // PREP_BLOC_CONTENU (20 s) + PREP_CONTEXTE (3 s), comme la production.
-const AUDIO = "test/extrait-fr-dur-75s.wav";
+const AUDIO = "bancs/audio/extrait-fr-dur-75s.wav";
 
 const journal = [];
 function noter(texte) { journal.push(texte); }

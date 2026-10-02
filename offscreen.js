@@ -305,7 +305,7 @@ const PREP_BOUCLE_MOTS_MIN = 10;
 // LA TRADUCTION — API Translator de Chrome, DANS CE DOCUMENT
 // ---------------------------------------------------------------------------
 //
-// Mesure du 2026-08-31 (voir mesures-traduction/RESULTATS.md) : l'API Translator
+// Mesure du 2026-08-31 (voir docs/mesures/traduction/RESULTATS.md) : l'API Translator
 // fonctionne ICI, dans le document offscreen, SANS le moindre clic
 // (`navigator.userActivation.isActive` vaut false et ca passe quand meme), a une
 // condition et une seule : que la paire soit DEJA INSTALLEE. Une paire absente

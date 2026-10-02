@@ -18,7 +18,7 @@ models/
 
 # Les poids du modele de traduction, telecharges pour les mesures (870 Mo).
 # Meme regle que models/ : hors de question de les versionner.
-test-nllb-model/
+bancs/test-nllb-model/
 
 # Notes de travail personnelles : gardees sur le disque, hors du depot.
 REPRISE-LIVESUB.md
@@ -27,5 +27,5 @@ PROMPTS-modele.md
 # Fichiers audio de mesure dont les droits ne permettent pas la publication
 # (extraits d'emissions). Seul speech.wav (discours de JFK, domaine public)
 # est versionne. Voir bancs/README.md pour fournir ses propres fichiers.
-test/*
-!test/speech.wav
+bancs/audio/*
+!bancs/audio/speech.wav

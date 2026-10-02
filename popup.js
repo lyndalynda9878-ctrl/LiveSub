@@ -33,7 +33,7 @@
 // ⚠️ POURQUOI LE TELECHARGEMENT EST ICI, ET NULLE PART AILLEURS
 // ===========================================================================
 //
-// Mesure du 2026-08-31 (mesures-traduction/RESULTATS.md) :
+// Mesure du 2026-08-31 (docs/mesures/traduction/RESULTATS.md) :
 //
 //   - une paire DEJA INSTALLEE se cree sans le moindre geste utilisateur, y
 //     compris dans le document offscreen (`isActive: false`, et ca passe) ;

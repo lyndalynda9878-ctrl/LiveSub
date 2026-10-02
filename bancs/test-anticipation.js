@@ -45,8 +45,8 @@ const DUREE_CONTENU_VISEE = 88;
 const DUREE_FRAGMENT = 15;
 
 const CLIPS = [
-  { url: "test/speech.wav", langue: "english", intitule: "EN" },
-  { url: "test/speech-fr.mp3", langue: "french", intitule: "FR" },
+  { url: "audio/speech.wav", langue: "english", intitule: "EN" },
+  { url: "audio/speech-fr.mp3", langue: "french", intitule: "FR" },
 ];
 
 const VITESSES = [1, 2];
@@ -156,7 +156,7 @@ async function reechantillonner(audio, tauxDeclare, tauxCible) {
 async function jouerEtCapturer(blobUrl, vitesse) {
   const ctx = new AudioContext(); // taux natif (48 kHz), comme une capture d'onglet
   if (ctx.state === "suspended") await ctx.resume();
-  await ctx.audioWorklet.addModule(chrome.runtime.getURL("test-anticipation.worklet.js"));
+  await ctx.audioWorklet.addModule(chrome.runtime.getURL("bancs/test-anticipation.worklet.js"));
 
   const el = new Audio();
   el.src = blobUrl;
@@ -568,7 +568,7 @@ async function partieC(idOnglet) {
     });
     const ctx = new AudioContext();
     if (ctx.state === "suspended") await ctx.resume();
-    await ctx.audioWorklet.addModule(chrome.runtime.getURL("test-anticipation.worklet.js"));
+    await ctx.audioWorklet.addModule(chrome.runtime.getURL("bancs/test-anticipation.worklet.js"));
 
     const source = ctx.createMediaStreamSource(stream);
     const noeud = new AudioWorkletNode(ctx, "enregistreur", {

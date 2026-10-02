@@ -1,8 +1,8 @@
 # Traductions cote a cote — texte integral, aucune retouche
 
 Releve le 2026-08-31. Candidat A = API Translator de Chrome 151.0.7922.174,
-console de `test-traduction-a3.html`. Candidat B = Xenova/nllb-200-distilled-600M q8
-dans un Web Worker, console de `test-traduction-nllb.html`.
+console de `bancs/test-traduction-a3.html`. Candidat B = Xenova/nllb-200-distilled-600M q8
+dans un Web Worker, console de `bancs/test-traduction-nllb.html`.
 
 Aucun jugement de qualite n'est porte ici : ce fichier ne contient que les sorties.
 
@@ -10,7 +10,7 @@ Aucun jugement de qualite n'est porte ici : ce fichier ne contient que les sorti
 
 ## fr->en
 
-### Source (transcription Parakeet de `test/extrait-fr-dur.wav`)
+### Source (transcription Parakeet de `bancs/audio/extrait-fr-dur.wav`)
 
 > La mort de mes premières étoiles, les trous noirs supermassifs se sont nourris pendant des milliards d'années de matière, de gaz, d'étoiles parfois, ou même d'autres trou noirs. La surface d'un trou noir marque l'espace, à l'intérieur duquel matière et lumière restent piégées sans espoir de retour. C'est l'horizon des événements. Autour d'eux. La matière tourbillonne avant de disparaître à tout jamais. Elle dessine un contour qui dévoile l'invisible.
 
@@ -26,7 +26,7 @@ Aucun jugement de qualite n'est porte ici : ce fichier ne contient que les sorti
 
 ## en->fr
 
-### Source (transcription Parakeet de `test/extrait-fr-dur.wav`)
+### Source (transcription Parakeet de `bancs/audio/extrait-fr-dur.wav`)
 
 > it possible to detect these mergers are very new, so we're currently discovering a lot of exciting things. Like two massive black holes that we detected in a galaxy 17 billion light years away. As they spun around each other violently, they released more energy in the form of gravitational waves than the combined light from all the stars in the Milky Way in 4400 years. The new black hole they formed is about the size of Germany and is 142 solar masses. And here we hit a curious gap in scale there are lots of black holes up to 150 solar masses and then there's nothing for a long time. Until we suddenly hit black holes that are millions of times more
 
@@ -42,7 +42,7 @@ Aucun jugement de qualite n'est porte ici : ce fichier ne contient que les sorti
 
 ## fr->ar
 
-### Source (transcription Parakeet de `test/extrait-fr-dur.wav`)
+### Source (transcription Parakeet de `bancs/audio/extrait-fr-dur.wav`)
 
 > La mort de mes premières étoiles, les trous noirs supermassifs se sont nourris pendant des milliards d'années de matière, de gaz, d'étoiles parfois, ou même d'autres trou noirs. La surface d'un trou noir marque l'espace, à l'intérieur duquel matière et lumière restent piégées sans espoir de retour. C'est l'horizon des événements. Autour d'eux. La matière tourbillonne avant de disparaître à tout jamais. Elle dessine un contour qui dévoile l'invisible.
 

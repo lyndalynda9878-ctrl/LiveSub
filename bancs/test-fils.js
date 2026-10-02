@@ -31,7 +31,7 @@ const PASSES = Math.max(1, Math.min(10, parseInt(params.get("passes"), 10) || 3)
 // dit rien du regime reel.
 const DUREE = Math.max(1, Math.min(60, parseFloat(params.get("duree")) || 23));
 
-const AUDIO = params.get("audio") || "test/extrait-fr-dur-75s.wav";
+const AUDIO = params.get("audio") || "bancs/audio/extrait-fr-dur-75s.wav";
 
 const zone = document.getElementById("log");
 const lignes = [];

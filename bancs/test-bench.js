@@ -100,8 +100,8 @@ const CONFIGS = [
 const BACKEND = "wasm";
 
 const CLIPS = [
-  { fichier: "test/speech.wav", langue: "english", intitule: "Anglais" },
-  { fichier: "test/speech-fr.mp3", langue: "french", intitule: "Francais" },
+  { fichier: "bancs/audio/speech.wav", langue: "english", intitule: "Anglais" },
+  { fichier: "bancs/audio/speech-fr.mp3", langue: "french", intitule: "Francais" },
 ];
 
 // ---------------------------------------------------------------------------

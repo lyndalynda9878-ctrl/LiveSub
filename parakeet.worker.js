@@ -3,7 +3,7 @@
 //
 // Meme raison d'etre que whisper.worker.js : le WASM d'ONNX Runtime est
 // SYNCHRONE. Tant qu'il calcule, la page ne repeint plus, ne scrolle plus, ne
-// repond plus. C'est verifiable a l'oeil sur test-parakeet.html (etape 2), ou
+// repond plus. C'est verifiable a l'oeil sur bancs/test-parakeet.html (etape 2), ou
 // l'inference tourne sur le fil principal : le compteur de la page se fige
 // pendant toute la transcription. Ici il ne se fige pas.
 //
@@ -186,7 +186,7 @@ ort.env.wasm.wasmPaths = DIST_ORT;
 // chose :
 //
 //   - LA CHAINE COMPLETE, run reel de 9 min a 1 fil (28 blocs,
-//     mesures-traduction/9min-valide.json) : 17,7 s de calcul par bloc de ~22 s
+//     docs/mesures/traduction/9min-valide.json) : 17,7 s de calcul par bloc de ~22 s
 //     d'audio, soit un RTF de 0,82 sur une machine a 12 fils logiques. Il en
 //     faut moins de 0,44 pour suivre une video qui defile a x2. La preparation
 //     prenait donc du retard a CHAQUE bloc, et ce retard n'etait jamais
@@ -195,7 +195,7 @@ ort.env.wasm.wasmPaths = DIST_ORT;
 //     d'attente rapportees.
 //   - LE MOTEUR SEUL, meme machine, meme taille de bloc (23 s), toujours a
 //     1 fil : 6,1 a 7,1 s, soit un RTF de 0,27 a 0,31
-//     (mesures-fils/releve-A-1fil, -C-1fil-temoin, -D-1fil-texte).
+//     (docs/mesures/fils/releve-A-1fil, -C-1fil-temoin, -D-1fil-texte).
 //
 // Le fil unique explique donc environ 7 s des 17,7, pas les 17,7. D'ou viennent
 // les ~11 s restantes -- la meme machine decode la video a x2, capte et
@@ -228,7 +228,7 @@ function filsRetenus(demandes) {
 // ⚠️ La valeur n'est PAS posee ici. ONNX Runtime la lit quand il demarre son
 // moteur WASM, c'est-a-dire a la creation de la PREMIERE session -- l'ecrire
 // apres coup change le champ et rien d'autre (lecon deja payee dans
-// test-parakeet.js). On la pose donc au debut de `charger()`, qui est le seul
+// bancs/test-parakeet.js). On la pose donc au debut de `charger()`, qui est le seul
 // endroit ou des sessions sont creees, et jamais ailleurs.
 ort.env.wasm.proxy = false;
 

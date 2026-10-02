@@ -19,7 +19,7 @@ description: >
    - Logs du **VAD / capture audio** (`offscreen.js`) : « Inspecter les vues →
      **offscreen.html** ». ⚠️ Console séparée, PAS celle de la page. Le lien n'apparaît
      que quand l'offscreen existe → démarrer la capture d'abord.
-   - Test **Whisper isolé** : ouvrir `chrome-extension://<ID>/test-whisper.html`
+   - Test **Whisper isolé** : ouvrir `chrome-extension://<ID>/bancs/test-whisper.html`
      (l'ID est sur la carte de l'extension). Le résultat s'affiche sur la page ET dans
      la console (F12).
 

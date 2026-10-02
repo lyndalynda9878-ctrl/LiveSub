@@ -35,7 +35,7 @@ function texteDepuisMots(mots) {
 
 async function main() {
   etatDiv.textContent = "decodage du .wav...";
-  const url = chrome.runtime.getURL(new URLSearchParams(location.search).get("wav") || "test/extrait-fr-dur.wav");
+  const url = chrome.runtime.getURL(new URLSearchParams(location.search).get("wav") || "bancs/audio/extrait-fr-dur.wav");
   log("audio : " + url);
 
   const buf = await (await fetch(url)).arrayBuffer();

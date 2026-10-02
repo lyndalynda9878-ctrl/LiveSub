@@ -69,8 +69,8 @@ const NIVEAUX = [
 ];
 
 const CLIPS = [
-  { url: "test/speech-fr.mp3", langue: "french", intitule: "FR" },
-  { url: "test/speech.wav", langue: "english", intitule: "EN" },
+  { url: "audio/speech-fr.mp3", langue: "french", intitule: "FR" },
+  { url: "audio/speech.wav", langue: "english", intitule: "EN" },
 ];
 
 // Les variantes a comparer. `opt: "basic"` sur les quantifiees : en "all" elles

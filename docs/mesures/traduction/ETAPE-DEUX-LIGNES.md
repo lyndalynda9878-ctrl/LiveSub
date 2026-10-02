@@ -1,8 +1,8 @@
 # L'overlay a deux lignes (2026-09-01)
 
 Chrome 151.0.7922.174. Balise `<video>` reelle servie par
-`test-video-traduction.js` (port 8733), construite a partir de
-`test/extrait-fr-dur.wav` (extrait ARTE, francais). Durees utilisees : 3 min
+`bancs/test-video-traduction.js` (port 8733), construite a partir de
+`bancs/audio/extrait-fr-dur.wav` (extrait ARTE, francais). Durees utilisees : 3 min
 (fr -> en) et 1 min 30 (langue d'origine, et fr -> ar).
 
 Un seul fichier touche : **`content.js`**.

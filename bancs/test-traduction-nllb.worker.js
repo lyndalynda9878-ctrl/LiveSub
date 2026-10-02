@@ -67,7 +67,7 @@ function memoireWasm() {
   };
 }
 
-const RACINE = new URL("./", self.location.href).href;
+const RACINE = new URL("../", self.location.href).href; // racine de l'extension (ce fichier vit dans bancs/)
 
 // Import DYNAMIQUE, et c'est necessaire : un import statique serait resolu avant
 // que la moindre ligne de ce fichier ne s'execute -- donc avant l'espion pose
@@ -79,7 +79,7 @@ const { pipeline, env } = tf;
 // verifie en renommant le dossier -- le chargement DOIT alors echouer.
 env.allowRemoteModels = false;
 env.allowLocalModels = true;
-env.localModelPath = RACINE + "test-nllb-model/";
+env.localModelPath = RACINE + "bancs/test-nllb-model/";
 
 // Memes regles que Parakeet : un seul fil, pas de proxy, pas de WebGPU.
 //

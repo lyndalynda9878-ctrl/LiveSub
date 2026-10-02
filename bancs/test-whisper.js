@@ -204,8 +204,8 @@ function transcrire(audio, langue) {
 // ---------------------------------------------------------------------------
 
 const EXTRAITS = [
-  { fichier: "test/speech.wav", langue: "english", intitule: "Extrait anglais" },
-  { fichier: "test/speech-fr.mp3", langue: "french", intitule: "Extrait francais" },
+  { fichier: "bancs/audio/speech.wav", langue: "english", intitule: "Extrait anglais" },
+  { fichier: "bancs/audio/speech-fr.mp3", langue: "french", intitule: "Extrait francais" },
 ];
 
 // Le worker renvoie "webgpu" ou "wasm" ; ici on l'ecrit en clair.

@@ -4,8 +4,8 @@ Machine : Windows 11 26200, Intel Iris Xe / Wi-Fi 6E.
 Chrome **151.0.7922.174**, profil `%USERPROFILE%\.cache\chrome-devtools-mcp\chrome-profile`.
 Extension chargee non empaquetee, ID `gahilnfeeoofbbokajafblpidjmbngjl`.
 
-Texte de mesure : la transcription REELLE de `test/extrait-fr-dur.wav` par Parakeet
-(`mesures-traduction/source-fr.txt`, 69 mots) et celle de l'extrait anglais
+Texte de mesure : la transcription REELLE de `bancs/audio/extrait-fr-dur.wav` par Parakeet
+(`docs/mesures/traduction/source-fr.txt`, 69 mots) et celle de l'extrait anglais
 (`source-en.txt`, 123 mots). Le texte de 2493 mots est `source-fr.txt` repete
 jusqu'a 2493 mots exactement — la taille de la mesure de reference de Parakeet.
 
@@ -45,7 +45,7 @@ jusqu'a 2493 mots exactement — la taille de la mesure de reference de Parakeet
 | **Mon texte, fr->ar (69 mots)** | **240 ms** (2e passage 209 ms) | **39 600 ms** |
 | **2493 mots, fr->en** | **2 099 ms**, un seul appel | **1 366 060 ms** (22 min 46 s), 54 morceaux |
 | **Reseau, 1re traduction d'une paire installee** | 0 requete | 0 requete |
-| **Reseau, 1er telechargement** | 20,5 s ; **2 domaines** : `update.googleapis.com:443` et `edgedl.me.gvt1.com:80` ; **56 490 050 o** de CRX sur le fil, 79 567 210 o sur disque | 0 dans le navigateur (le modele est descendu hors navigateur par `test-nllb-fetch.js`) |
+| **Reseau, 1er telechargement** | 20,5 s ; **2 domaines** : `update.googleapis.com:443` et `edgedl.me.gvt1.com:80` ; **56 490 050 o** de CRX sur le fil, 79 567 210 o sur disque | 0 dans le navigateur (le modele est descendu hors navigateur par `bancs/test-nllb-fetch.js`) |
 | **Reseau, 2e traduction** | **0 requete** (onglet Reseau de la page) | **0 requete** |
 | **Hors ligne** | **traduit** (volet B) | **traduit** |
 | **Langue detectee toute seule** | `LanguageDetector` present mais `availability` = `unavailable`, `create()` echoue | sans objet : NLLB exige `src_lang` explicite |
@@ -154,8 +154,8 @@ d'un facteur 100.
 
 ### La deuxieme traduction
 
-Onglet Reseau de `test-traduction-a3.html` apres les 3 paires traduites deux fois
-chacune : **3 requetes en tout**, `test-traduction-a3.html` et `test-traduction-a3.js`
+Onglet Reseau de `bancs/test-traduction-a3.html` apres les 3 paires traduites deux fois
+chacune : **3 requetes en tout**, `bancs/test-traduction-a3.html` et `bancs/test-traduction-a3.js`
 (deux fois, module). **Zero requete pour une traduction, la premiere comme la seconde.**
 
 ---
@@ -289,13 +289,13 @@ chercher ailleurs. Ses chiffres tiennent. Le dossier a ete remis a son nom.
 | mesure | console / outil |
 |---|---|
 | A1 : presence, availability, create, traductions | **console du service worker** (`background.js`) — le document offscreen n'est pas une cible DevTools en session pilotee, le resultat remonte par `chrome.runtime.sendMessage` |
-| A3 : sonde, create, traductions, 2493 mots, LanguageDetector, volets A et B | **console de la page** `test-traduction-a3.html` (`window.SONDE`, `TRADUCTIONS_A`, `GROS`, `DETECTEUR`, `VOLET_A_*`, `HORS_LIGNE`) |
+| A3 : sonde, create, traductions, 2493 mots, LanguageDetector, volets A et B | **console de la page** `bancs/test-traduction-a3.html` (`window.SONDE`, `TRADUCTIONS_A`, `GROS`, `DETECTEUR`, `VOLET_A_*`, `HORS_LIGNE`) |
 | requetes de la 2e traduction, volet C | **onglet Reseau** de la page concernee |
 | domaines du 1er telechargement | **guetteur TCP Windows** (`Get-NetTCPConnection` sur les processus `chrome`), hors navigateur — l'onglet Reseau de la page ne voit RIEN de ce telechargement, il est fait par le processus navigateur |
 | octets sur le fil | taille du CRX depose dans `component_crx_cache` du profil |
 | octets sur disque | `Get-ChildItem -Recurse` sur `TranslateKit\models` |
 | octets Wi-Fi | `Get-NetAdapterStatistics` |
 | memoire du candidat A | `Get-Process chrome` (somme des `WorkingSet64`) |
-| B : chargement, memoire WASM, traductions | **console de la page** `test-traduction-nllb.html`, alimentee par les messages du worker |
+| B : chargement, memoire WASM, traductions | **console de la page** `bancs/test-traduction-nllb.html`, alimentee par les messages du worker |
 | memoire WASM de B | espion sur `WebAssembly.Memory` **dans le worker**, lu par `buffer.byteLength` |
 | version et drapeaux de Chrome | `chrome://version` |

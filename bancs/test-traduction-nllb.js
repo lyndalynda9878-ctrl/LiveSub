@@ -54,7 +54,7 @@ let prochainId = 1;
 const enAttente = new Map();
 
 function creerWorker() {
-  worker = new Worker(chrome.runtime.getURL("test-traduction-nllb.worker.js"), { type: "module" });
+  worker = new Worker(chrome.runtime.getURL("bancs/test-traduction-nllb.worker.js"), { type: "module" });
   worker.onmessage = (e) => {
     const m = e.data;
     if (m.type === "ready") {

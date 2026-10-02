@@ -29,7 +29,10 @@
 ## Vue d'ensemble
 LiveSub est une **extension de navigateur (Chrome, Manifest V3)** qui capte le son de
 l'onglet, le transcrit (**Parakeet TDT 0.6B v3**, 100 % local) et affiche des
-sous-titres en overlay sur la page. La traduction reste à faire.
+sous-titres en overlay sur la page. Les sous-titres peuvent être **traduits**
+(API Translator de Chrome, locale, depuis le 31/08/2026) : l'original reste affiché mot
+à mot, la traduction phrase par phrase en dessous — mesures dans
+`docs/mesures/traduction/`.
 
 Il n'y a **qu'un seul mode** : « préparer d'abord ». La vidéo défile en accéléré et en
 silence, tout est transcrit d'avance, puis le texte s'affiche à l'heure pendant la
@@ -101,12 +104,12 @@ chaque mot avant que la lecture commence, donc elle n'a plus rien à estimer.
 - `vendor/` — librairies locales. Gitignoré, régénéré par `scripts/copy-assets.js`
   (postinstall).
 - `README.md` — installation, licences, attribution NVIDIA (condition CC-BY-4.0).
-- `test-parakeet.html` / `.js`, `test-parakeet-worker.html` / `.js` — pages de mesure du
+- `bancs/test-parakeet.html` / `.js`, `bancs/test-parakeet-worker.html` / `.js` — pages de mesure du
   moteur actuel.
-- `test-fils.html` / `.js` (page d'extension) et `test-fils-offscreen.html` / `.js`
+- `bancs/test-fils.html` / `.js` (page d'extension) et `bancs/test-fils-offscreen.html` / `.js`
   (**dans le document offscreen**) — bancs des fils WASM : relèvent `SharedArrayBuffer`,
   `crossOriginIsolated`, les fils demandés **et** les fils réellement posés, puis
-  chronomètrent. Relevés dans `mesures-fils/`.
+  chronomètrent. Relevés dans `docs/mesures/fils/`.
 
 ⏳ **VRAI JUSQU'AU 30/08/2026, PLUS D'ACTUALITÉ — les fichiers du mode direct.**
 
@@ -123,10 +126,10 @@ chaque mot avant que la lecture commence, donc elle n'a plus rien à estimer.
 > - `whisper.worker.js` — **Web Worker** de transcription : c'est là que vivent
 >   Transformers.js et Whisper, pour que le fil principal ne fige jamais. Choisit aussi
 >   le backend (GPU/CPU) — voir « Choix du backend » plus bas.
-> - `test-whisper.html` / `test-whisper.js` — page de test isolée : prouve que Whisper
+> - `bancs/test-whisper.html` / `bancs/test-whisper.js` — page de test isolée : prouve que Whisper
 >   transcrit (Transformers.js, `Xenova/whisper-tiny`, `dtype: "fp32"`) depuis le worker,
 >   sans figer la page. C'est aussi la page qui lit/écrit le backend mémorisé.
-> - `test-bench.html` / `test-bench.js` — page de **comparaison** : fait tourner plusieurs
+> - `bancs/test-bench.html` / `bancs/test-bench.js` — page de **comparaison** : fait tourner plusieurs
 >   variantes du modèle sur le même audio (fragments à la taille de production + extrait
 >   complet, EN et FR), chronomètre, et affiche les textes côte à côte. Le worker accepte
 >   `?modele=…&dtype=…&opt=…` uniquement pour elle ; en production personne ne passe de
@@ -217,7 +220,7 @@ plus pour la production, mais l'erreur de méthode, elle, est à retenir.
 ⚠️ **La ligne RTF ci-dessus est celle du 30/08/2026, à `numThreads = 1`. Elle reste vraie
 pour ce qu'elle mesurait — mais ce n'est plus le réglage de production.** Depuis le
 04/09/2026 le moteur tourne à **4 fils** (`PREP_FILS`, `offscreen.js`). Même bloc de 23 s,
-meilleur de 3 passes, relevés dans `mesures-fils/` :
+meilleur de 3 passes, relevés dans `docs/mesures/fils/` :
 
 | RTF du moteur seul | 1 fil | **4 fils** |
 |---|---|---|
@@ -350,8 +353,8 @@ constat est ce qui a fait choisir « préparer d'abord », et il tient toujours.
 Les sections datées qui le décrivent restent en place : « Les deux modes d'affichage »,
 « Le retard du son », « Le flux », « L'horloge des mots », « Choix du backend ».
 
-⚠️ **Conséquence pour l'acquis n° 8.** Le bloc « ACQUIS À NE PAS PERDRE » (dans
-`REPRISE-LIVESUB.md`) comptait un huitième point : « Le MODE DIRECT fonctionne toujours,
+⚠️ **Conséquence pour l'acquis n° 8.** Le bloc « ACQUIS À NE PAS PERDRE » (dans les
+notes de travail, gardées hors du dépôt) comptait un huitième point : « Le MODE DIRECT fonctionne toujours,
 sans une ligne modifiée ». **Il n'a plus d'objet : il ne reste que 7 acquis.**
 
 ---
@@ -622,7 +625,7 @@ suivies de trous, sans rapport avec le rythme réel de la parole, et des silence
 n'existaient pas à l'écran. Avec l'instant de chaque mot, l'affichage peut le sortir à
 l'heure : parole rapide → texte rapide, pause → l'écran s'arrête.
 
-### Ce que ça coûte : mesuré, pas supposé (2026-08-20, `test-bruit.html`)
+### Ce que ça coûte : mesuré, pas supposé (2026-08-20, `bancs/test-bruit.html`)
 | fenêtre | mots/passe | sans | avec | surcoût |
 |---|---|---|---|---|
 | 7 s | 11 | 2 201 ms | 2 276 ms | +3 % |
@@ -1097,7 +1100,7 @@ corrige, pas seulement l'incident.
 
 ✅ **CE QUI A FINI PAR RENDRE LA MARGE (04/09/2026) : les 4 fils WASM.** Le raisonnement
 « dette » de cette section est resté vrai sous Parakeet — un run réel de 9 min à **1 fil**
-(28 blocs, `mesures-traduction/9min-valide.json`) a payé **237 s de déficit d'un coup à la
+(28 blocs, `docs/mesures/traduction/9min-valide.json`) a payé **237 s de déficit d'un coup à la
 fin**, les « environ 5 minutes » d'attente rapportées. Le passage à 4 fils double la
 vitesse du moteur, donc double la marge par bloc, et cette attente est réglée (mesuré le
 04/09/2026). ⚠️ **Le chiffre à surveiller reste celui de cette section, pas le nombre de
@@ -1339,7 +1342,7 @@ total sans aucun sous-titre — et c'est cette mesure-là qu'il faut regarder, p
   prudence » : 1 fil est le réglage qui ne tenait pas le ×2.**
 
   Mesuré le 04/09/2026 **dans le document offscreen** — l'endroit qui manquait, et le
-  seul qui compte pour la production (relevés `mesures-fils/releve-OFF-*.json`) :
+  seul qui compte pour la production (relevés `docs/mesures/fils/releve-OFF-*.json`) :
 
   | dans l'offscreen | relevé |
   |---|---|
@@ -1462,14 +1465,14 @@ total sans aucun sous-titre — et c'est cette mesure-là qu'il faut regarder, p
 Recharger l'extension (`chrome://extensions` → 🔄) puis la page (F5). Console du
 service worker : « Inspecter les vues → service worker ». Console de la capture :
 « Inspecter les vues → **offscreen.html** ». Test du moteur isolé : ouvrir
-`chrome-extension://<ID>/test-parakeet-worker.html`. (Voir la skill `tester-extension`.)
-⏳ *`test-whisper.html` existe encore mais ne mesure plus le moteur de production.*
+`chrome-extension://<ID>/bancs/test-parakeet-worker.html`. (Voir la skill `tester-extension`.)
+⏳ *`bancs/test-whisper.html` existe encore mais ne mesure plus le moteur de production.*
 
-**Mesurer les fils** : `test-fils.html?fils=N&passes=P&duree=S` chronomètre le moteur dans
-une **page** d'extension, `test-fils-offscreen.html` fait la même chose **dans le document
+**Mesurer les fils** : `bancs/test-fils.html?fils=N&passes=P&duree=S` chronomètre le moteur dans
+une **page** d'extension, `bancs/test-fils-offscreen.html` fait la même chose **dans le document
 offscreen** — c'est celle-là qui compte pour la production, et c'est celle qui manquait
 jusqu'au 04/09/2026. Les deux relèvent `SharedArrayBuffer`, `crossOriginIsolated`, les fils
-demandés **et** les fils réellement posés. Les relevés sont dans `mesures-fils/`.
+demandés **et** les fils réellement posés. Les relevés sont dans `docs/mesures/fils/`.
 
 ⚠️ **UNE SÉANCE DE MESURE S'USE QUATRE FOIS PLUS VITE QU'AVANT.** Un worker Whisper
 pesait 147 Mo ; un worker Parakeet en pèse **652**, et occupe **~1 335 Mo** de mémoire
@@ -1511,7 +1514,7 @@ d'un bout à l'autre. Deux pièges de plus, mesurés le 03 et le 04/09/2026.**
   **6,2 s** — un facteur ~4. Ce n'est pas l'offscreen qui est lent : le témoin est le
   relevé `PAGE-CACHEE`, la **même page** que la veille, qui a rendu **25,9 s** dans cette
   séance-là. ⛔ **Aucun chiffre absolu de cette séance ne doit sortir du fichier
-  `mesures-fils/`** ; ses rapports 1/2/3/4/6/8 fils, eux, sont bons. Voir aussi la mémoire
+  `docs/mesures/fils/`** ; ses rapports 1/2/3/4/6/8 fils, eux, sont bons. Voir aussi la mémoire
   `chrome-pilote-3x-plus-lent`.
 
 ⚠️ **Un banc Node ne prouve rien sur ce que le navigateur rend disponible.** Le bouchon
@@ -1543,7 +1546,7 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
   identique** — ce n'est pas le piège de WebGPU. 4 est un **optimum** : à 6 et à 8 fils
   c'est plus lent. La production est passée à `PREP_FILS = 4`.
 - ✅ **L'attente de fin de préparation est réglée** : le déficit de **237 s** payé d'un
-  coup à la fin d'un run de 9 min à 1 fil (`mesures-traduction/9min-valide.json`) ne se
+  coup à la fin d'un run de 9 min à 1 fil (`docs/mesures/traduction/9min-valide.json`) ne se
   forme plus, la marge par bloc ayant doublé. Voir le point 6 bis.
 
 ### Depuis le 30/08/2026 — changement de moteur
@@ -1582,7 +1585,7 @@ bascule de la case en plein milieu du run pour vérifier qu'elle ne perd ni mot 
   dédiées plus haut.
 - ✅ **Étape 0 — chiffrer avant de s'engager** : coût des horodatages (+20 %, sous le seuil
   de renoncement de 40 %), absence de dérive sur 14 passes, justesse des instants sous
-  musique (20 ms à −1,8 dB). Page `test-bruit.html`.
+  musique (20 ms à −1,8 dB). Page `bancs/test-bruit.html`.
 - ✅ **Étape 1 — les instants voyagent** : worker → offscreen → service worker → `FLUX`.
   Chaque mot porte l'heure à laquelle il a été prononcé. Voir « Les instants » plus haut.
 - ✅ **Étape 2 — `content.js` affiche à l'heure** : `PAS_REVELATION` et `RETARD_MAX_MOTS`

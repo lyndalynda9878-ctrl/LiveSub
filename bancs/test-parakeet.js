@@ -55,11 +55,11 @@
 // Le dossier ONNX Runtime, declare ici parce que l'import dynamique du bundle
 // (plus bas) en a besoin. Chemin RELATIF : le navigateur sait le resoudre, et
 // il ne pointe que sur le disque.
-const DIST_ORT_BUNDLE = "./node_modules/parakeet.js/node_modules/onnxruntime-web/dist/";
+const DIST_ORT_BUNDLE = "../node_modules/parakeet.js/node_modules/onnxruntime-web/dist/";
 
-import { ParakeetModel } from "./node_modules/parakeet.js/src/index.js";
-import { ParakeetTokenizer } from "./node_modules/parakeet.js/src/tokenizer.js";
-import { OnnxPreprocessor } from "./node_modules/parakeet.js/src/preprocessor.js";
+import { ParakeetModel } from "../node_modules/parakeet.js/src/index.js";
+import { ParakeetTokenizer } from "../node_modules/parakeet.js/src/tokenizer.js";
+import { OnnxPreprocessor } from "../node_modules/parakeet.js/src/preprocessor.js";
 
 // ---------------------------------------------------------------------------
 // LES DEUX REGLAGES A MESURER
@@ -121,7 +121,7 @@ globalThis.ort = ort;
 // `new URL(..., import.meta.url)` donne des URL absolues chrome-extension://
 // (ou file://, selon d'ou la page est ouverte). On les ecrit en clair ici pour
 // qu'un lecteur puisse verifier d'un coup d'oeil qu'aucune ne pointe ailleurs.
-const MODELE = "./models/parakeet-tdt-0.6b-v3/";
+const MODELE = "../models/parakeet-tdt-0.6b-v3/";
 // Meme dossier que celui utilise plus haut pour importer le bundle : un seul
 // chemin, pour qu-il ne puisse pas y en avoir deux qui divergent.
 const DIST_ORT = DIST_ORT_BUNDLE;

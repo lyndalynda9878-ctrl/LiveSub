@@ -110,8 +110,8 @@ document.getElementById("charger").addEventListener("click", charger);
 </body></html>`;
 
 const FICHIERS = {
-  "/extrait-fr-dur.wav": ["test/extrait-fr-dur.wav", "audio/wav"],
-  "/extrait-en.wav": ["test/extrait-en.wav", "audio/wav"],
+  "/extrait-fr-dur.wav": ["audio/extrait-fr-dur.wav", "audio/wav"],
+  "/extrait-en.wav": ["audio/extrait-en.wav", "audio/wav"],
 };
 
 http

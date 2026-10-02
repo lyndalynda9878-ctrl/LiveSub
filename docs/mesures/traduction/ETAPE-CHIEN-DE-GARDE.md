@@ -1,8 +1,8 @@
 # Le chien de garde et le temps restant (2026-08-31)
 
 Chrome 151.0.7922.174. Video de mesure : une balise `<video>` reelle servie par
-`test-video-traduction.js` (port 8733), construite a partir de
-`test/extrait-fr-dur.wav` (extrait ARTE, francais, 45 s) repete jusqu'a la duree
+`bancs/test-video-traduction.js` (port 8733), construite a partir de
+`bancs/audio/extrait-fr-dur.wav` (extrait ARTE, francais, 45 s) repete jusqu'a la duree
 voulue. Durees utilisees : **9 min 00 s** et **18 min 00 s**.
 
 Un essai a aussi ete fait sur une VRAIE video YouTube :
@@ -14,7 +14,7 @@ defaut, decrit au point 8, et n'a pas pu servir de vehicule de validation.
 
 ## 1. Le diagnostic : la file avancait-elle ?
 
-Journal releve toutes les 5 s par `test-progres.html` (page d'extension, donc non
+Journal releve toutes les 5 s par `bancs/test-progres.html` (page d'extension, donc non
 ephemere), video de 9 minutes, AVANT tout correctif :
 
 ```
