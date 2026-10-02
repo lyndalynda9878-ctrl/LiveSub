@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "LiveSub",
   "version": "1.0",
-  "description": "Sous-titrage et traduction en temps reel 100% local",
+  "description": "Sous-titrage et traduction des vidéos de l’onglet, 100 % local",
   "permissions": [
     "storage",
     "tabCapture",

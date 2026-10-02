@@ -1,7 +1,7 @@
 {
   "name": "livesub",
   "version": "1.0.0",
-  "description": "",
+  "description": "Extension Chrome qui sous-titre et traduit les vidéos de l’onglet, 100 % en local (NVIDIA Parakeet + API Translator de Chrome).",
   "main": "background.js",
   "scripts": {
     "build:assets": "node scripts/copy-assets.js",
@@ -10,7 +10,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "",
+  "author": "Lynda Djemai",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
