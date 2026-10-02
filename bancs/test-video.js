@@ -4,7 +4,7 @@
 // pas injecte dans les pages chrome-extension://, et le mode pilote un
 // HTMLVideoElement (playbackRate, preservesPitch, currentTime, duration).
 //
-// La video est construite dans la page a partir de test/speech.wav repete :
+// La video est construite dans la page a partir de bancs/audio/speech.wav repete :
 // l'extrait fait 11 s, il en faut plusieurs minutes pour voir defiler
 // plusieurs blocs de 30 s.
 //

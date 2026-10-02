@@ -1,4 +1,4 @@
-// Obtenir la transcription REELLE de test/extrait-fr-dur.wav, telle que
+// Obtenir la transcription REELLE de bancs/audio/extrait-fr-dur.wav, telle que
 // Parakeet la produit -- c'est la matiere des mesures de traduction.
 //
 // ⚠️ Le texte est derive de res.words, JAMAIS de res.utterance_text :
